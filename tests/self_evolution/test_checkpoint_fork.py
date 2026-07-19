@@ -8,12 +8,16 @@ from agent_libos import AgentImage, Runtime
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
+    ChildProcessWait,
     DataFlowContext,
     DataLabels,
     EventType,
+    ExitedProcessOutcome,
+    HostResumeProcessWait,
     ObjectOwnerKind,
     ObjectRight,
     ObjectType,
+    PausedProcessWait,
     ProcessStatus,
     ResourceBudget,
 )
@@ -419,13 +423,91 @@ class TestCheckpointFork:
             child = runtime.spawn_child_process(parent, 'unfinished child')
             with pytest.raises(ProcessWaitRequired):
                 runtime.process.wait(parent, child)
-            assert runtime.process.get(parent).status == ProcessStatus.WAITING_EVENT
+            waiting = runtime.process.get(parent)
+            assert waiting.status == ProcessStatus.WAITING_EVENT
+            assert waiting.wait_state == ChildProcessWait(child_pid=child)
             checkpoint_id = runtime.checkpoint.create(parent, 'waiting fork point', actor=parent)
             runtime.capability.grant(parent, f'checkpoint:{checkpoint_id}', [CapabilityRight.EXECUTE], issued_by='test')
             forked = runtime.checkpoint.fork_from_checkpoint(parent, checkpoint_id)
             fork_root = runtime.process.get(forked['fork_root_pid'])
             assert fork_root.status == ProcessStatus.RUNNABLE
             assert fork_root.status_message is None
+            assert fork_root.wait_state is None
+            assert fork_root.outcome is None
+            assert fork_root.state_generation == 0
+        finally:
+            runtime.close()
+
+    def test_fork_remaps_terminal_child_outcome_to_cloned_result(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='fork terminal child')
+            runtime.capability.grant(parent, 'process:spawn', [CapabilityRight.WRITE], issued_by='test')
+            child = runtime.spawn_child_process(parent, 'terminal child')
+            result = runtime.memory.create_object(
+                child,
+                ObjectType.SUMMARY,
+                {'answer': 42},
+                name='terminal-result',
+            )
+            runtime.process.exit(child, result)
+            source_child = runtime.process.get(child)
+            assert source_child.outcome == ExitedProcessOutcome(result_oid=result.oid)
+
+            checkpoint_id = runtime.checkpoint.create(parent, 'terminal child outcome', actor=parent)
+            runtime.capability.grant(
+                parent,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            forked = runtime.checkpoint.fork_from_checkpoint(parent, checkpoint_id)
+
+            fork_child = runtime.process.get(forked['pid_map'][child])
+            cloned_result_oid = forked['object_map'][result.oid]
+            assert fork_child.outcome == ExitedProcessOutcome(result_oid=cloned_result_oid)
+            assert fork_child.status_message == f'result_oid:{cloned_result_oid}'
+            assert cloned_result_oid != result.oid
+            assert runtime.store.get_object(cloned_result_oid) is not None
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('pause_method', 'expected_wait_type'),
+        [
+            ('pause', PausedProcessWait),
+            ('pause_for_host_resume', HostResumeProcessWait),
+        ],
+    )
+    def test_fork_remaps_paused_reason_to_cloned_object(
+        self,
+        pause_method: str,
+        expected_wait_type: type[PausedProcessWait] | type[HostResumeProcessWait],
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal=f'fork {pause_method}')
+            getattr(runtime.process, pause_method)(pid, 'carry this reason into the fork')
+            source = runtime.process.get(pid)
+            assert isinstance(source.wait_state, expected_wait_type)
+            reason_oid = source.wait_state.reason_oid
+            assert reason_oid is not None
+
+            checkpoint_id = runtime.checkpoint.create(pid, f'{pause_method} state', actor=pid)
+            runtime.capability.grant(
+                pid,
+                f'checkpoint:{checkpoint_id}',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            forked = runtime.checkpoint.fork_from_checkpoint(pid, checkpoint_id)
+
+            fork_process = runtime.process.get(forked['fork_root_pid'])
+            cloned_reason_oid = forked['object_map'][reason_oid]
+            assert isinstance(fork_process.wait_state, expected_wait_type)
+            assert fork_process.wait_state.reason_oid == cloned_reason_oid
+            assert cloned_reason_oid != reason_oid
+            assert runtime.store.get_object(cloned_reason_oid) is not None
         finally:
             runtime.close()
 

@@ -33,10 +33,23 @@ jobs:
       - name: Compile Python sources
         run: uv run python -m compileall agent_libos tests scripts experiments benchmarks
 
+      - name: Check architecture and blocking-work boundaries
+        run: uv run python scripts/check_architecture.py
+
+      - name: Check protected-operation coverage
+        run: uv run python scripts/check_protected_operations.py
+
       - name: Check invariant manifest and pytest collection
         run: uv run python scripts/check_test_invariants.py
 
   release-artifacts:
+    needs:
+      - static
+      - python
+      - security
+      - deterministic-release
+      - postgres
+      - gui
     runs-on: ubuntu-latest
 
     steps:
@@ -60,7 +73,7 @@ jobs:
 
       - name: Build and validate distributions
         run: |
-          uv build --out-dir dist
+          uv build --clear --out-dir dist
           python scripts/check_release_artifacts.py dist
 
       - name: Clean-install wheel and run entrypoint smoke
@@ -68,12 +81,33 @@ jobs:
           uv venv --python 3.11 .release-venv
           wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
           uv pip install --python .release-venv/bin/python "$wheel"
+          uv pip check --python .release-venv/bin/python
           smoke_root="$(mktemp -d)"
           cd "$smoke_root"
           "$GITHUB_WORKSPACE/.release-venv/bin/python" -c "import agent_libos, importlib.metadata; assert agent_libos.__version__ == importlib.metadata.version('agent-libos')"
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos-gui-server" --help
           "$GITHUB_WORKSPACE/.release-venv/bin/agent-libos" --db local demo > demo.json
+
+      - name: Clean-install source distribution
+        run: |
+          uv venv --python 3.11 .release-sdist-venv
+          sdist="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          uv pip install --python .release-sdist-venv/bin/python "$sdist"
+          uv pip check --python .release-sdist-venv/bin/python
+          sdist_smoke_root="$(mktemp -d)"
+          cd "$sdist_smoke_root"
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/python" -c "import agent_libos, importlib.metadata; assert agent_libos.__version__ == importlib.metadata.version('agent-libos')"
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos" --help
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos-gui-server" --help
+          "$GITHUB_WORKSPACE/.release-sdist-venv/bin/agent-libos" --db local demo > demo.json
+
+      - name: Preserve validated distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-libos-validated-distributions
+          path: dist/*
+          if-no-files-found: error
 
   python:
     needs: static
@@ -161,6 +195,59 @@ jobs:
         run: >-
           uv run python scripts/test_matrix.py --lane security
           -n 4 --dist worksteal --max-lane-seconds 900
+
+  deterministic-release:
+    needs: static
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2.0.4
+        with:
+          deno-version: lts
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Run combined deterministic release matrix
+        timeout-minutes: 20
+        run: >-
+          uv run python scripts/test_matrix.py --lane all
+          -n 4 --dist worksteal --max-lane-seconds 900
+
+      - name: Run runtime-safety release smoke
+        run: >-
+          uv run python experiments/run_benchmark.py
+          --suite benchmarks/runtime_safety
+          --runner agent_libos_full
+          --limit 3
+          --require-all-passed
+          --output .benchmark_runs/ci-release-smoke
+
+      - name: Run 100k external-effect recovery scale smoke
+        run: >-
+          uv run python experiments/run_external_effect_recovery_scale.py
+          --profile ci
+          --output .benchmark_runs/external-effect-recovery-ci.json
+
+      - name: Run 10k runtime-publication handler scale smoke
+        run: >-
+          uv run python experiments/run_publication_reconciliation_scale.py
+          --profile ci
+          --output .benchmark_runs/publication-reconciliation-ci.json
 
   postgres:
     runs-on: ubuntu-latest

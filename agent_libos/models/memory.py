@@ -88,6 +88,75 @@ class ObjectLifecycleState(StrEnum):
     RELEASED = "released"
 
 
+@dataclass(frozen=True, slots=True)
+class PersistedObjectState:
+    """Payload-free durable Object state used by security revalidation."""
+
+    oid: OID
+    lifecycle_state: ObjectLifecycleState
+    version: int
+    payload_present: bool
+    recovered_after_reopen: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.oid, str) or not self.oid:
+            raise ValueError("persisted Object state oid must be non-empty")
+        if not isinstance(self.lifecycle_state, ObjectLifecycleState):
+            raise ValueError("persisted Object lifecycle state is invalid")
+        if (
+            isinstance(self.version, bool)
+            or not isinstance(self.version, int)
+            or self.version <= 0
+        ):
+            raise ValueError("persisted Object version must be positive")
+        if type(self.payload_present) is not bool:
+            raise ValueError("persisted Object payload_present must be boolean")
+        if type(self.recovered_after_reopen) is not bool:
+            raise ValueError(
+                "persisted Object recovered_after_reopen must be boolean"
+            )
+        if self.payload_present and self.recovered_after_reopen:
+            raise ValueError(
+                "a present Object payload cannot be marked recovered after reopen"
+            )
+        if (
+            self.recovered_after_reopen
+            and self.lifecycle_state is not ObjectLifecycleState.RELEASED
+        ):
+            raise ValueError(
+                "only a released Object can carry the reopen recovery marker"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ObjectPayloadRecoverySummary:
+    """Bounded diagnostics for runtime-only payload rows released on reopen."""
+
+    total_count: int = 0
+    sample_oids: tuple[OID, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.total_count, bool)
+            or not isinstance(self.total_count, int)
+            or self.total_count < 0
+        ):
+            raise ValueError("object payload recovery total_count must be non-negative")
+        if not isinstance(self.sample_oids, tuple):
+            raise ValueError("object payload recovery sample must be a tuple")
+        if len(self.sample_oids) > self.total_count:
+            raise ValueError("object payload recovery sample exceeds total")
+        if any(not isinstance(oid, str) or not oid for oid in self.sample_oids):
+            raise ValueError("object payload recovery sample OIDs must not be empty")
+
+    @property
+    def truncated(self) -> bool:
+        return self.total_count > len(self.sample_oids)
+
+    def __len__(self) -> int:
+        return self.total_count
+
+
 @dataclass
 class ObjectMetadata:
     title: str | None = None

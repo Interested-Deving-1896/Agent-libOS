@@ -7,6 +7,7 @@ from typing import Any
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models.base import CapabilityID, CheckpointID, EventID, OID, PID, StrEnum
 from agent_libos.models.memory import MemoryView, ObjectHandle
+from agent_libos.models.process_state import ProcessOutcome, ProcessWaitState
 
 
 class ProcessStatus(StrEnum):
@@ -141,6 +142,136 @@ class ResourceReservation:
             _validate_resource_number(key, value, allow_none=False, require_integer=False)
 
 
+class ResourceUsageReservationStatus(StrEnum):
+    ACTIVE = "active"
+    SETTLED = "settled"
+    RELEASED = "released"
+    CHARGED_MAXIMUM = "charged_maximum"
+
+
+@dataclass(frozen=True)
+class ResourceUsageReservation:
+    """Typed durable envelope for one provider-side resource effect."""
+
+    reservation_id: str
+    pid: PID
+    usage: ResourceUsage
+    status: ResourceUsageReservationStatus
+    reserved_by: str
+    reason: str
+    settled_usage: ResourceUsage | None
+    created_at: str
+    updated_at: str
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "reservation_id",
+            "pid",
+            "reserved_by",
+            "reason",
+            "created_at",
+            "updated_at",
+        ):
+            if not str(getattr(self, field_name)).strip():
+                raise ValueError(f"{field_name} must be non-empty")
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class ResourceUsageReservationCursor:
+    """Stable keyset cursor for bounded usage-reservation recovery."""
+
+    created_at: str
+    reservation_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.created_at, str) or not self.created_at:
+            raise ValueError(
+                "resource usage reservation cursor created_at must not be empty"
+            )
+        if not isinstance(self.reservation_id, str) or not self.reservation_id:
+            raise ValueError(
+                "resource usage reservation cursor reservation_id must not be empty"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceUsageReservationPage:
+    """One hard-bounded page of active usage reservations."""
+
+    records: tuple[ResourceUsageReservation, ...]
+    next_cursor: ResourceUsageReservationCursor | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_cursor is not None and not isinstance(
+            self.next_cursor,
+            ResourceUsageReservationCursor,
+        ):
+            raise ValueError(
+                "resource usage reservation page cursor has an invalid type"
+            )
+        if self.next_cursor is not None and not self.records:
+            raise ValueError(
+                "empty resource usage reservation page cannot have a cursor"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceUsageReservationRecoverySummary:
+    """Bounded diagnostics for a fully processed reservation backlog."""
+
+    total_count: int
+    sample_reservation_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.total_count, bool)
+            or not isinstance(self.total_count, int)
+            or self.total_count < 0
+        ):
+            raise ValueError("resource usage recovery total_count must be non-negative")
+        if len(self.sample_reservation_ids) > self.total_count:
+            raise ValueError("resource usage recovery sample exceeds total_count")
+        if any(
+            not isinstance(reservation_id, str) or not reservation_id
+            for reservation_id in self.sample_reservation_ids
+        ):
+            raise ValueError("resource usage recovery sample ids must be non-empty")
+
+    @property
+    def truncated(self) -> bool:
+        return len(self.sample_reservation_ids) < self.total_count
+
+    def __len__(self) -> int:
+        return self.total_count
+
+
+@dataclass(frozen=True, slots=True)
+class StaleExecutionRecoverySummary:
+    """Bounded diagnostics for stale process-execution recovery."""
+
+    total_count: int
+    sample_pids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.total_count, bool)
+            or not isinstance(self.total_count, int)
+            or self.total_count < 0
+        ):
+            raise ValueError("stale execution recovery total_count must be non-negative")
+        if len(self.sample_pids) > self.total_count:
+            raise ValueError("stale execution recovery sample exceeds total")
+        if any(not isinstance(pid, str) or not pid for pid in self.sample_pids):
+            raise ValueError("stale execution recovery sample PIDs must not be empty")
+
+    @property
+    def truncated(self) -> bool:
+        return len(self.sample_pids) < self.total_count
+
+    def __len__(self) -> int:
+        return self.total_count
+
+
 def _validate_resource_number(
     name: str,
     value: Any,
@@ -222,12 +353,111 @@ class AgentProcess:
     updated_at: str
     working_directory: str = "."
     status_message: str | None = None
+    wait_state: ProcessWaitState | None = None
+    outcome: ProcessOutcome | None = None
+    state_generation: int = 0
     llm_profile_id: str = field(default_factory=lambda: DEFAULT_CONFIG.llm.default_profile_id)
     model_tool_table: dict[str, str] = field(default_factory=dict)
     revision: int = 0
     execution_generation: int = 0
     execution_owner_id: str | None = None
     execution_lease_id: str | None = None
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class ProcessCursor:
+    """Stable keyset cursor for bounded process recovery scans."""
+
+    created_at: str
+    pid: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.created_at, str) or not self.created_at:
+            raise ValueError("process cursor created_at must not be empty")
+        if not isinstance(self.pid, str) or not self.pid:
+            raise ValueError("process cursor pid must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessPage:
+    """One hard-bounded page of process rows."""
+
+    records: tuple[AgentProcess, ...]
+    next_cursor: ProcessCursor | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_cursor is not None and not self.records:
+            raise ValueError("empty process page cannot have a cursor")
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessToolBindingRecord:
+    """One durable binding from the indexed JIT-recovery projection."""
+
+    pid: str
+    tool_name: str
+    tool_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pid, str) or not self.pid or "\x00" in self.pid:
+            raise ValueError("process tool binding PID must not be empty")
+        for field_name, value in (
+            ("tool name", self.tool_name),
+            ("tool identity", self.tool_id),
+        ):
+            if not isinstance(value, str) or not value or "\x00" in value:
+                raise ValueError(
+                    f"process tool binding {field_name} must not be empty"
+                )
+
+
+@dataclass(frozen=True, order=True, slots=True)
+class ProcessToolBindingCursor:
+    """Stable global keyset for the normalized JIT binding projection."""
+
+    pid: str
+    tool_name: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pid, str) or not self.pid or "\x00" in self.pid:
+            raise ValueError("process tool binding cursor PID must not be empty")
+        if (
+            not isinstance(self.tool_name, str)
+            or not self.tool_name
+            or "\x00" in self.tool_name
+        ):
+            raise ValueError(
+                "process tool binding cursor tool name must not be empty"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ProcessToolBindingPage:
+    """One hard-bounded page of normalized durable JIT bindings."""
+
+    records: tuple[ProcessToolBindingRecord, ...]
+    next_cursor: ProcessToolBindingCursor | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_cursor is not None and not isinstance(
+            self.next_cursor,
+            ProcessToolBindingCursor,
+        ):
+            raise ValueError("process tool binding page cursor has an invalid type")
+        if self.next_cursor is not None and not self.records:
+            raise ValueError("empty process tool binding page cannot have a cursor")
+        keys = [
+            ProcessToolBindingCursor(record.pid, record.tool_name)
+            for record in self.records
+        ]
+        if keys != sorted(keys) or len(keys) != len(set(keys)):
+            raise ValueError(
+                "process tool binding recovery page must be strictly ordered"
+            )
+        if self.next_cursor is not None and self.next_cursor != keys[-1]:
+            raise ValueError(
+                "process tool binding recovery cursor must match the last record"
+            )
 
 
 @dataclass(frozen=True)
@@ -240,9 +470,36 @@ class ProcessExecutionToken:
     lease_id: str
 
 
+@dataclass(frozen=True, order=True, slots=True)
+class ProcessRestoreEpoch:
+    """One process's durable restore high-water floor or reserved epoch."""
+
+    pid: PID
+    revision: int
+    execution_generation: int
+    state_generation: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pid, str) or not self.pid or "\x00" in self.pid:
+            raise ValueError("process restore epoch PID must not be empty")
+        for field_name in (
+            "revision",
+            "execution_generation",
+            "state_generation",
+        ):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"process restore epoch {field_name} must be a non-negative integer"
+                )
+
+
 @dataclass
 class ProcessResult:
     pid: PID
     status: ProcessStatus
     result: ObjectHandle | None = None
     message: str | None = None
+    wait_state: ProcessWaitState | None = None
+    outcome: ProcessOutcome | None = None
+    state_generation: int = 0

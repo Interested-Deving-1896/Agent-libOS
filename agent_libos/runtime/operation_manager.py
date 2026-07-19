@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, replace
 from functools import wraps
-from typing import Any, Callable, Iterable, Iterator, TypeVar
+from typing import Any, Callable, Iterable, Iterator, TypeVar, cast
 
 from agent_libos.models import (
     OperationEvidenceLink,
@@ -15,6 +15,7 @@ from agent_libos.models import (
     OperationOutcome,
     OperationRecord,
     OperationState,
+    StaleOperationRecoverySummary,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -23,8 +24,14 @@ from agent_libos.models.exceptions import (
     ProcessMessageWaitRequired,
     ProcessWaitRequired,
     ResourceLimitExceeded,
+    RuntimePublicationPending,
+    RuntimeRecoveryRequired,
+    ValidationError,
 )
-from agent_libos.storage import EvidenceRepository
+from agent_libos.storage import (
+    OperationRepositoryProtocol,
+    RuntimePublicationRepositoryProtocol,
+)
 from agent_libos.utils.ids import new_id, utc_now
 
 
@@ -40,14 +47,62 @@ _CURRENT_OPERATION: ContextVar[_CurrentOperation | None] = ContextVar(
 )
 
 F = TypeVar("F", bound=Callable[..., Any])
+_RUNTIME_PUBLICATION_BINDING_VERSION = 1
+_RUNTIME_PUBLICATION_METADATA_PREFIX = "runtime_publication_"
+
+
+def _validated_public_operation_metadata(
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    selected = dict(metadata or {})
+    if any(
+        str(key).startswith(_RUNTIME_PUBLICATION_METADATA_PREFIX)
+        for key in selected
+    ):
+        raise ValidationError(
+            "runtime publication metadata is reserved for durable binding"
+        )
+    return selected
 
 
 class OperationManager:
     """Durable causal scopes for protected Agent libOS operations."""
 
-    def __init__(self, store: EvidenceRepository):
+    def __init__(
+        self,
+        store: OperationRepositoryProtocol,
+        publications: RuntimePublicationRepositoryProtocol | None = None,
+        *,
+        recovery_page_size: int = 500,
+        require_recovery_lease: Callable[[], None] | None = None,
+        recovery_terminalization_scope: (
+            Callable[[str], AbstractContextManager[Any]] | None
+        ) = None,
+        current_mutation_admission_is_stale: Callable[[], bool] | None = None,
+    ):
+        if (
+            isinstance(recovery_page_size, bool)
+            or not isinstance(recovery_page_size, int)
+            or recovery_page_size <= 0
+        ):
+            raise ValueError("operation recovery page size must be positive")
         self.store = store
+        self.publications: RuntimePublicationRepositoryProtocol = (
+            publications
+            if publications is not None
+            else cast(RuntimePublicationRepositoryProtocol, store)
+        )
         self._identity = id(self)
+        self._recovery_page_size = recovery_page_size
+        self._require_recovery_lease = (
+            require_recovery_lease
+            if require_recovery_lease is not None
+            else self._recovery_lease_not_configured
+        )
+        self._recovery_terminalization_scope = recovery_terminalization_scope
+        self._current_mutation_admission_is_stale = (
+            current_mutation_admission_is_stale
+        )
 
     def current_id(self) -> str | None:
         current = _CURRENT_OPERATION.get()
@@ -76,6 +131,7 @@ class OperationManager:
             raise ValueError(f"parent operation not found: {parent_id}")
         operation_id = new_id("op")
         now = utc_now()
+        selected_metadata = _validated_public_operation_metadata(metadata)
         record = OperationRecord(
             operation_id=operation_id,
             root_operation_id=parent.root_operation_id if parent is not None else operation_id,
@@ -87,7 +143,7 @@ class OperationManager:
             state=OperationState.RUNNING,
             outcome=OperationOutcome.PENDING,
             expected_roles=sorted({str(value) for value in expected_roles}),
-            metadata=dict(metadata or {}),
+            metadata=selected_metadata,
             started_at=now,
             updated_at=now,
         )
@@ -126,12 +182,17 @@ class OperationManager:
             return updated
 
     def merge_metadata(self, metadata: dict[str, Any], *, operation_id: str | None = None) -> OperationRecord | None:
+        selected_metadata = _validated_public_operation_metadata(metadata)
         selected_id = operation_id or self.current_id()
         if selected_id is None:
             return None
         with self.store.locked():
             record = self._require(selected_id)
-            updated = replace(record, metadata={**record.metadata, **dict(metadata)}, updated_at=utc_now())
+            updated = replace(
+                record,
+                metadata={**record.metadata, **selected_metadata},
+                updated_at=utc_now(),
+            )
             self.store.update_operation(updated)
             return updated
 
@@ -141,6 +202,8 @@ class OperationManager:
             return None
         with self.store.locked():
             record = self._require(selected_id)
+            if record.pid == str(pid):
+                return record
             updated = replace(record, pid=str(pid), updated_at=utc_now())
             self.store.update_operation(updated)
             return updated
@@ -152,6 +215,19 @@ class OperationManager:
         operation_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> OperationRecord | None:
+        return self._finish(
+            outcome,
+            operation_id=operation_id,
+            metadata=_validated_public_operation_metadata(metadata),
+        )
+
+    def _finish(
+        self,
+        outcome: OperationOutcome | str,
+        *,
+        operation_id: str | None,
+        metadata: dict[str, Any],
+    ) -> OperationRecord | None:
         selected_id = operation_id or self.current_id()
         if selected_id is None:
             return None
@@ -160,7 +236,7 @@ class OperationManager:
             if record.state == OperationState.TERMINAL:
                 return record
             selected_outcome = OperationOutcome(outcome)
-            selected_metadata = dict(metadata or {})
+            selected_metadata = dict(metadata)
             if (
                 selected_outcome == OperationOutcome.SUCCEEDED
                 and self._has_unknown_external_effect(selected_id)
@@ -186,12 +262,357 @@ class OperationManager:
                 return self._require(selected_id)
             return updated
 
+    def bind_runtime_publication(
+        self,
+        operation_id: str,
+        *,
+        publication_id: str,
+        publication_kind: str,
+        expected_kind: OperationKind | str,
+        expected_name: str,
+        expected_actor: str,
+        expected_pid: str | None,
+    ) -> OperationRecord:
+        """Persist the publication-to-operation association during planning."""
+
+        with self.store.locked():
+            self._require_runtime_publication_plan(
+                operation_id,
+                publication_id=publication_id,
+                publication_kind=publication_kind,
+                required_state="planning",
+            )
+
+            record = self._require_runtime_publication_operation_identity(
+                operation_id,
+                publication_id=publication_id,
+                expected_kind=expected_kind,
+                expected_name=expected_name,
+                expected_actor=expected_actor,
+                expected_pid=expected_pid,
+            )
+            if record.state != OperationState.RUNNING:
+                raise ValidationError(
+                    "runtime publication can only bind its active operation: "
+                    f"{publication_id} -> {operation_id}"
+                )
+            binding_operation_ids = self.runtime_publication_binding_operation_ids(
+                publication_id
+            )
+            if binding_operation_ids not in ([], [str(operation_id)]):
+                raise ValidationError(
+                    "runtime publication is already bound to another operation: "
+                    f"{publication_id} -> {binding_operation_ids}"
+                )
+            existing_publication_id = record.metadata.get("runtime_publication_id")
+            if (
+                existing_publication_id is not None
+                and str(existing_publication_id) != str(publication_id)
+            ):
+                raise ValidationError(
+                    "operation is already bound to another runtime publication: "
+                    f"{operation_id} -> {existing_publication_id}"
+                )
+            metadata = {
+                **record.metadata,
+                "runtime_publication_id": str(publication_id),
+                "runtime_publication_kind": str(publication_kind),
+                "runtime_publication_bound": True,
+                "runtime_publication_binding_version": (
+                    _RUNTIME_PUBLICATION_BINDING_VERSION
+                ),
+            }
+            if record.metadata == metadata:
+                return record
+            updated = replace(record, metadata=metadata, updated_at=utc_now())
+            if not self.store.update_operation(
+                updated,
+                expected_states=[OperationState.RUNNING.value],
+            ):
+                latest = self._require(operation_id)
+                if (
+                    latest.state == OperationState.RUNNING
+                    and latest.metadata.get("runtime_publication_id")
+                    == str(publication_id)
+                    and latest.metadata.get("runtime_publication_kind")
+                    == str(publication_kind)
+                    and latest.metadata.get("runtime_publication_bound") is True
+                    and latest.metadata.get("runtime_publication_binding_version")
+                    == _RUNTIME_PUBLICATION_BINDING_VERSION
+                ):
+                    return latest
+                raise RuntimeError(
+                    "operation changed during runtime publication binding: "
+                    f"{operation_id}"
+                )
+            return updated
+
+    def reconcile_runtime_publication(
+        self,
+        operation_id: str,
+        outcome: OperationOutcome | str,
+        *,
+        publication_id: str,
+        publication_kind: str,
+        publication_state: str,
+        publication_phase: str,
+        expected_kind: OperationKind | str,
+        expected_name: str,
+        expected_actor: str,
+        expected_pid: str | None,
+        _publication_reconciled_marker: Callable[..., bool] | None = None,
+    ) -> OperationRecord:
+        """Authoritatively converge an operation from its durable publication."""
+
+        selected_outcome = OperationOutcome(outcome)
+        if selected_outcome == OperationOutcome.PENDING:
+            raise ValueError("runtime publication cannot reconcile to pending")
+        with self.store.locked():
+            self._require_runtime_publication_plan(
+                operation_id,
+                publication_id=publication_id,
+                publication_kind=publication_kind,
+                required_state=publication_state,
+                required_phase=publication_phase,
+            )
+            record = self._require_runtime_publication_operation_identity(
+                operation_id,
+                publication_id=publication_id,
+                expected_kind=expected_kind,
+                expected_name=expected_name,
+                expected_actor=expected_actor,
+                expected_pid=expected_pid,
+            )
+            self._require_exact_runtime_publication_binding(
+                record,
+                publication_id=publication_id,
+                publication_kind=publication_kind,
+            )
+            now = utc_now()
+            metadata = {
+                **record.metadata,
+                "runtime_publication_id": str(publication_id),
+                "runtime_publication_state": str(publication_state),
+                "runtime_publication_phase": str(publication_phase),
+                "runtime_publication_reconciled": True,
+            }
+            metadata.setdefault(
+                "runtime_publication_original_operation_state",
+                record.state.value,
+            )
+            metadata.setdefault(
+                "runtime_publication_original_operation_outcome",
+                record.outcome.value,
+            )
+            if (
+                record.state == OperationState.TERMINAL
+                and record.outcome == selected_outcome
+                and record.metadata == metadata
+            ):
+                self._mark_runtime_publication_operation_reconciled(
+                    operation_id,
+                    publication_id=publication_id,
+                    publication_kind=publication_kind,
+                    publication_state=publication_state,
+                    publication_phase=publication_phase,
+                    reconciled_marker=_publication_reconciled_marker,
+                )
+                return record
+            updated = replace(
+                record,
+                state=OperationState.TERMINAL,
+                outcome=selected_outcome,
+                metadata=metadata,
+                updated_at=now,
+                completed_at=record.completed_at or now,
+            )
+            if not self.store.update_operation(
+                updated,
+                expected_states=[record.state.value],
+            ):
+                latest = self._require(operation_id)
+                if (
+                    latest.state == OperationState.TERMINAL
+                    and latest.outcome == selected_outcome
+                    and latest.metadata.get("runtime_publication_id")
+                    == str(publication_id)
+                ):
+                    self._require_exact_runtime_publication_binding(
+                        latest,
+                        publication_id=publication_id,
+                        publication_kind=publication_kind,
+                    )
+                    self._mark_runtime_publication_operation_reconciled(
+                        operation_id,
+                        publication_id=publication_id,
+                        publication_kind=publication_kind,
+                        publication_state=publication_state,
+                        publication_phase=publication_phase,
+                        reconciled_marker=_publication_reconciled_marker,
+                    )
+                    return latest
+                raise RuntimeError(
+                    "operation changed during runtime publication reconciliation: "
+                    f"{operation_id}"
+                )
+            self._mark_runtime_publication_operation_reconciled(
+                operation_id,
+                publication_id=publication_id,
+                publication_kind=publication_kind,
+                publication_state=publication_state,
+                publication_phase=publication_phase,
+                reconciled_marker=_publication_reconciled_marker,
+            )
+            return updated
+
+    def _mark_runtime_publication_operation_reconciled(
+        self,
+        operation_id: str,
+        *,
+        publication_id: str,
+        publication_kind: str,
+        publication_state: str,
+        publication_phase: str,
+        reconciled_marker: Callable[..., bool] | None,
+    ) -> None:
+        marker = (
+            reconciled_marker
+            or self.publications.mark_runtime_publication_operation_reconciled
+        )
+        if not marker(
+            publication_id,
+            expected_kind=publication_kind,
+            expected_state=publication_state,
+            expected_phase=publication_phase,
+            expected_operation_id=operation_id,
+        ):
+            raise RuntimeError(
+                "runtime publication changed while marking operation reconciliation: "
+                f"{publication_id} -> {operation_id}"
+            )
+
+    def runtime_publication_binding_operation_ids(
+        self,
+        publication_id: str,
+    ) -> list[str]:
+        """Return every operation carrying a reverse link to a publication."""
+
+        return self.store.list_operation_ids_by_runtime_publication_id(
+            str(publication_id)
+        )
+
+    def get_operation(self, operation_id: str) -> OperationRecord | None:
+        """Read one operation through the manager's typed repository boundary."""
+
+        return self.store.get_operation(str(operation_id))
+
+    def _require_runtime_publication_plan(
+        self,
+        operation_id: str,
+        *,
+        publication_id: str,
+        publication_kind: str,
+        required_state: str,
+        required_phase: str | None = None,
+    ) -> dict[str, Any]:
+        publication = self.publications.get_runtime_publication(publication_id)
+        if publication is None:
+            raise ValidationError(
+                f"runtime publication is missing: {publication_id}"
+            )
+        plan = publication["plan"]
+        matches = (
+            publication["kind"] == str(publication_kind)
+            and str(plan.get("operation_id") or "") == str(operation_id)
+            and plan.get("operation_binding_version")
+            == _RUNTIME_PUBLICATION_BINDING_VERSION
+            and publication["state"] == str(required_state)
+            and (
+                required_phase is None
+                or publication["phase"] == str(required_phase)
+            )
+        )
+        if not matches:
+            raise ValidationError(
+                "runtime publication binding changed: "
+                f"{publication_id} -> {operation_id}"
+            )
+        return publication
+
+    def _require_exact_runtime_publication_binding(
+        self,
+        record: OperationRecord,
+        *,
+        publication_id: str,
+        publication_kind: str,
+    ) -> None:
+        binding_operation_ids = self.runtime_publication_binding_operation_ids(
+            publication_id
+        )
+        metadata = record.metadata
+        if (
+            binding_operation_ids != [record.operation_id]
+            or metadata.get("runtime_publication_bound") is not True
+            or metadata.get("runtime_publication_kind") != str(publication_kind)
+            or metadata.get("runtime_publication_binding_version")
+            != _RUNTIME_PUBLICATION_BINDING_VERSION
+        ):
+            raise ValidationError(
+                "operation is not the exact durable runtime publication binding: "
+                f"{record.operation_id} -> {publication_id}"
+            )
+
+    def _require_runtime_publication_operation_identity(
+        self,
+        operation_id: str,
+        *,
+        publication_id: str,
+        expected_kind: OperationKind | str,
+        expected_name: str,
+        expected_actor: str,
+        expected_pid: str | None,
+    ) -> OperationRecord:
+        record = self.store.get_operation(operation_id)
+        if record is None:
+            raise ValidationError(
+                "runtime publication references a missing operation: "
+                f"{publication_id} -> {operation_id}"
+            )
+
+        selected_kind = OperationKind(expected_kind)
+        selected_pid = str(expected_pid) if expected_pid is not None else None
+        identity_mismatches: list[str] = []
+        if record.kind != selected_kind:
+            identity_mismatches.append(
+                f"kind={record.kind.value!r} (expected {selected_kind.value!r})"
+            )
+        if record.name != str(expected_name):
+            identity_mismatches.append(
+                f"name={record.name!r} (expected {str(expected_name)!r})"
+            )
+        if record.actor != str(expected_actor):
+            identity_mismatches.append(
+                f"actor={record.actor!r} (expected {str(expected_actor)!r})"
+            )
+        if record.pid != selected_pid:
+            identity_mismatches.append(
+                f"pid={record.pid!r} (expected {selected_pid!r})"
+            )
+        if identity_mismatches:
+            raise ValidationError(
+                "runtime publication operation identity mismatch: "
+                f"{publication_id} -> {operation_id} "
+                f"({'; '.join(identity_mismatches)})"
+            )
+        return record
+
     def wait(
         self,
         *,
         operation_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> OperationRecord | None:
+        selected_metadata = _validated_public_operation_metadata(metadata)
         selected_id = operation_id or self.current_id()
         if selected_id is None:
             return None
@@ -203,7 +624,7 @@ class OperationManager:
                 record,
                 state=OperationState.WAITING,
                 outcome=OperationOutcome.PENDING,
-                metadata={**record.metadata, **dict(metadata or {})},
+                metadata={**record.metadata, **selected_metadata},
                 updated_at=utc_now(),
                 completed_at=None,
             )
@@ -247,27 +668,55 @@ class OperationManager:
         ids = sorted({link.operation_id for link in links})
         return [record for operation_id in ids if (record := self.store.get_operation(operation_id)) is not None]
 
-    def interrupt_stale_running(self) -> list[str]:
-        interrupted: list[str] = []
-        for record in self.store.list_operations(state=OperationState.RUNNING.value):
-            pending_effect = self._has_unknown_external_effect(record.operation_id)
-            updated = self.finish(
-                OperationOutcome.UNKNOWN if pending_effect else OperationOutcome.INTERRUPTED,
-                operation_id=record.operation_id,
-                metadata={
-                    "recovery": (
-                        "stale_running_with_pending_external_effect"
-                        if pending_effect
-                        else "stale_running_operation"
+    def interrupt_stale_running(self) -> StaleOperationRecoverySummary:
+        self._require_recovery_lease()
+        interrupted_sample: list[str] = []
+        interrupted_total = 0
+        cursor = None
+        with self.store.stale_operation_recovery_index():
+            while True:
+                page = self.store.scan_stale_running_operations(
+                    after=cursor,
+                    limit=self._recovery_page_size,
+                )
+                unknown_ids = self.store.operation_ids_with_unknown_external_effects(
+                    record.operation_id for record in page.records
+                )
+                for record in page.records:
+                    pending_effect = record.operation_id in unknown_ids
+                    updated = self.finish(
+                        (
+                            OperationOutcome.UNKNOWN
+                            if pending_effect
+                            else OperationOutcome.INTERRUPTED
+                        ),
+                        operation_id=record.operation_id,
+                        metadata={
+                            "recovery": (
+                                "stale_running_with_pending_external_effect"
+                                if pending_effect
+                                else "stale_running_operation"
+                            )
+                        },
                     )
-                },
-            )
-            if updated is not None and updated.outcome in {
-                OperationOutcome.INTERRUPTED,
-                OperationOutcome.UNKNOWN,
-            }:
-                interrupted.append(updated.operation_id)
-        return interrupted
+                    if updated is not None and updated.outcome in {
+                        OperationOutcome.INTERRUPTED,
+                        OperationOutcome.UNKNOWN,
+                    }:
+                        interrupted_total += 1
+                        if len(interrupted_sample) < self._recovery_page_size:
+                            interrupted_sample.append(updated.operation_id)
+                cursor = page.next_cursor
+                if cursor is None:
+                    break
+        return StaleOperationRecoverySummary(
+            total_count=interrupted_total,
+            sample_operation_ids=tuple(interrupted_sample),
+        )
+
+    @staticmethod
+    def _recovery_lease_not_configured() -> None:
+        raise RuntimeError("operation recovery requires a configured recovery lease")
 
     @contextmanager
     def activate(self, operation_id: str) -> Iterator[OperationRecord]:
@@ -287,6 +736,362 @@ class OperationManager:
             yield record
         finally:
             _CURRENT_OPERATION.reset(token)
+
+    def _owns_pending_runtime_publication(
+        self,
+        operation_id: str,
+        pending: RuntimePublicationPending | RuntimeRecoveryRequired,
+    ) -> bool:
+        publication = self.publications.get_runtime_publication(
+            pending.publication_id
+        )
+        operation = self.store.get_operation(operation_id)
+        return bool(
+            publication is not None
+            and operation is not None
+            and operation.state != OperationState.TERMINAL
+            and publication["state"]
+            in {"planning", "applying", "reconciliation_pending", "rollback_pending"}
+            and str(publication["plan"].get("operation_id") or "") == operation_id
+            and publication["plan"].get("operation_binding_version")
+            == _RUNTIME_PUBLICATION_BINDING_VERSION
+            and self.runtime_publication_binding_operation_ids(
+                pending.publication_id
+            )
+            == [operation_id]
+            and operation.metadata.get("runtime_publication_id")
+            == pending.publication_id
+            and operation.metadata.get("runtime_publication_kind")
+            == publication["kind"]
+            and operation.metadata.get("runtime_publication_bound") is True
+            and operation.metadata.get("runtime_publication_binding_version")
+            == _RUNTIME_PUBLICATION_BINDING_VERSION
+            and self._runtime_publication_operation_contract_matches(
+                operation,
+                publication,
+            )
+            and pending.operation_id == operation_id
+            and (
+                not isinstance(pending, RuntimeRecoveryRequired)
+                or pending.pid == publication["pid"]
+            )
+            and pending.state == publication["state"]
+            and pending.phase == publication["phase"]
+        )
+
+    def _owns_grouped_pending_runtime_publication(
+        self,
+        operation_id: str,
+        error: BaseExceptionGroup,
+    ) -> bool:
+        """Recognize exact pending signals carried by a control-flow group."""
+
+        pending: list[RuntimePublicationPending | RuntimeRecoveryRequired] = []
+        stack: list[BaseException] = [error]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, BaseExceptionGroup):
+                stack.extend(current.exceptions)
+            elif isinstance(
+                current,
+                (RuntimePublicationPending, RuntimeRecoveryRequired),
+            ):
+                pending.append(current)
+        return bool(pending) and all(
+            self._owns_pending_runtime_publication(operation_id, item)
+            for item in pending
+        )
+
+    def _finish_runtime_publication_mismatch(
+        self,
+        operation: OperationRecord,
+        error: BaseException,
+    ) -> None:
+        scope = self._recovery_terminalization_scope
+        publication_id = self._validated_terminalization_publication_id(
+            operation,
+            error,
+        )
+        if scope is None or publication_id is None:
+            self._finish_unless_admission_stale(
+                (
+                    OperationOutcome.UNKNOWN
+                    if self._has_unknown_external_effect(operation.operation_id)
+                    else OperationOutcome.FAILED
+                ),
+                operation_id=operation.operation_id,
+                metadata={
+                    "error_type": type(error).__name__,
+                    "runtime_publication_mismatch": True,
+                },
+            )
+            return
+        with scope(publication_id):
+            self._finish(
+                (
+                    OperationOutcome.UNKNOWN
+                    if self._has_unknown_external_effect(operation.operation_id)
+                    else OperationOutcome.FAILED
+                ),
+                operation_id=operation.operation_id,
+                metadata={
+                    "error_type": type(error).__name__,
+                    "runtime_publication_mismatch": True,
+                },
+            )
+
+    def _finish_unless_admission_stale(
+        self,
+        outcome: OperationOutcome | str,
+        *,
+        operation_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> OperationRecord | None:
+        stale = self._current_mutation_admission_is_stale
+        if stale is not None and stale():
+            return None
+        try:
+            return self._finish(
+                outcome,
+                operation_id=operation_id,
+                metadata=dict(metadata or {}),
+            )
+        except BaseException:
+            if stale is not None and stale():
+                return None
+            raise
+
+    def _validated_terminalization_publication_id(
+        self,
+        operation: OperationRecord,
+        error: BaseException,
+    ) -> str | None:
+        """Resolve one exact durable publication without trusting the signal.
+
+        A control-flow signal is only a lookup hint.  Its complete envelope,
+        the publication plan, the unique reverse operation binding, and the
+        durable operation ancestry must all agree before the builder-issued
+        terminalization scope can be selected.
+        """
+
+        signals = self._runtime_publication_signals(error)
+        if not signals:
+            return None
+        selected_publication_id: str | None = None
+        for signal in signals:
+            binding = self._validated_signal_binding(signal)
+            if binding is None:
+                return None
+            publication_id, bound_operation = binding
+            if not self._operations_are_ancestrally_related(
+                operation,
+                bound_operation,
+            ):
+                return None
+            if (
+                selected_publication_id is not None
+                and selected_publication_id != publication_id
+            ):
+                return None
+            selected_publication_id = publication_id
+        return selected_publication_id
+
+    def _validated_signal_binding(
+        self,
+        signal: RuntimePublicationPending | RuntimeRecoveryRequired,
+    ) -> tuple[str, OperationRecord] | None:
+        publication = self.publications.get_runtime_publication(
+            signal.publication_id
+        )
+        if publication is None:
+            return None
+        publication_id = str(publication.get("publication_id") or "")
+        plan = publication.get("plan")
+        if not publication_id or not isinstance(plan, dict):
+            return None
+        bound_operation_id = str(plan.get("operation_id") or "")
+        if not bound_operation_id:
+            return None
+        if self.runtime_publication_binding_operation_ids(publication_id) != [
+            bound_operation_id
+        ]:
+            return None
+        bound_operation = self.store.get_operation(bound_operation_id)
+        if bound_operation is None or not self._bound_operation_matches_publication(
+            bound_operation,
+            publication,
+        ):
+            return None
+        if not self._signal_matches_publication(
+            signal,
+            publication,
+            bound_operation_id=bound_operation_id,
+        ):
+            return None
+        return publication_id, bound_operation
+
+    def _bound_operation_matches_publication(
+        self,
+        operation: OperationRecord,
+        publication: dict[str, Any],
+    ) -> bool:
+        metadata = operation.metadata
+        return bool(
+            metadata.get("runtime_publication_id")
+            == publication.get("publication_id")
+            and metadata.get("runtime_publication_kind")
+            == publication.get("kind")
+            and metadata.get("runtime_publication_bound") is True
+            and metadata.get("runtime_publication_binding_version")
+            == _RUNTIME_PUBLICATION_BINDING_VERSION
+            and self._runtime_publication_operation_contract_matches(
+                operation,
+                publication,
+            )
+        )
+
+    @staticmethod
+    def _signal_matches_publication(
+        signal: RuntimePublicationPending | RuntimeRecoveryRequired,
+        publication: dict[str, Any],
+        *,
+        bound_operation_id: str,
+    ) -> bool:
+        return bool(
+            str(signal.publication_id)
+            == str(publication.get("publication_id") or "")
+            and str(signal.operation_id) == bound_operation_id
+            and str(signal.state) == str(publication.get("state") or "")
+            and str(signal.phase) == str(publication.get("phase") or "")
+            and (
+                not isinstance(signal, RuntimeRecoveryRequired)
+                or str(signal.pid) == str(publication.get("pid") or "")
+            )
+        )
+
+    @staticmethod
+    def _runtime_publication_signals(
+        error: BaseException,
+    ) -> list[RuntimePublicationPending | RuntimeRecoveryRequired]:
+        signals: list[RuntimePublicationPending | RuntimeRecoveryRequired] = []
+        stack = [error]
+        while stack:
+            current = stack.pop()
+            if isinstance(current, BaseExceptionGroup):
+                stack.extend(current.exceptions)
+            elif isinstance(
+                current,
+                (RuntimePublicationPending, RuntimeRecoveryRequired),
+            ):
+                signals.append(current)
+        return signals
+
+    def _operations_are_ancestrally_related(
+        self,
+        left: OperationRecord,
+        right: OperationRecord,
+    ) -> bool:
+        if left.root_operation_id != right.root_operation_id:
+            return False
+        return self._operation_descends_from(left, right.operation_id) or (
+            self._operation_descends_from(right, left.operation_id)
+        )
+
+    def _operation_descends_from(
+        self,
+        operation: OperationRecord,
+        ancestor_operation_id: str,
+    ) -> bool:
+        current: OperationRecord | None = operation
+        seen: set[str] = set()
+        while current is not None and current.operation_id not in seen:
+            if current.operation_id == ancestor_operation_id:
+                return True
+            seen.add(current.operation_id)
+            current = (
+                self.store.get_operation(current.parent_operation_id)
+                if current.parent_operation_id is not None
+                else None
+            )
+        return False
+
+    @staticmethod
+    def _runtime_publication_operation_contract_matches(
+        operation: OperationRecord,
+        publication: dict[str, Any],
+    ) -> bool:
+        plan = publication["plan"]
+        publication_pid = str(publication["pid"])
+        if (
+            operation.kind != OperationKind.RUNTIME
+            or str(plan.get("pid") or "") != publication_pid
+        ):
+            return False
+        if publication["kind"] == "process_exec":
+            return OperationManager._process_exec_publication_contract_matches(
+                operation,
+                publication_pid,
+            )
+        if publication["kind"] == "checkpoint_restore":
+            return OperationManager._checkpoint_restore_publication_contract_matches(
+                operation,
+                plan,
+            )
+        if publication["kind"] != "process_launch":
+            return False
+        return OperationManager._process_launch_publication_contract_matches(
+            operation,
+            plan,
+            publication_pid,
+        )
+
+    @staticmethod
+    def _process_exec_publication_contract_matches(
+        operation: OperationRecord,
+        publication_pid: str,
+    ) -> bool:
+        return (
+            operation.name == "process.exec"
+            and operation.actor == publication_pid
+            and operation.pid == publication_pid
+        )
+
+    @staticmethod
+    def _checkpoint_restore_publication_contract_matches(
+        operation: OperationRecord,
+        plan: dict[str, Any],
+    ) -> bool:
+        actor = str(plan.get("actor") or "")
+        return bool(
+            actor
+            and str(plan.get("checkpoint_id") or "")
+            and operation.name == "checkpoint.restore"
+            and operation.actor == actor
+            and operation.pid == actor
+        )
+
+    @staticmethod
+    def _process_launch_publication_contract_matches(
+        operation: OperationRecord,
+        plan: dict[str, Any],
+        publication_pid: str,
+    ) -> bool:
+        launch_kind = str(plan.get("launch_kind") or "")
+        if launch_kind == "spawn":
+            return (
+                plan.get("parent_pid") is None
+                and operation.name == "process.spawn"
+                and operation.actor == "runtime"
+                and operation.pid in {None, publication_pid}
+            )
+        parent_pid = str(plan.get("parent_pid") or "")
+        return bool(
+            parent_pid
+            and launch_kind in {"fork", "spawn_child"}
+            and operation.name == f"process.{launch_kind}"
+            and operation.actor == parent_pid
+            and operation.pid == parent_pid
+        )
 
     @contextmanager
     def scope(
@@ -321,18 +1126,32 @@ class OperationManager:
         except (HumanApprovalRequired, ProcessWaitRequired, ProcessMessageWaitRequired) as exc:
             self._record_wait(record.operation_id, exc)
             raise
+        except (RuntimePublicationPending, RuntimeRecoveryRequired) as exc:
+            if not self._owns_pending_runtime_publication(record.operation_id, exc):
+                self._finish_runtime_publication_mismatch(record, exc)
+            raise
+        except BaseExceptionGroup as exc:
+            if not self._owns_grouped_pending_runtime_publication(
+                record.operation_id,
+                exc,
+            ):
+                self._finish_runtime_publication_mismatch(record, exc)
+            raise
         except (CapabilityDenied, PolicyDenied, ResourceLimitExceeded) as exc:
-            self.finish(
+            self._finish_unless_admission_stale(
                 OperationOutcome.DENIED,
                 operation_id=record.operation_id,
                 metadata={"error_type": type(exc).__name__},
             )
             raise
         except asyncio.CancelledError:
-            self.finish(OperationOutcome.INTERRUPTED, operation_id=record.operation_id)
+            self._finish_unless_admission_stale(
+                OperationOutcome.INTERRUPTED,
+                operation_id=record.operation_id,
+            )
             raise
         except BaseException as exc:
-            self.finish(
+            self._finish_unless_admission_stale(
                 OperationOutcome.UNKNOWN if self._has_unknown_external_effect(record.operation_id) else OperationOutcome.FAILED,
                 operation_id=record.operation_id,
                 metadata={"error_type": type(exc).__name__},
@@ -340,7 +1159,10 @@ class OperationManager:
             raise
         else:
             if auto_finish:
-                self.finish(OperationOutcome.SUCCEEDED, operation_id=record.operation_id)
+                self._finish_unless_admission_stale(
+                    OperationOutcome.SUCCEEDED,
+                    operation_id=record.operation_id,
+                )
         finally:
             _CURRENT_OPERATION.reset(token)
 
@@ -439,26 +1261,5 @@ class OperationManager:
         return record
 
     def _has_unknown_external_effect(self, operation_id: str) -> bool:
-        selected = self._require(operation_id)
-        subtree = {operation_id}
-        descendants = self.store.list_operations(root_operation_id=selected.root_operation_id)
-        changed = True
-        while changed:
-            changed = False
-            for candidate in descendants:
-                if candidate.parent_operation_id in subtree and candidate.operation_id not in subtree:
-                    subtree.add(candidate.operation_id)
-                    changed = True
-        links = self.store.list_operation_evidence(
-            operation_ids=subtree,
-            evidence_types=["external_effect"],
-        )
-        return any(
-            effect is not None
-            and (
-                effect.effect_state == "pending"
-                or effect.transaction_state == "unknown"
-            )
-            for link in links
-            if (effect := self.store.get_external_effect(link.evidence_id)) is not None
-        )
+        self._require(operation_id)
+        return self.store.operation_has_unknown_external_effect(operation_id)

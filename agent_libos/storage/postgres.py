@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable, Iterator
-from typing import Any
+from typing import Any, Mapping
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
 from agent_libos.storage.engine import split_sql_script
-from agent_libos.storage.sql import SQLRuntimeStore
+from agent_libos.storage.sql import SQLRuntimeStore, _V3_KEYSET_TEXT_COLUMNS
 
 
 def _postgres_runtime_lock_key(database: str, schema: str) -> int:
@@ -51,6 +51,12 @@ class _PostgresDialect:
         transformed = transformed.replace(
             "INSERT OR REPLACE INTO skill_trust",
             "INSERT INTO skill_trust",
+        )
+        transformed = re.sub(
+            r"\s+INDEXED\s+BY\s+[A-Za-z_][A-Za-z0-9_]*",
+            "",
+            transformed,
+            flags=re.IGNORECASE,
         )
         transformed = _prepare_parameterized_sql(transformed) if with_params else transformed.replace("?", "%s")
         if was_insert_or_ignore and "ON CONFLICT" not in transformed:
@@ -112,6 +118,12 @@ class _PostgresConnection:
     def close(self) -> None:
         self._conn.close()
 
+    @property
+    def closed(self) -> bool:
+        """Driver-reported session state after a possibly partial close."""
+
+        return bool(self._conn.closed)
+
     def commit(self) -> None:
         self._conn.commit()
 
@@ -138,6 +150,8 @@ class _PostgresConnection:
 class PostgresStore(SQLRuntimeStore):
     """PostgreSQL runtime store backend."""
 
+    KEYSET_TEXT_COLLATION = "C"
+
     def __init__(self, dsn: str, *, config: AgentLibOSConfig | None = None):
         self.config = config or DEFAULT_CONFIG
         self.path = dsn
@@ -148,16 +162,65 @@ class PostgresStore(SQLRuntimeStore):
         try:
             self._acquire_runtime_lease(conn)
             self._init_store(dsn, config=config, conn=conn)
-        except Exception:
-            self._release_runtime_lease(conn)
-            conn.close()
+        except BaseException as primary_error:
+            cleanup_errors = self._close_connection_best_effort(conn)
+            if cleanup_errors:
+                raise BaseExceptionGroup(
+                    "PostgreSQL store initialization and cleanup failed",
+                    [primary_error, *cleanup_errors],
+                ) from None
             raise
 
     def close(self) -> None:
+        conn = getattr(self, "conn", None)
+        if conn is None:
+            return
+        cleanup_errors = self._close_connection_best_effort(conn)
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "PostgreSQL store cleanup failed",
+                list(cleanup_errors),
+            ) from None
+
+    def _close_connection_best_effort(
+        self,
+        conn: _PostgresConnection,
+    ) -> tuple[BaseException, ...]:
+        """Close the owning session without a separate unlock commit point.
+
+        PostgreSQL advisory locks are session-scoped. An explicit unlock before
+        close creates an unobservable acknowledgement window: the server may
+        release the lock while the client sees both unlock and close errors.
+        Session close is therefore the sole irreversible ownership transition
+        used by runtime handoff.
+        """
+
+        errors: list[BaseException] = []
         try:
-            self._release_runtime_lease(getattr(self, "conn", None))
-        finally:
-            super().close()
+            conn.close()
+        except BaseException as exc:
+            errors.append(exc)
+        if self._postgres_connection_reports_closed(conn):
+            # A successfully closed PostgreSQL session cannot retain a session
+            # advisory lock, even if close itself reported a diagnostic.
+            self._runtime_lease_acquired = False
+            self._runtime_lease_key = None
+            self._backend_ownership_release_observed = True
+        return tuple(errors)
+
+    @staticmethod
+    def _postgres_connection_reports_closed(conn: Any) -> bool:
+        return getattr(conn, "closed", None) is True
+
+    def _runtime_ownership_released(self) -> bool:
+        if not getattr(self, "_runtime_lease_acquired", False):
+            return True
+        conn = getattr(self, "conn", None)
+        if conn is not None and self._postgres_connection_reports_closed(conn):
+            self._runtime_lease_acquired = False
+            self._runtime_lease_key = None
+            return True
+        return False
 
     @classmethod
     def _probe_user_schema_objects(cls, conn: Any) -> set[str]:
@@ -172,6 +235,55 @@ class PostgresStore(SQLRuntimeStore):
             """
         )
         return {str(row["name"]) for row in rows}
+
+    @classmethod
+    def _probe_text_column_collations(
+        cls,
+        conn: Any,
+    ) -> Mapping[tuple[str, str], str]:
+        tables = sorted(_V3_KEYSET_TEXT_COLUMNS)
+        placeholders = ", ".join("?" for _ in tables)
+        rows = conn.execute(
+            f"""
+            SELECT collation_row.collname AS collation_name
+                 , relation.relname AS table_name
+                 , attribute.attname AS column_name
+                 , current_setting('server_encoding') AS server_encoding
+              FROM pg_catalog.pg_attribute AS attribute
+              JOIN pg_catalog.pg_class AS relation
+                ON relation.oid = attribute.attrelid
+              JOIN pg_catalog.pg_namespace AS namespace
+                ON namespace.oid = relation.relnamespace
+              JOIN pg_catalog.pg_collation AS collation_row
+                ON collation_row.oid = attribute.attcollation
+             WHERE namespace.nspname = current_schema()
+               AND relation.relname IN ({placeholders})
+               AND attribute.attnum > 0
+               AND NOT attribute.attisdropped
+            """,
+            tables,
+        )
+        selected_rows = list(rows)
+        server_encodings = {
+            str(row["server_encoding"]).upper() for row in selected_rows
+        }
+        if server_encodings != {"UTF8"}:
+            raise UnsupportedStoreVersion(
+                "Agent libOS PostgreSQL keyset ordering requires UTF8 server_encoding; "
+                f"found {sorted(server_encodings) or ['missing']}"
+            )
+        required = {
+            (table, column)
+            for table, columns in _V3_KEYSET_TEXT_COLUMNS.items()
+            for column in columns
+        }
+        return {
+            (str(row["table_name"]), str(row["column_name"])): str(
+                row["collation_name"]
+            )
+            for row in selected_rows
+            if (str(row["table_name"]), str(row["column_name"])) in required
+        }
 
     def _acquire_runtime_lease(self, conn: _PostgresConnection) -> None:
         identity = conn.execute(
@@ -190,19 +302,6 @@ class PostgresStore(SQLRuntimeStore):
             raise ValidationError(f"runtime store is already open: postgres:{database}/{schema}")
         self._runtime_lease_key = lease_key
         self._runtime_lease_acquired = True
-
-    def _release_runtime_lease(self, conn: _PostgresConnection | None) -> None:
-        if conn is None or not getattr(self, "_runtime_lease_acquired", False):
-            return
-        self._runtime_lease_acquired = False
-        lease_key = getattr(self, "_runtime_lease_key", None)
-        if lease_key is None:
-            return
-        try:
-            conn.execute("SELECT pg_advisory_unlock(?)", (lease_key,))
-        except Exception:
-            pass
-
 
 _PRAGMA_TABLE_INFO = re.compile(r"^\s*PRAGMA\s+table_info\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)\s*$", re.IGNORECASE)
 _PRAGMA_INDEX_LIST = re.compile(r"^\s*PRAGMA\s+index_list\((?P<table>[A-Za-z_][A-Za-z0-9_]*)\)\s*$", re.IGNORECASE)

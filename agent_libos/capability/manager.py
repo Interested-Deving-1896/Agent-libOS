@@ -5,6 +5,10 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from agent_libos.capability.admission import (
+    CapabilityAdmissionPort,
+    install_instance_admission_guards,
+)
 from agent_libos.capability.effect_binding import APPROVAL_BINDING_KEY as APPROVAL_BINDING_CONSTRAINT_KEY
 from agent_libos.capability.evaluator import (
     DATA_RELEASE_BINDING_KEY as DATA_RELEASE_BINDING_CONSTRAINT_KEY,
@@ -16,6 +20,7 @@ from agent_libos.capability.mutation import CapabilityDraft, CapabilityMutationS
 from agent_libos.capability.profiles import SandboxProfileBuilder
 from agent_libos.capability.resources import ResourceAuthority
 from agent_libos.capability.rules import AUTHORITY_RULES_KEY, AuthorityRuleCodec
+from agent_libos.capability.transaction import AuthorityTransaction
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     AuthorityRisk,
@@ -34,6 +39,70 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.ports import AuditPort, CapabilityStorePort, EventPort, OperationPort
 from agent_libos.utils.ids import utc_now
+
+
+CAPABILITY_MANAGER_MUTATION_PUBLIC_METHODS = frozenset(
+    {
+        "assert_handle",
+        "authority_transaction",
+        "claim_decision_use",
+        "commit_reserved_use",
+        "consume_allow_once",
+        "consume_use",
+        "delegate",
+        "derive_authority",
+        "disable_subject_capability",
+        "finalize_exec_revocations",
+        "grant",
+        "grant_once",
+        "handle_for_object",
+        "inherit",
+        "issue",
+        "issue_trusted",
+        "require",
+        "reserve_decision_use",
+        "reserve_use",
+        "restore_reserved_use",
+        "revoke",
+        "revoke_resource_trusted",
+        "set_permission_policy",
+        "stage_exec_revocation",
+        "transition_allowed_rights",
+    }
+)
+
+CAPABILITY_MANAGER_MIXED_PUBLIC_METHODS = frozenset(
+    {
+        "authorize",
+        "authorize_matching_capabilities",
+        "decision_from_matches",
+        "reauthorize_decision",
+    }
+)
+
+CAPABILITY_MANAGER_READ_ONLY_PUBLIC_METHODS = frozenset(
+    {
+        "authorize_handle",
+        "capabilities_for",
+        "check",
+        "constraints_satisfied",
+        "explain_decision",
+        "inspect",
+        "is_expired",
+        "list_subject",
+        "matching_capabilities",
+        "object_access",
+        "parse_resource_pattern",
+        "permission_policy",
+        "project_read",
+        "resources_overlap",
+        "sandbox_profile_for_decision",
+        "spec",
+        "spec_covers",
+        "tool_execute",
+        "validate_delegation",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -65,6 +134,7 @@ class CapabilityManager:
         config: AgentLibOSConfig | None = None,
         *,
         operations: OperationPort,
+        admission: CapabilityAdmissionPort | None = None,
     ) -> None:
         self.config = config or DEFAULT_CONFIG
         self.store = store
@@ -75,8 +145,47 @@ class CapabilityManager:
         self.rule_codec = AuthorityRuleCodec()
         self.profiles = SandboxProfileBuilder()
         self.evaluator = CapabilityEvaluator(self.rule_codec)
-        self.leases = CapabilityLeaseService(store, audit, events, self.operations)
-        self.mutations = CapabilityMutationService(store, audit, events, self.leases)
+        self._admission = admission
+        self.leases = CapabilityLeaseService(
+            store,
+            audit,
+            events,
+            self.operations,
+            admission=admission,
+        )
+        self.mutations = CapabilityMutationService(
+            store,
+            audit,
+            events,
+            self.leases,
+            admission=admission,
+        )
+        install_instance_admission_guards(
+            self,
+            admission=admission,
+            mutation_methods=CAPABILITY_MANAGER_MUTATION_PUBLIC_METHODS,
+            mixed_audit_methods=CAPABILITY_MANAGER_MIXED_PUBLIC_METHODS,
+        )
+
+    def authority_transaction(
+        self,
+        decisions: Iterable[CapabilityDecision | None],
+        *,
+        actor: str,
+        operation: str,
+    ) -> AuthorityTransaction:
+        """Return the sole mutation boundary for cached authority decisions."""
+
+        return AuthorityTransaction(
+            self.store,
+            decisions,
+            actor=actor,
+            operation=operation,
+            reauthorize=self.reauthorize_decision,
+            reserve=self.reserve_decision_use,
+            commit=self.commit_reserved_use,
+            admission=self._admission,
+        )
 
     def issue(
         self,
@@ -88,16 +197,63 @@ class CapabilityManager:
         require_authority: bool = True,
     ) -> Capability:
         selected = self._coerce_spec(spec)
-        if require_authority:
-            issue_authority = self._require_issue_authority(actor, selected)
-            issuer_cap_id = (
-                issue_authority.mutation_decision.selected_capability_id
-                if issue_authority.mutation_decision is not None
-                else None
+        if not require_authority:
+            draft = self._prepare_issue_draft(
+                actor=actor,
+                subject=subject,
+                selected=selected,
+                transfer_parent=None,
+                issuer_cap_id=issuer_cap_id,
             )
-        else:
-            issue_authority = _IssueAuthority()
-        transfer_parent = issue_authority.transfer_parent
+            return self.mutations.issue(
+                draft,
+                actor=actor,
+                authority_decision=None,
+                attach_to_process=self._attach_to_process,
+            )
+
+        # This first pass is advisory only.  AuthorityTransaction reauthorizes
+        # the selected ADMIN/GRANT decision after entering the mutation UoW.
+        # A GRANT also transfers the requested rights, so its allow/deny and
+        # parent-attenuation checks must be recomputed inside that same UoW;
+        # rechecking GRANT alone would allow a concurrent READ/WRITE deny to be
+        # missed while still publishing the child capability.
+        issue_authority = self._require_issue_authority(actor, selected)
+        authority_decision = issue_authority.mutation_decision
+        assert authority_decision is not None
+        with self.authority_transaction(
+            [authority_decision],
+            actor=actor,
+            operation="capability issue",
+        ) as current_decisions:
+            current_decision = current_decisions[0]
+            transfer_parent: Capability | None = None
+            if issue_authority.transfer_parent is not None:
+                transfer_parent = self._find_transfer_parent(actor, selected)
+                self._validate_transfer_parent(transfer_parent, selected)
+            draft = self._prepare_issue_draft(
+                actor=actor,
+                subject=subject,
+                selected=selected,
+                transfer_parent=transfer_parent,
+                issuer_cap_id=current_decision.selected_capability_id,
+            )
+            return self.mutations.issue(
+                draft,
+                actor=actor,
+                authority_decision=None,
+                attach_to_process=self._attach_to_process,
+            )
+
+    def _prepare_issue_draft(
+        self,
+        *,
+        actor: str,
+        subject: str,
+        selected: CapabilitySpec,
+        transfer_parent: Capability | None,
+        issuer_cap_id: str | None,
+    ) -> CapabilityDraft:
         delegation_depth = transfer_parent.delegation_depth + 1 if transfer_parent is not None else 0
         max_delegation_depth = (
             self._delegated_max_delegation_depth(transfer_parent, selected)
@@ -107,7 +263,7 @@ class CapabilityManager:
         expires_at = selected.expires_at
         if transfer_parent is not None and expires_at is None:
             expires_at = transfer_parent.expires_at
-        draft = self._capability_draft(
+        return self._capability_draft(
             subject=subject,
             resource=selected.resource,
             rights=selected.rights,
@@ -123,12 +279,6 @@ class CapabilityManager:
             uses_remaining=selected.uses_remaining,
             delegable=selected.delegable,
             revocable=selected.revocable,
-        )
-        return self.mutations.issue(
-            draft,
-            actor=actor,
-            authority_decision=issue_authority.mutation_decision,
-            attach_to_process=self._attach_to_process,
         )
 
     def issue_trusted(
@@ -181,6 +331,7 @@ class CapabilityManager:
         expires_at: str | None = None,
         delegable: bool = False,
         revocable: bool = True,
+        metadata: dict[str, Any] | None = None,
     ) -> Capability:
         # Trusted runtime paths keep this compact bootstrap helper, while all
         # records still flow through issue() for canonical spec conversion.
@@ -201,6 +352,7 @@ class CapabilityManager:
             uses_remaining=uses_remaining,
             delegable=delegable,
             revocable=revocable,
+            metadata=metadata,
         )
 
     def delegate(
@@ -763,11 +915,47 @@ class CapabilityManager:
             authority_decision = self._require_revoke_authority(revoked_by, cap)
         else:
             authority_decision = None
-        return self.mutations.revoke(
+        if authority_decision is None:
+            return self.mutations.revoke(
+                cap_id,
+                revoked_by=revoked_by,
+                reason=reason,
+                authority_decision=None,
+            )
+        with self.authority_transaction(
+            [authority_decision],
+            actor=revoked_by,
+            operation="capability revoke",
+        ):
+            return self.mutations.revoke(
+                cap_id,
+                revoked_by=revoked_by,
+                reason=reason,
+                authority_decision=None,
+            )
+
+    def stage_exec_revocation(
+        self,
+        cap_id: str,
+        *,
+        rollback_token: str,
+    ) -> Capability:
+        """Internal exec publication transition; never grants authority."""
+
+        return self.mutations.stage_exec_revocation(
             cap_id,
-            revoked_by=revoked_by,
-            reason=reason,
-            authority_decision=authority_decision,
+            rollback_token=rollback_token,
+        )
+
+    def finalize_exec_revocations(
+        self,
+        subject: str,
+        *,
+        rollback_token: str,
+    ) -> list[Capability]:
+        return self.mutations.finalize_exec_revocations(
+            subject,
+            rollback_token=rollback_token,
         )
 
     def disable_subject_capability(
@@ -834,6 +1022,7 @@ class CapabilityManager:
         issued_by: str = "system",
         expires_at: str | None = None,
         uses_remaining: int | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> ObjectHandle:
         normalized = self._normalize_rights(rights)
         cap = self.issue_trusted(
@@ -844,7 +1033,7 @@ class CapabilityManager:
             expires_at=expires_at,
             uses_remaining=uses_remaining,
             delegable=False,
-            metadata={"object_handle": True},
+            metadata={**dict(metadata or {}), "object_handle": True},
         )
         return ObjectHandle(oid=oid, rights=normalized, capability_id=cap.cap_id, expires_at=expires_at)
 

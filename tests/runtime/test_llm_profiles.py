@@ -24,6 +24,7 @@ from agent_libos.models import (
     SinkTrustRule,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.runtime.builder import RuntimeBuilder
 from agent_libos.storage import SQLiteStore
 from tests.support.fakes import RecordingActionClient
 
@@ -579,7 +580,10 @@ class TestLLMProfiles:
 
     def test_runtime_shutdown_closes_async_llm_clients_inside_running_loop(self) -> None:
         async def run() -> bool:
-            runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+            runtime = await RuntimeBuilder.configured(
+                Runtime,
+                config=_profile_config(),
+            ).afrom_store(SQLiteStore(":memory:"))
             client = AsyncCloseOnlyClient()
             runtime.llms.set_test_client("default", client)
 
@@ -662,7 +666,10 @@ class TestUserLLMProfileStore:
 
     def test_runtime_ashutdown_closes_async_llm_clients(self) -> None:
         async def run() -> bool:
-            runtime = Runtime(SQLiteStore(":memory:"), config=_profile_config())
+            runtime = await RuntimeBuilder.configured(
+                Runtime,
+                config=_profile_config(),
+            ).afrom_store(SQLiteStore(":memory:"))
             client = AsyncCloseOnlyClient()
             runtime.llms.set_test_client("default", client)
 

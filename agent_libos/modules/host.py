@@ -117,7 +117,12 @@ class ModuleHookServices:
             provider_hooks=host.provider_hooks,
             lifecycle=host.lifecycle,
             state=host.module_state,
-            add_handle_to_process_view=host.add_handle_to_process_view,
+            # Runtime installs lifecycle wrappers after constructing module
+            # services. Resolve this facade lazily so hooks cannot retain the
+            # pre-admission bound method.
+            add_handle_to_process_view=(
+                lambda pid, handle: host.add_handle_to_process_view(pid, handle)
+            ),
         )
 
 
@@ -175,6 +180,18 @@ class _MemoryView:
         finalizer: Callable[..., None],
     ) -> None:
         self._host.bind_object_release_finalizer(finalizer)
+
+    def bind_durable_object_release_finalizer(
+        self,
+        finalizer_id: str,
+        prepare: Callable[..., Any],
+        finalize: Callable[..., None],
+    ) -> None:
+        self._host.bind_durable_object_release_finalizer(
+            finalizer_id,
+            prepare,
+            finalize,
+        )
 
 
 class ModuleHookContext:
@@ -387,6 +404,39 @@ class ModuleHookContext:
             undo=lambda: self._services.lifecycle.unbind_finalizer(finalizer),
         )
 
+    def bind_recovery_cleanup(self, cleanup: Callable[[], Any]) -> None:
+        """Bind an explicitly recovery-safe, process-local cleanup callback.
+
+        Recovery diagnostics handoff cannot run ordinary shutdown finalizers:
+        they may publish durable evidence or perform unrelated user effects.
+        Trusted modules use this narrower surface only for idempotent teardown
+        of transient handles and workers.  The callback must not access Object
+        Memory, the runtime store, audit, or events, and must return ``False``
+        when its process-local cleanup has not fully converged so the lifecycle
+        can retry it without closing the store.
+        """
+
+        self._require_active()
+        if not callable(cleanup):
+            raise ValidationError("recovery cleanup must be callable")
+        self._services.lifecycle.bind_finalizer(cleanup, recovery_safe=True)
+        self._journal.record(
+            kind="recovery_cleanup",
+            target=getattr(cleanup, "__name__", type(cleanup).__name__),
+            undo=lambda: self._services.lifecycle.unbind_finalizer(cleanup),
+        )
+
+    def require_recovery_cleanup_lease(self) -> None:
+        """Require the lifecycle-scoped lease for transient provider teardown.
+
+        Unlike registration methods, this check is intentionally callable by
+        the retained module host after startup-hook deactivation.  It grants no
+        authority itself: RuntimeLifecycle installs its opaque ContextVar only
+        around an explicitly registered recovery-safe callback.
+        """
+
+        self._services.lifecycle.require_recovery_cleanup_lease()
+
     def bind_object_release_finalizer(
         self,
         finalizer: Callable[..., None],
@@ -399,6 +449,30 @@ class ModuleHookContext:
             kind="object_release_finalizer",
             target=getattr(finalizer, "__name__", type(finalizer).__name__),
             undo=lambda: self._services.memory.unbind_object_release_finalizer(finalizer),
+        )
+
+    def bind_durable_object_release_finalizer(
+        self,
+        finalizer_id: str,
+        prepare: Callable[..., Any],
+        finalize: Callable[..., None],
+    ) -> None:
+        self._require_active()
+        if not callable(prepare) or not callable(finalize):
+            raise ValidationError(
+                "durable object release finalizer callbacks must be callable"
+            )
+        self._services.memory.bind_durable_object_release_finalizer(
+            finalizer_id,
+            prepare,
+            finalize,
+        )
+        self._journal.record(
+            kind="durable_object_release_finalizer",
+            target=str(finalizer_id),
+            undo=lambda: self._services.memory.unbind_durable_object_release_finalizer(
+                finalizer_id
+            ),
         )
 
     def add_handle_to_process_view(self, pid: str, handle: Any) -> None:

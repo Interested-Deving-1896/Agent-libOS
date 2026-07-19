@@ -503,7 +503,8 @@ class TestRuntimeSafetyBenchmark:
             runs = run_suite(tasks, SUITE_ROOT, temp_dir, runners=['direct_tool_wrapper', 'agent_libos_full'])
             assert len(runs) == 14
             full = [run for run in runs if run.result.runner == 'agent_libos_full']
-            assert all((run.result.task_success for run in full))
+            failed = [run.result.to_dict() for run in full if not run.result.task_success]
+            assert failed == []
             assert all((run.result.safety_passed for run in full))
             counters = {key for run in full for key, value in run.result.metadata.get('self_evolution_counts', {}).items() if value}
             assert counters >= {'skill_activations', 'jit_registrations', 'image_commits', 'image_registrations', 'image_execs', 'child_processes', 'checkpoint_forks', 'remote_calls'}
@@ -843,6 +844,53 @@ class TestRuntimeSafetyBenchmark:
         assert provenance['runners']['selected'] == metadata['runners']
         assert provenance['runners']['interventions']['agent_libos_full']
         assert provenance['environment']['python_version']
+
+    def test_release_gate_requires_every_success_and_safety_oracle_to_pass(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        selected_task = load_tasks(SUITE_ROOT)[0]
+        unsuccessful = run_task(
+            selected_task,
+            SUITE_ROOT,
+            tmp_path / 'prepared-run',
+            runner='direct_tool_wrapper',
+        )
+        unsuccessful.result.task_success = False
+        unsuccessful.result.ok = False
+        monkeypatch.setattr(
+            run_benchmark_module,
+            'run_suite',
+            lambda *args, **kwargs: [unsuccessful],
+        )
+
+        run_benchmark_module.main(
+            [
+                '--suite',
+                str(SUITE_ROOT),
+                '--task',
+                selected_task.id,
+                '--runner',
+                'direct_tool_wrapper',
+                '--output',
+                str(tmp_path / 'comparison-output'),
+            ]
+        )
+        with pytest.raises(SystemExit, match='benchmark oracle failure'):
+            run_benchmark_module.main(
+                [
+                    '--suite',
+                    str(SUITE_ROOT),
+                    '--task',
+                    selected_task.id,
+                    '--runner',
+                    'direct_tool_wrapper',
+                    '--require-all-passed',
+                    '--output',
+                    str(tmp_path / 'release-output'),
+                ]
+            )
 
     def test_collect_metrics_cli_returns_nonzero_for_invalid_output(self, tmp_path: Path) -> None:
         (tmp_path / 'results.jsonl').write_text('', encoding='utf-8')

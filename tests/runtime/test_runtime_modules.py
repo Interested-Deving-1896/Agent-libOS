@@ -132,6 +132,35 @@ class TestRuntimeModule:
             journal.rollback()
             runtime.close()
 
+    def test_module_hook_recovery_cleanup_registration_is_explicit_and_journaled(self) -> None:
+        runtime = Runtime.open()
+        journal = RegistrationJournal('recovery-cleanup-contract:v0')
+        host = ModuleHookContext(
+            ModuleHookServices.from_host(runtime),
+            'recovery-cleanup-contract:v0',
+            journal,
+        )
+
+        def cleanup() -> bool:
+            return True
+
+        try:
+            before = runtime.lifecycle.finalizers_snapshot()
+
+            with pytest.raises(RuntimeError, match='recovery cleanup lease'):
+                host.require_recovery_cleanup_lease()
+
+            host.bind_recovery_cleanup(cleanup)
+
+            assert runtime.lifecycle.finalizers_snapshot() == (*before, cleanup)
+            assert runtime.lifecycle._finalizers[-1].recovery_safe is True
+            journal.rollback()
+            assert runtime.lifecycle.finalizers_snapshot() == before
+        finally:
+            host.deactivate()
+            journal.rollback()
+            runtime.close()
+
     def test_module_hook_image_view_cannot_mutate_live_images(self) -> None:
         runtime = Runtime.open()
         journal = RegistrationJournal('image-view-contract:v0')
@@ -943,7 +972,7 @@ sha256: {package_sha}
             module_manifests=(str(manifest),),
             trusted_modules=(trust,),
         )
-        original_transaction = runtime.modules._extensions.transaction
+        original_transaction = runtime.modules._module_publications.transaction
         fail_commit = True
 
         @contextlib.contextmanager
@@ -958,7 +987,7 @@ sha256: {package_sha}
                     raise RuntimeError('simulated rollback commit failure')
 
         monkeypatch.setattr(
-            runtime.modules._extensions,
+            runtime.modules._module_publications,
             'transaction',
             fail_first_commit,
         )

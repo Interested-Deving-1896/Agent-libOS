@@ -6,15 +6,19 @@ narrow ledger implementation behind that boundary.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import asdict, replace
 import hashlib
-from typing import Any
+from typing import Any, Callable
 
 from agent_libos.models import (
     AuditRecord,
     Event,
     ExternalEffectClassification,
+    ExternalEffectCursor,
     ExternalEffectRecord,
+    ExternalEffectRecoveryQuery,
+    ExternalEffectRecoverySummary,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
 )
@@ -273,14 +277,49 @@ def _effect_with_idempotency_key(
     pid: str,
     idempotency_key: str,
 ) -> ExternalEffectRecord | None:
-    return next(
-        (
-            item
-            for item in store.list_external_effects(pid=pid)
-            if item.idempotency_key == idempotency_key
-        ),
-        None,
-    )
+    return store.get_external_effect_by_idempotency(pid, idempotency_key)
+
+
+def iter_external_effect_recovery(
+    store: ProtectedEffectPort,
+    query: ExternalEffectRecoveryQuery,
+) -> Iterator[ExternalEffectRecord]:
+    """Yield one validated keyset page at a time without scanning history."""
+
+    current = query
+    while True:
+        page = store.query_external_effect_recovery(current)
+        if len(page.records) > current.limit:
+            raise ValidationError(
+                "external effect recovery repository exceeded the requested page limit"
+            )
+        previous = current.after
+        for effect in page.records:
+            cursor = ExternalEffectCursor(effect.created_at, effect.effect_id)
+            if previous is not None and cursor <= previous:
+                raise ValidationError(
+                    "external effect recovery repository returned a non-monotonic page"
+                )
+            if effect.effect_state != current.effect_state:
+                raise ValidationError(
+                    "external effect recovery repository returned an ineligible effect state"
+                )
+            if (
+                current.transaction_states
+                and effect.transaction_state not in current.transaction_states
+            ):
+                raise ValidationError(
+                    "external effect recovery repository returned an ineligible transaction state"
+                )
+            yield effect
+            previous = cursor
+        if page.next_cursor is None:
+            return
+        if previous is None or page.next_cursor != previous:
+            raise ValidationError(
+                "external effect recovery repository returned an invalid next cursor"
+            )
+        current = replace(current, after=page.next_cursor)
 
 
 def _effect_metadata(
@@ -399,13 +438,21 @@ def mark_external_effect_unknown(
     return store.get_external_effect(effect_id) or current
 
 
-def reconcile_pending_external_effects(store: ProtectedEffectPort, substrate: Any) -> list[ExternalEffectRecord]:
+def reconcile_pending_external_effects(
+    store: ProtectedEffectPort,
+    substrate: Any,
+    *,
+    require_recovery_lease: Callable[[], None],
+    page_size: int = 500,
+) -> ExternalEffectRecoverySummary:
     """Reconcile without replay; unsupported providers remain explicitly unknown."""
 
-    reconciled: list[ExternalEffectRecord] = []
-    for effect in store.list_external_effects():
-        if effect.effect_state != "pending":
-            continue
+    require_recovery_lease()
+
+    reconciled_sample: list[str] = []
+    reconciled_total = 0
+    query = ExternalEffectRecoveryQuery(limit=page_size)
+    for effect in iter_external_effect_recovery(store, query):
         protected = effect.provider_metadata.get("protected_operation")
         if effect.transaction_state == "prepared" and isinstance(protected, dict):
             # The SDK owns local prepare recovery, including capability and
@@ -415,29 +462,36 @@ def reconcile_pending_external_effects(store: ProtectedEffectPort, substrate: An
         provider = getattr(substrate, effect.provider, None)
         reconcile = getattr(provider, "reconcile_external_effect", None)
         if not callable(reconcile):
-            reconciled.append(
-                mark_external_effect_unknown(
-                    store,
-                    effect.effect_id,
-                    reason="provider_does_not_support_reconciliation",
-                )
+            mark_external_effect_unknown(
+                store,
+                effect.effect_id,
+                reason="provider_does_not_support_reconciliation",
             )
+            reconciled_total += 1
+            if len(reconciled_sample) < page_size:
+                reconciled_sample.append(effect.effect_id)
             continue
         try:
             result = reconcile(effect)
         except Exception as exc:
-            reconciled.append(
-                mark_external_effect_unknown(
-                    store,
-                    effect.effect_id,
-                    reason=f"provider_reconciliation_error:{type(exc).__name__}",
-                )
+            mark_external_effect_unknown(
+                store,
+                effect.effect_id,
+                reason=f"provider_reconciliation_error:{type(exc).__name__}",
             )
+            reconciled_total += 1
+            if len(reconciled_sample) < page_size:
+                reconciled_sample.append(effect.effect_id)
             continue
         if not isinstance(result, dict):
-            reconciled.append(
-                mark_external_effect_unknown(store, effect.effect_id, reason="invalid_reconciliation_result")
+            mark_external_effect_unknown(
+                store,
+                effect.effect_id,
+                reason="invalid_reconciliation_result",
             )
+            reconciled_total += 1
+            if len(reconciled_sample) < page_size:
+                reconciled_sample.append(effect.effect_id)
             continue
         state = str(result.get("state") or "unknown")
         receipt = result.get("provider_receipt")
@@ -470,8 +524,13 @@ def reconcile_pending_external_effects(store: ProtectedEffectPort, substrate: An
             updated_at=utc_now(),
         ):
             raise ValidationError(f"external effect reconciliation raced: {effect.effect_id}")
-        reconciled.append(store.get_external_effect(effect.effect_id) or effect)
-    return reconciled
+        reconciled_total += 1
+        if len(reconciled_sample) < page_size:
+            reconciled_sample.append(effect.effect_id)
+    return ExternalEffectRecoverySummary(
+        total_count=reconciled_total,
+        sample_effect_ids=tuple(reconciled_sample),
+    )
 
 
 def abandon_external_effect_intent(

@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_libos.models.runtime_module import RuntimeModule
+
 
 @dataclass(frozen=True)
 class ModuleProvides:
@@ -11,6 +13,7 @@ class ModuleProvides:
     syscalls: tuple[str, ...] = field(default_factory=tuple)
     provider_hooks: tuple[str, ...] = field(default_factory=tuple)
     startup_hooks: tuple[str, ...] = field(default_factory=tuple)
+    durable_object_release_finalizers: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "tools", tuple(self.tools))
@@ -18,6 +21,11 @@ class ModuleProvides:
         object.__setattr__(self, "syscalls", tuple(self.syscalls))
         object.__setattr__(self, "provider_hooks", tuple(self.provider_hooks))
         object.__setattr__(self, "startup_hooks", tuple(self.startup_hooks))
+        object.__setattr__(
+            self,
+            "durable_object_release_finalizers",
+            tuple(self.durable_object_release_finalizers),
+        )
 
 
 @dataclass(frozen=True)
@@ -56,18 +64,5 @@ class ModuleSource:
     source_files: tuple[ModuleSourceFile, ...] = field(default_factory=tuple)
 
 
-@dataclass(frozen=True)
-class LoadedModule:
-    module_id: str
-    name: str
-    version: str
-    entrypoint: str
-    manifest_path: str
-    manifest_sha256: str
-    source_path: str
-    source_sha256: str
-    status: str
-    loaded_at: str | None
-    registered: dict[str, Any]
-    error: str | None
-    metadata: dict[str, Any]
+# Compatibility name retained for callers that imported the unused v0.2 model.
+LoadedModule = RuntimeModule

@@ -17,7 +17,11 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.ports import AuditPort
 from agent_libos.runtime.image_artifact import ImageArtifactLoader
-from agent_libos.storage.repositories import ExtensionRepository, ProcessRepository
+from agent_libos.storage.repositories import (
+    ExtensionRepository,
+    ProcessRepository,
+    RuntimePublicationRepository,
+)
 from agent_libos.utils.ids import new_id, utc_now
 
 if TYPE_CHECKING:
@@ -32,6 +36,7 @@ class ImagePackageInstaller:
         *,
         loader: ImageArtifactLoader,
         processes: ProcessRepository,
+        publications: RuntimePublicationRepository,
         extensions: ExtensionRepository,
         tools: ToolBroker,
         filesystem: Any,
@@ -42,6 +47,7 @@ class ImagePackageInstaller:
     ) -> None:
         self._loader = loader
         self._processes = processes
+        self._publications = publications
         self._extensions = extensions
         self._tools = tools
         self._filesystem = filesystem
@@ -53,16 +59,49 @@ class ImagePackageInstaller:
     def preflight(self, image: AgentImage) -> None:
         self._loader.load(image, expected_kind="image_package")
 
-    def install(self, pid: str, image: AgentImage) -> None:
+    def planned_workspace_root(
+        self,
+        pid: str,
+        image: AgentImage,
+        *,
+        materialization_id: str,
+    ) -> str:
+        return (
+            Path(self._config.image.materialized_workspace_root)
+            / self._safe_segment(pid)
+            / self._safe_segment(materialization_id)
+            / self._safe_segment(str(image.boot.get("artifact_id") or "image"))
+            / "workspace"
+        ).as_posix()
+
+    def install(
+        self,
+        pid: str,
+        image: AgentImage,
+        *,
+        workspace_root: str | None = None,
+        publication_id: str | None = None,
+    ) -> None:
         artifact = self._loader.load(image, expected_kind="image_package")
-        workspace_root: str | None = None
+        materialized_workspace_root: str | None = None
         working_directory: str | None = None
         registered_jit: list[str] = []
         try:
-            workspace_paths = self._materialize_workspace(pid, image, artifact)
+            workspace_paths = self._materialize_workspace(
+                pid,
+                image,
+                artifact,
+                workspace_root=workspace_root,
+                publication_id=publication_id,
+            )
             if workspace_paths is not None:
-                workspace_root, working_directory = workspace_paths
-            registered_jit = self._register_jit_tools(pid, image, artifact)
+                materialized_workspace_root, working_directory = workspace_paths
+            registered_jit = self._register_jit_tools(
+                pid,
+                image,
+                artifact,
+                publication_id=publication_id,
+            )
             process = self._require_process(pid)
             if workspace_paths is not None:
                 process.working_directory = working_directory
@@ -75,11 +114,17 @@ class ImagePackageInstaller:
                     },
                     expected_revision=process.revision,
                 )
-                self._grant_workspace(pid, image, artifact, workspace_root)
+                self._grant_workspace(
+                    pid,
+                    image,
+                    artifact,
+                    materialized_workspace_root,
+                    publication_id=publication_id,
+                )
         except Exception:
             self._remove_registered_jit_tool_names(pid, registered_jit)
             self._cleanup_materialized_workspace(
-                workspace_root,
+                materialized_workspace_root or workspace_root,
                 actor=f"image:{image.image_id}",
                 reason="image_package_boot_failed",
             )
@@ -92,63 +137,97 @@ class ImagePackageInstaller:
                 "image_id": image.image_id,
                 "artifact_id": image.boot.get("artifact_id"),
                 "package_sha256": artifact.get("package_sha256"),
-                "workspace_root": workspace_root,
+                "workspace_root": materialized_workspace_root,
                 "working_directory": working_directory,
                 "jit_tools": registered_jit,
+                "publication_id": publication_id,
             },
         )
 
-    def cleanup(self, pid: str, image: AgentImage, *, reason: str) -> None:
+    def cleanup(
+        self,
+        pid: str,
+        image: AgentImage | str,
+        *,
+        reason: str,
+        workspace_root: str | None = None,
+        strict: bool = False,
+    ) -> None:
+        image_id = image.image_id if isinstance(image, AgentImage) else str(image)
         process = self._processes.get_process(pid)
-        if process is None:
-            return
         tool_rows = {
             str(row.get("tool_id")): row
             for row in self._extensions.list_tools()
         }
         handles: dict[str, ToolHandle] = {}
-        for name, tool_id in list(process.tool_table.items()):
-            row = tool_rows.get(str(tool_id))
-            if row is None or not bool(row.get("ephemeral")):
-                continue
-            if str(row.get("registered_by")) != f"image.package:{image.image_id}":
-                continue
-            handle = self._tools.loaded_tool_handle(tool_id)
-            handles[name] = handle or ToolHandle(
-                tool_id=tool_id,
-                name=name,
-                capability_id=None,
-                scope=str(row.get("scope") or "ephemeral_process"),
-            )
+        if process is not None:
+            for name, tool_id in list(process.tool_table.items()):
+                row = tool_rows.get(str(tool_id))
+                if row is None or not bool(row.get("ephemeral")):
+                    continue
+                if str(row.get("registered_by")) != f"image.package:{image_id}":
+                    continue
+                handle = self._tools.loaded_tool_handle(tool_id)
+                handles[name] = handle or ToolHandle(
+                    tool_id=tool_id,
+                    name=name,
+                    capability_id=None,
+                    scope=str(row.get("scope") or "ephemeral_process"),
+                )
         self._remove_registered_jit_tools(pid, handles)
         self._cleanup_materialized_workspace(
-            self._materialized_workspace_root_for_cwd(process.working_directory),
-            actor=f"image:{image.image_id}",
+            workspace_root
+            or self._materialized_workspace_root_for_cwd(
+                process.working_directory if process is not None else None
+            ),
+            actor=f"image:{image_id}",
             reason=reason,
+            strict=strict,
         )
+
+    def cleanup_publication_workspace(
+        self,
+        workspace_root: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Delete only one exact publication-planned workspace tree."""
+
+        self._cleanup_materialized_workspace(
+            workspace_root,
+            actor="runtime.publication",
+            reason=reason,
+            strict=True,
+        )
+
+    def publication_workspace_exists(self, workspace_root: str) -> bool:
+        root = self._validated_materialized_root(workspace_root)
+        return bool(root is not None and root.exists())
 
     def _materialize_workspace(
         self,
         pid: str,
         image: AgentImage,
         artifact: dict[str, Any],
+        *,
+        workspace_root: str | None = None,
+        publication_id: str | None = None,
     ) -> tuple[str, str] | None:
         workspace = artifact.get("workspace") or {}
         source = workspace.get("source")
         if not source:
             return None
-        artifact_id = self._safe_segment(
-            str(image.boot.get("artifact_id") or "image")
+        root_relative = Path(
+            workspace_root
+            or self.planned_workspace_root(
+                pid,
+                image,
+                materialization_id=new_id("boot"),
+            )
         )
-        root_relative = (
-            Path(self._config.image.materialized_workspace_root)
-            / self._safe_segment(pid)
-            / self._safe_segment(new_id("boot"))
-            / artifact_id
-            / "workspace"
-        )
-        root = (self._workspace_root / root_relative).resolve()
-        self._require_under_workspace(root)
+        root = self._validated_materialized_root(root_relative.as_posix())
+        if root is None:
+            raise ValidationError("invalid planned image workspace root")
         files = [
             record
             for record in artifact.get("files", [])
@@ -163,6 +242,15 @@ class ImagePackageInstaller:
             "files": len(files),
             "bytes": total_bytes,
         }
+        self._record_publication_artifact(
+            publication_id,
+            {
+                "artifact_id": f"workspace_intent:{root_relative.as_posix()}",
+                "kind": "workspace",
+                "path": root_relative.as_posix(),
+                "status": "intent",
+            },
+        )
         self._resources.preflight(
             pid,
             usage,
@@ -219,6 +307,8 @@ class ImagePackageInstaller:
         image: AgentImage,
         artifact: dict[str, Any],
         workspace_root: str,
+        *,
+        publication_id: str | None = None,
     ) -> None:
         workspace = artifact.get("workspace") or {}
         granted: list[dict[str, Any]] = []
@@ -235,13 +325,31 @@ class ImagePackageInstaller:
                 if grant.get("recursive")
                 else self._filesystem.grant_path
             )
-            capability = grant_method(
-                pid,
-                target,
-                rights,
-                issued_by=f"image.package:{image.image_id}",
-                delegable=bool(grant.get("delegable", False)),
-            )
+            with self._processes.transaction():
+                capability = grant_method(
+                    pid,
+                    target,
+                    rights,
+                    issued_by=f"image.package:{image.image_id}",
+                    delegable=bool(grant.get("delegable", False)),
+                    metadata=(
+                        {
+                            "runtime_publication_id": publication_id,
+                            "runtime_publication_kind": "image_workspace_grant",
+                        }
+                        if publication_id is not None
+                        else None
+                    ),
+                )
+                self._record_publication_artifact(
+                    publication_id,
+                    {
+                        "artifact_id": f"capability:{capability.cap_id}",
+                        "kind": "capability",
+                        "capability_id": capability.cap_id,
+                        "resource": capability.resource,
+                    },
+                )
             granted.append(
                 {
                     "capability_id": capability.cap_id,
@@ -262,6 +370,8 @@ class ImagePackageInstaller:
         pid: str,
         image: AgentImage,
         artifact: dict[str, Any],
+        *,
+        publication_id: str | None = None,
     ) -> list[str]:
         process = self._require_process(pid)
         prepared: list[tuple[str, str]] = []
@@ -269,7 +379,13 @@ class ImagePackageInstaller:
         handles: dict[str, ToolHandle] = {}
         try:
             for item in artifact.get("jit_tools", []):
-                candidate = self._prepare_jit_candidate(pid, image, process, item)
+                candidate = self._prepare_jit_candidate(
+                    pid,
+                    image,
+                    process,
+                    item,
+                    publication_id=publication_id,
+                )
                 if candidate is not None:
                     prepared.append(candidate)
                     candidate_ids.append(candidate[1])
@@ -277,7 +393,12 @@ class ImagePackageInstaller:
                 handles[name] = self._tools.register(
                     pid,
                     candidate_id,
-                    approver=f"image.package:{image.image_id}",
+                    approver=(
+                        f"publication:{publication_id}"
+                        if publication_id is not None
+                        else f"image.package:{image.image_id}"
+                    ),
+                    publication_id=publication_id,
                 )
             registered = sorted(handles)
             if registered:
@@ -305,6 +426,8 @@ class ImagePackageInstaller:
         image: AgentImage,
         process: Any,
         item: dict[str, Any],
+        *,
+        publication_id: str | None = None,
     ) -> tuple[str, str] | None:
         name = str(item.get("name") or "")
         if not name:
@@ -335,6 +458,7 @@ class ImagePackageInstaller:
             spec,
             source_code=str(item.get("source") or ""),
             tests=[dict(test) for test in item.get("tests", [])],
+            publication_id=publication_id,
         )
         validation = self._tools.validate(candidate_id, pid=pid)
         if not validation.ok:
@@ -402,9 +526,12 @@ class ImagePackageInstaller:
         *,
         actor: str,
         reason: str,
+        strict: bool = False,
     ) -> None:
         root = self._validated_materialized_root(workspace_root)
         if root is None:
+            if strict and workspace_root:
+                raise ValidationError("invalid materialized image workspace root")
             return
         try:
             shutil.rmtree(root)
@@ -421,6 +548,8 @@ class ImagePackageInstaller:
                     "error_type": type(exc).__name__,
                 },
             )
+            if strict:
+                raise
             return
         self._prune_empty_parents(root.parent)
         self._audit.record(
@@ -470,10 +599,6 @@ class ImagePackageInstaller:
                 break
             current = current.parent
 
-    def _require_under_workspace(self, root: Path) -> None:
-        if self._workspace_root not in root.parents and root != self._workspace_root:
-            raise RuntimeError("image workspace materialization escaped workspace root")
-
     def _require_process(self, pid: str) -> Any:
         process = self._processes.get_process(pid)
         if process is None:
@@ -481,6 +606,22 @@ class ImagePackageInstaller:
 
             raise NotFound(f"process not found: {pid}")
         return process
+
+    def _record_publication_artifact(
+        self,
+        publication_id: str | None,
+        artifact: dict[str, Any],
+    ) -> None:
+        if publication_id is None:
+            return
+        if not self._publications.record_runtime_publication_artifact(
+            publication_id,
+            artifact,
+            expected_states={"planning", "applying"},
+        ):
+            raise ValidationError(
+                f"runtime publication changed while recording artifact: {publication_id}"
+            )
 
     @staticmethod
     def _artifact_file_bytes(record: dict[str, Any]) -> bytes:

@@ -131,7 +131,11 @@ class LLMActionService:
         if notice := self._pre_tool_notice(pid, name):
             return notice
         result = self._tools.call(pid, name, args, context_metadata=context_metadata)
-        return self._result(pid, result)
+        return self._result(
+            pid,
+            result,
+            publish_result=name not in {"process_exit", "exec_process"},
+        )
 
     async def adispatch(
         self,
@@ -144,10 +148,20 @@ class LLMActionService:
         if notice := self._pre_tool_notice(pid, name):
             return notice
         result = await self._tools.acall(pid, name, args, context_metadata=context_metadata)
-        return self._result(pid, result)
+        return self._result(
+            pid,
+            result,
+            publish_result=name not in {"process_exit", "exec_process"},
+        )
 
-    def _result(self, pid: str, result: ToolCallResult) -> dict[str, Any]:
-        if result.result_handle is not None:
+    def _result(
+        self,
+        pid: str,
+        result: ToolCallResult,
+        *,
+        publish_result: bool,
+    ) -> dict[str, Any]:
+        if publish_result and result.result_handle is not None:
             self._publish_result(pid, result.result_handle)
         notice = self._post_tool_notice(pid)
         return {

@@ -165,17 +165,58 @@ Each lifecycle transition commits its durable row, process-local alias, audit
 record, TypeScript source, and in-memory executable handle atomically. JIT
 registration and resolver calls share the runtime registry lifecycle lock; the
 source/handle is installed before the durable alias commits and removed again
-if commit or observability fails, so no resolver observes only one side. Manual validation failures
-remain inspectable as rejected candidates. Composite Skill activation or image
-package boot discards candidates that it created when the enclosing operation
-fails, including their Object Memory descriptors, so unpublished source and
-aliases do not accumulate as failed-boot residue.
+if commit or observability fails, so no resolver observes only one side.
+Snapshot-based process exec holds that same lock through its terminal
+publication, which serializes concurrent process-local candidate, Tool, and
+Skill mutations after either commit or compensation. If compensation succeeds
+but its terminal publication transaction fails, a durable applied marker lets
+startup finish the terminal record without replaying the older exec snapshot.
+If compensation fails before that marker is durable, ImageBoot fences the
+entire runtime in `CLOSE_FAILED`, so Tool, Skill, memory, process, capability,
+and all other public mutation boundaries reject admission without persisting
+new state. The fence also revokes older admission epochs; a Tool or Skill
+mutation that was already waiting for the shared registry barrier revalidates
+after it acquires the lock and is rejected before publication. Orderly close
+remains available; a successful reopen performs
+startup recovery and restores normal mutation admission.
+Manual validation failures remain inspectable as rejected candidates. Composite
+Skill activation or image package boot discards candidates that it created when
+the enclosing operation fails, including their Object Memory descriptors, so
+unpublished source and aliases do not accumulate as failed-boot residue.
+
+Checkpoint image installation also treats a committed JIT candidate and its
+registered Tool as two distinct publication artifacts. Their durable rows,
+executable handle, and exact candidate-then-Tool receipts commit in one unit of
+work. Compensation consumes those receipt identities directly rather than
+reverse-mapping a Tool id through candidate metadata.
 
 Registered JIT tools are process-local but persistent: when a runtime reopens an
 existing runtime store, it reloads executable TypeScript sources only for JIT
 tool ids still referenced by a process tool table. Stale ephemeral tool
 references with no recoverable registered source are removed from the process
 tool table fail-closed instead of being shown to the model as broken tools.
+Host-side process tool configuration applies the same durable candidate-owner
+check before replacing either tool table: a loaded handle is not authority to
+bind another process's JIT. Checkpoint restore also preflights every registered
+JIT candidate owned by the restored scope that the restore would remove,
+including owner-unbound tools, and refuses the restore if any such identity is
+referenced outside that scope. This prevents a scoped restore from deleting the
+owner metadata that a later startup would otherwise use to prune a foreign
+binding.
+Startup rehydration requires the opaque recovery lease before any durable read,
+keyset-pages the normalized durable ephemeral-binding projection directly by
+`(pid, tool_name)`, and looks up only each page's referenced JIT identities.
+Process and Tool writes maintain an exact eligibility bit in this projection in
+the same transaction. Its binary-collated partial covering index excludes
+static/package bindings before traversal, so a sparse eligible backlog cannot
+hide an unbounded cross-table residual scan inside one nominal page. The scan
+does not decode unrelated process control state, so wait/outcome corruption
+remains fail-closed on explicit process access without preventing startup. Each
+page performs one typed bulk artifact lookup; its temporary lookup and
+diagnostic buffers are page-bounded, and the returned summary and audit record
+contain exact totals plus bounded samples. The in-memory registry itself
+necessarily scales with the active JIT set. A single process's binding fanout is
+traversed across bounded pages rather than materialized as one record.
 
 Checkpoint fork never shares an ephemeral registration identity with the
 source process. It allocates new tool and candidate ids, rewrites the forked
@@ -309,6 +350,12 @@ Trusted startup Runtime Modules can add additional syscall names through the
 runtime syscall router. They cannot override built-in syscall names, and the
 handler still runs as part of the same `LibOSSyscallSession` under the caller
 pid.
+
+Process list, wait, and signal Tool/JIT results include canonical tagged
+`wait_state` and `outcome` objects plus `state_generation`. The Host GUI signal
+projection uses the same serializer. `status_message`/`message` remains a
+temporary compatibility display field; TypeScript code must use the tagged
+fields for wait identity, terminal result/reason Object ids, and outcome codes.
 
 ## Sandbox Rules
 

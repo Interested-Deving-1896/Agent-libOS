@@ -1,9 +1,25 @@
 from __future__ import annotations
 
+from agent_libos.capability.admission import (
+    CapabilityAdmissionPort,
+    install_instance_admission_guards,
+    revalidate_admission,
+)
 from agent_libos.models import Capability, CapabilityDecision, EventType
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.ports import AuditPort, CapabilityStorePort, EventPort, OperationPort
 from agent_libos.utils.ids import new_id, utc_now
+
+
+CAPABILITY_LEASE_MUTATION_PUBLIC_METHODS = frozenset(
+    {
+        "commit",
+        "consume",
+        "reserve",
+        "reserve_decision",
+        "restore",
+    }
+)
 
 
 class CapabilityLeaseService:
@@ -15,11 +31,19 @@ class CapabilityLeaseService:
         audit: AuditPort,
         events: EventPort,
         operations: OperationPort,
+        *,
+        admission: CapabilityAdmissionPort | None = None,
     ) -> None:
         self.store = store
         self.audit = audit
         self.events = events
         self.operations = operations
+        self._admission = admission
+        install_instance_admission_guards(
+            self,
+            admission=admission,
+            mutation_methods=CAPABILITY_LEASE_MUTATION_PUBLIC_METHODS,
+        )
 
     def consume(
         self,
@@ -32,8 +56,10 @@ class CapabilityLeaseService:
         if count < 1:
             raise ValidationError("capability consume count must be >= 1")
         with self.store.transaction():
+            revalidate_admission(self._admission)
             cap = self._require_capability(cap_id)
             if cap.uses_remaining is None:
+                revalidate_admission(self._admission)
                 return cap
             updated = self.store.consume_capability_uses(cap_id, count)
             if updated is None:
@@ -47,6 +73,7 @@ class CapabilityLeaseService:
             )
             if updated.revoked:
                 self._emit_revoked(updated, source=used_by, reason=reason)
+            revalidate_admission(self._admission)
             return updated
 
     def reserve(
@@ -60,6 +87,7 @@ class CapabilityLeaseService:
         if count < 1:
             raise ValidationError("capability reservation count must be >= 1")
         with self.store.transaction():
+            revalidate_admission(self._admission)
             cap = self._require_capability(cap_id)
             if cap.uses_remaining is None:
                 raise ValidationError(f"capability is not finite-use: {cap_id}")
@@ -99,6 +127,7 @@ class CapabilityLeaseService:
                     reason=reason,
                     reservation_id=reservation_id,
                 )
+            revalidate_admission(self._admission)
             return reservation_id
 
     def reserve_decision(
@@ -116,6 +145,7 @@ class CapabilityLeaseService:
         if reservation_id is None:
             return False
         with self.store.transaction():
+            revalidate_admission(self._admission)
             committed = self.store.commit_capability_use_reservation(
                 reservation_id,
                 updated_at=utc_now(),
@@ -131,6 +161,7 @@ class CapabilityLeaseService:
                 "result",
                 {"status": "committed" if committed else "commit_skipped"},
             )
+            revalidate_admission(self._admission)
             return committed
 
     def restore(
@@ -143,6 +174,7 @@ class CapabilityLeaseService:
         if reservation_id is None:
             return None
         with self.store.transaction():
+            revalidate_admission(self._admission)
             updated = self.store.restore_capability_use_reservation(
                 reservation_id,
                 updated_at=utc_now(),
@@ -155,6 +187,7 @@ class CapabilityLeaseService:
                     decision={"restored": False, "reason": reason},
                 )
                 self._link_reservation(reservation_id, "result", {"status": "restore_skipped"})
+                revalidate_admission(self._admission)
                 return None
             self.audit.record(
                 actor=restored_by,
@@ -183,6 +216,7 @@ class CapabilityLeaseService:
                 "result",
                 {"status": "restored", "capability_id": updated.cap_id},
             )
+            revalidate_admission(self._admission)
             return updated
 
     def _require_capability(self, cap_id: str) -> Capability:
@@ -225,3 +259,9 @@ class CapabilityLeaseService:
             target=cap.subject,
             payload=payload,
         )
+
+
+__all__ = [
+    "CAPABILITY_LEASE_MUTATION_PUBLIC_METHODS",
+    "CapabilityLeaseService",
+]

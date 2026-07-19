@@ -1,4 +1,4 @@
-import type { AgentRating, ExplainOperationResponse, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, LLMProfileInput, LLMProfileSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
+import type { AgentRating, CheckpointInspectResult, ExplainOperationResponse, GuiConnection, HumanResponseInput, ImageInspectResult, ImageMutationResult, ImagePackageFile, ImageSummary, LLMProfileInput, LLMProfileSummary, ObjectTask, OperationListResponse, RuntimeSnapshot, SseMessage, WorkflowRunResult } from "./types";
 import type { OptionalQuanta } from "../quanta";
 
 type JsonBody = Record<string, unknown>;
@@ -78,6 +78,13 @@ export class LibOSClient {
 
   async createCheckpoint(pid: string, reason: string) {
     return this.request<{ checkpoint_id: string }>("POST", "/api/checkpoints/create", { pid, reason });
+  }
+
+  async inspectCheckpoint(checkpointId: string): Promise<CheckpointInspectResult> {
+    return this.request<CheckpointInspectResult>(
+      "GET",
+      `/api/checkpoints/${encodeURIComponent(checkpointId)}`
+    );
   }
 
   async commitCheckpointToImage({

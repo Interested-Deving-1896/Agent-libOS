@@ -1,25 +1,31 @@
 from __future__ import annotations
 
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import replace
 from typing import Any
 
 from agent_libos.models import (
     EventPriority,
     EventType,
+    KilledProcessOutcome,
     ObjectOwnerKind,
     ObjectTask,
     ObjectTaskStatus,
+    ProcessExecutionToken,
     ProcessStatus,
 )
 from agent_libos.models.exceptions import NotFound
 from agent_libos.ports import AuditPort, EventPort
+from agent_libos.process_execution import (
+    trusted_process_control_mutation,
+    trusted_process_execution_takeover,
+)
 from agent_libos.runtime.object_task_notifications import (
     ObjectTaskNotificationService,
 )
 from agent_libos.storage import ObjectRepository, ProcessRepository
 from agent_libos.tools.observability import sanitize_for_observability
-from agent_libos.utils.ids import utc_now
+from agent_libos.utils.ids import new_id, utc_now
 
 
 OBJECT_TASK_ACTIVE_STATUSES = {
@@ -275,13 +281,12 @@ class ObjectTaskStateService:
                 or process.status in self._process.TERMINAL_STATUSES
             ):
                 return
-            process.status = status
-            process.status_message = message
-            process.updated_at = utc_now()
-            self._records.transition_process(
+            self._process.transitions.transition(
                 runner_pid,
                 status,
                 expected_revision=process.revision,
+                expected_status=process.status,
+                expected_state_generation=process.state_generation,
                 status_message=message,
             )
 
@@ -290,22 +295,70 @@ class ObjectTaskStateService:
         if process is None or process.status in self._process.TERMINAL_STATUSES:
             return
         try:
-            self._process.signal(runner_pid, "cancel", {"reason": reason})
+            # Cancellation may originate in the creator's scheduler quantum.
+            # Name the exact runner and observed source state so the control
+            # path cannot be reused for an unrelated process or a stale state.
+            with trusted_process_control_mutation(
+                runner_pid,
+                allowed_statuses={process.status},
+                reason="object_task.cancel terminalizes its runner",
+            ):
+                self._process.signal(runner_pid, "cancel", {"reason": reason})
         except Exception:
             process = self._records.get_process(runner_pid)
             if (
                 process is not None
                 and process.status not in self._process.TERMINAL_STATUSES
             ):
-                process.status = ProcessStatus.KILLED
-                process.status_message = reason
-                process.updated_at = utc_now()
-                self._records.transition_process(
-                    runner_pid,
-                    ProcessStatus.KILLED,
-                    expected_revision=process.revision,
-                    status_message=reason,
-                )
+                # The signal may have lost a race with another legitimate
+                # runner transition.  Re-read and fence the fallback to that
+                # newly observed state instead of widening the first scope.
+                with (
+                    self._runner_takeover_scope(process),
+                    trusted_process_control_mutation(
+                        runner_pid,
+                        allowed_statuses={process.status},
+                        reason="object_task.cancel fallback terminalizes its runner",
+                    ),
+                ):
+                    self._process.transitions.transition(
+                        runner_pid,
+                        ProcessStatus.KILLED,
+                        expected_revision=process.revision,
+                        expected_status=process.status,
+                        expected_state_generation=process.state_generation,
+                        outcome=KilledProcessOutcome(code="object_task_cancelled"),
+                        status_message=reason,
+                    )
+
+    @staticmethod
+    def _runner_takeover_scope(process: Any) -> AbstractContextManager[Any]:
+        if process.status != ProcessStatus.RUNNING:
+            return nullcontext()
+        if (
+            process.execution_owner_id is None
+            and process.execution_lease_id is None
+        ):
+            return nullcontext()
+        if process.execution_owner_id is None or process.execution_lease_id is None:
+            raise RuntimeError(
+                f"running process has an incomplete execution lease: {process.pid}"
+            )
+        return trusted_process_execution_takeover(
+            process.pid,
+            source_revision=process.revision,
+            source_state_generation=process.state_generation,
+            source_execution_token=ProcessExecutionToken(
+                pid=process.pid,
+                generation=process.execution_generation,
+                owner_id=process.execution_owner_id,
+                lease_id=process.execution_lease_id,
+            ),
+            intended_status=ProcessStatus.KILLED,
+            reason="object task cancellation takes over an execution lease",
+            nonce=new_id("process_takeover"),
+            outcome_code="object_task_cancelled",
+        )
 
     def discard_failed_result(
         self,

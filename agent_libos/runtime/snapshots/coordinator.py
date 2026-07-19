@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
-from typing import Any, TypeVar
+from contextlib import AbstractContextManager, contextmanager
+from typing import Any, Protocol, TypeVar
 
 from agent_libos.runtime.snapshots.codec import SnapshotCodec
 from agent_libos.runtime.snapshots.models import ProcessSnapshot
-from agent_libos.storage import RuntimeStore
-
-
 PreparedT = TypeVar("PreparedT")
 PublishedT = TypeVar("PublishedT")
-ReservationT = TypeVar("ReservationT")
+
+
+class SnapshotTransactionPort(Protocol):
+    """Shared transaction/lock boundary required by snapshot orchestration."""
+
+    def locked(self) -> AbstractContextManager[None]: ...
+
+    def transaction(
+        self,
+        *,
+        include_object_payloads: bool = False,
+    ) -> AbstractContextManager[Any]: ...
 
 
 class SnapshotCoordinator:
@@ -19,11 +27,18 @@ class SnapshotCoordinator:
 
     The manager supplies domain-specific discovery and row mutation callbacks;
     this service owns the invariant-sensitive ordering around validation,
-    authority reservation settlement, the store transaction, and compensation.
+    the store transaction and typed publication boundary. Authority-gated
+    callers wrap this method in their domain AuthorityTransaction so
+    reauthorization, publication, evidence, and settlement share one UoW.
     """
 
-    def __init__(self, store: RuntimeStore, *, codec: type[SnapshotCodec] = SnapshotCodec):
-        self._store = store
+    def __init__(
+        self,
+        transaction_port: SnapshotTransactionPort,
+        *,
+        codec: type[SnapshotCodec] = SnapshotCodec,
+    ):
+        self._transaction_port = transaction_port
         self._codec = codec
 
     def decode(self, snapshot: Mapping[str, Any]) -> ProcessSnapshot:
@@ -45,7 +60,7 @@ class SnapshotCoordinator:
     @contextmanager
     def capture_scope(self) -> Iterator[None]:
         """Hold the one transaction used by discovery and checkpoint publish."""
-        with self._store.transaction(include_object_payloads=True):
+        with self._transaction_port.transaction(include_object_payloads=True):
             yield
 
     @contextmanager
@@ -73,34 +88,25 @@ class SnapshotCoordinator:
     ) -> Iterator[None]:
         """Acquire ownership before the store lock for restore preflight."""
         with ownership_quiescence():
-            with self._store.locked():
+            with self._transaction_port.locked():
                 yield
 
     def atomic_publish(
         self,
         snapshot: Mapping[str, Any] | ProcessSnapshot,
         *,
-        reserve: Callable[[], ReservationT],
         prepare: Callable[[ProcessSnapshot], PreparedT],
-        settle: Callable[[ReservationT], None],
         publish: Callable[[ProcessSnapshot, PreparedT], PublishedT],
-        compensate: Callable[[ReservationT], None],
     ) -> tuple[PreparedT, PublishedT]:
-        """Prepare and publish once, restoring reservations on any failure."""
+        """Prepare and publish once in one payload-aware store transaction."""
         typed = (
             snapshot
             if isinstance(snapshot, ProcessSnapshot)
             else self.decode(snapshot)
         )
-        reservation = reserve()
-        try:
+        with self._transaction_port.transaction(include_object_payloads=True):
             prepared = prepare(typed)
-            with self._store.transaction(include_object_payloads=True):
-                settle(reservation)
-                published = publish(typed, prepared)
-        except BaseException:
-            compensate(reservation)
-            raise
+            published = publish(typed, prepared)
         return prepared, published
 
 

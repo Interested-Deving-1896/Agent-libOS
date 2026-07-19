@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 import sqlite3
 import stat
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from agent_libos.config import AgentLibOSConfig
-from agent_libos.models.exceptions import ValidationError
-from agent_libos.storage.sql import SQLRuntimeStore
+from agent_libos.models.exceptions import UnsupportedStoreVersion, ValidationError
+from agent_libos.storage.sql import SQLRuntimeStore, _V3_KEYSET_TEXT_COLUMNS
 from agent_libos.utils.ids import utc_now
 
 try:  # pragma: no cover - Windows fallback is exercised only on non-POSIX hosts.
@@ -31,10 +32,13 @@ class SQLiteStore(SQLRuntimeStore):
     backend-neutral repositories live in :class:`SQLRuntimeStore`.
     """
 
+    KEYSET_TEXT_COLLATION = "BINARY"
+
     def __init__(self, path: str | Path = ":memory:", *, config: AgentLibOSConfig | None = None):
         selected_path = str(path)
         connection_path = selected_path
         self._lease_handle: Any | None = None
+        self._sqlite_connection_closed = False
         use_database_lease = False
         if selected_path != ":memory:":
             db_path = Path(selected_path)
@@ -64,6 +68,7 @@ class SQLiteStore(SQLRuntimeStore):
                 timeout=0.0 if use_database_lease else 5.0,
             )
             conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
             if use_database_lease:
                 self._acquire_exclusive_sqlite_lease(conn, Path(connection_path))
             self._init_store(selected_path, config=config, conn=conn)
@@ -99,17 +104,126 @@ class SQLiteStore(SQLRuntimeStore):
                 conn.close()
 
     @classmethod
+    def _require_supported_store_version_for(cls, conn: Any) -> bool:
+        row = conn.execute("PRAGMA encoding").fetchone()
+        encoding = str(row["encoding"]) if row is not None else "missing"
+        if encoding.upper() != "UTF-8":
+            raise UnsupportedStoreVersion(
+                "Agent libOS SQLite keyset ordering requires UTF-8 database "
+                f"encoding; found {encoding}"
+            )
+        return super()._require_supported_store_version_for(conn)
+
+    @classmethod
     def _probe_user_schema_objects(cls, conn: Any) -> set[str]:
         rows = conn.execute(
             "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
         )
         return {str(row["name"]) for row in rows}
 
+    @classmethod
+    def _probe_text_column_collations(
+        cls,
+        conn: Any,
+    ) -> Mapping[tuple[str, str], str]:
+        tables = sorted(_V3_KEYSET_TEXT_COLUMNS)
+        placeholders = ", ".join("?" for _ in tables)
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master "
+            f"WHERE type = 'table' AND name IN ({placeholders})",
+            tables,
+        )
+        ddl_by_table = {
+            str(row["name"]): str(row["sql"])
+            for row in rows
+        }
+        result: dict[tuple[str, str], str] = {}
+        for table, columns in _V3_KEYSET_TEXT_COLUMNS.items():
+            ddl = ddl_by_table.get(table)
+            if ddl is None:
+                continue
+            for column in columns:
+                declaration = re.search(
+                    rf"(?im)^\s*[\"`\[]?{re.escape(column)}[\"`\]]?\s+TEXT\b(?P<tail>[^,\n]*)",
+                    ddl,
+                )
+                if declaration is None:
+                    continue
+                explicit = re.search(
+                    r"\bCOLLATE\s+(?:[\"`\[])?(?P<name>[A-Za-z0-9_.-]+)",
+                    declaration.group("tail"),
+                    re.IGNORECASE,
+                )
+                # SQLite TEXT columns use BINARY without an explicit clause.
+                result[(table, column)] = (
+                    explicit.group("name").upper()
+                    if explicit is not None
+                    else "BINARY"
+                )
+        return result
+
     def close(self) -> None:
+        errors: list[BaseException] = []
+        if not self._sqlite_connection_reports_closed():
+            try:
+                super().close()
+            except BaseException as exc:
+                errors.append(exc)
+            else:
+                self._sqlite_connection_closed = True
+            if self._sqlite_connection_reports_closed():
+                self._sqlite_connection_closed = True
+
+        # A file lease remains the authoritative ownership barrier if closing
+        # the SQLite connection failed while it was still open. Releasing it in
+        # that state would let a successor start beside a retryable old owner.
+        if self._sqlite_connection_reports_closed():
+            try:
+                self._release_runtime_lease()
+            except BaseException as exc:
+                errors.append(exc)
+
+        if (
+            self._sqlite_connection_reports_closed()
+            and getattr(self, "_lease_handle", None) is None
+        ):
+            self._backend_ownership_release_observed = True
+
+        if not errors:
+            return
+        if len(errors) == 1:
+            raise errors[0]
+        raise BaseExceptionGroup("SQLite store cleanup failed", errors) from None
+
+    def _sqlite_connection_reports_closed(self) -> bool:
+        if getattr(self, "_sqlite_connection_closed", False):
+            return True
+        # sqlite3.Connection has no public closed flag, so successful close is
+        # tracked above. Test doubles and alternate DB-API adapters may expose
+        # one, which also makes a close-that-raised-after-closing observable.
+        conn = getattr(self, "conn", None)
+        if getattr(conn, "closed", None) is True:
+            return True
+        if conn is None:
+            return True
+        # CPython sqlite3 exposes no ``closed`` flag. Reading ``in_transaction``
+        # is a side-effect-free driver state probe: it returns a bool while the
+        # handle is live and raises ProgrammingError only after sqlite3_close
+        # has irreversibly detached it. This also covers an adapter that closes
+        # the real connection and then raises a diagnostic from ``close()``.
         try:
-            super().close()
-        finally:
-            self._release_runtime_lease()
+            conn.in_transaction
+        except sqlite3.ProgrammingError:
+            return True
+        except BaseException:
+            return False
+        return False
+
+    def _runtime_ownership_released(self) -> bool:
+        return (
+            self._sqlite_connection_reports_closed()
+            and getattr(self, "_lease_handle", None) is None
+        )
 
     def _acquire_runtime_lease(self, db_path: Path) -> _SQLiteRuntimeLease:
         lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
@@ -156,10 +270,6 @@ class SQLiteStore(SQLRuntimeStore):
             return _SQLiteRuntimeLease(handle, lease_path)
         except BaseException:
             if handle is not None:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
                 handle.close()
             elif fd >= 0:
                 os.close(fd)
@@ -239,11 +349,21 @@ class SQLiteStore(SQLRuntimeStore):
         lease = getattr(self, "_lease_handle", None)
         if lease is None:
             return
-        self._lease_handle = None
         handle = lease.handle
-        if fcntl is not None:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-        handle.close()
+        try:
+            handle.close()
+        except BaseException as exc:
+            close_error: BaseException | None = exc
+        else:
+            close_error = None
+
+        # Closing the descriptor is the single irreversible lease release
+        # point. An explicit LOCK_UN before close would create an ambiguous
+        # acknowledgement window: unlock may have taken effect even if both
+        # that call and the later close report diagnostics. File handles expose
+        # whether close crossed its release point, including close-then-raise
+        # adapters used by alternate runtimes.
+        if getattr(handle, "closed", False):
+            self._lease_handle = None
+        if close_error is not None:
+            raise close_error

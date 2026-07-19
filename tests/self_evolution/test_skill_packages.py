@@ -166,6 +166,284 @@ class TestSkillPackageLoading:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize('operation', ['trust', 'untrust'])
+    def test_skill_trust_reauthorizes_unlimited_admin_before_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        source_type = 'global'
+        source = 'global/reauthorization'
+        package_sha256 = 'b' * 64
+        try:
+            actor = runtime.process.spawn(
+                image='base-agent:v0',
+                goal=f'skill trust authority race {operation}',
+            )
+            if operation == 'untrust':
+                runtime.skills.trust_skill_source(
+                    actor='test.host',
+                    source_type=source_type,
+                    source=source,
+                    package_sha256=package_sha256,
+                    require_capability=False,
+                )
+            authority = runtime.capability.grant(
+                actor,
+                runtime.config.skills.trust_resource,
+                [CapabilityRight.ADMIN],
+                issued_by='test.host',
+            )
+            original_require = runtime.capability.require
+
+            def revoke_after_outer_authorization(*args: Any, **kwargs: Any):
+                decision = original_require(*args, **kwargs)
+                runtime.capability.revoke(
+                    authority.cap_id,
+                    revoked_by='test.host',
+                    reason='skill trust revocation race regression',
+                    require_authority=False,
+                )
+                return decision
+
+            monkeypatch.setattr(runtime.capability, 'require', revoke_after_outer_authorization)
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                if operation == 'trust':
+                    runtime.skills.trust_skill_source(
+                        actor=actor,
+                        source_type=source_type,
+                        source=source,
+                        package_sha256=package_sha256,
+                    )
+                else:
+                    runtime.skills.untrust_skill_source(
+                        actor=actor,
+                        source_type=source_type,
+                        source=source,
+                        package_sha256=package_sha256,
+                    )
+
+            persisted = runtime.store.is_skill_trusted(
+                source_type=source_type,
+                source=source,
+                package_sha256=package_sha256,
+            )
+            assert persisted is (operation == 'untrust')
+        finally:
+            runtime.close()
+
+    def test_skill_registration_reauthorizes_inside_publication_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(
+                Path(temp_dir),
+                'registration-race-skill',
+                allowed_tools=['echo'],
+            )
+            runtime = Runtime.open('local')
+            try:
+                package, _source = runtime.skills._load_package_from_host_path(skill_dir)
+                actor = runtime.process.spawn(goal='skill registration authority race')
+                authority = runtime.capability.grant(
+                    actor,
+                    'skill:registration-race-skill',
+                    [CapabilityRight.WRITE],
+                    issued_by='test.host',
+                )
+                original_transaction = runtime.capability.authority_transaction
+
+                def revoke_before_publication(decisions, *, actor: str, operation: str):
+                    if operation == 'skill registration':
+                        runtime.capability.revoke(
+                            authority.cap_id,
+                            revoked_by='test.host',
+                            reason='registration race regression',
+                            require_authority=False,
+                        )
+                    return original_transaction(
+                        decisions,
+                        actor=actor,
+                        operation=operation,
+                    )
+
+                monkeypatch.setattr(
+                    runtime.capability,
+                    'authority_transaction',
+                    revoke_before_publication,
+                )
+
+                with pytest.raises(CapabilityDenied, match='authority changed'):
+                    runtime.skills.register_skill_package(package, actor=actor)
+
+                assert runtime.store.get_skill('registration-race-skill') is None
+            finally:
+                runtime.close()
+
+    def test_global_skill_registration_rechecks_exact_trust_inside_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            global_dir = root / 'global-skills'
+            skill_dir = write_skill_package(
+                global_dir,
+                'global-registration-race',
+                allowed_tools=['echo'],
+            )
+            config = AgentLibOSConfig(
+                skills=replace(SkillDefaults(), global_dirs=(str(global_dir),))
+            )
+            runtime = Runtime.open('local', config=config)
+            try:
+                trust = runtime.skills.global_package_info(skill_dir)
+                runtime.skills.trust_skill_source(
+                    actor='cli',
+                    source_type='global',
+                    source=trust['source'],
+                    package_sha256=trust['package_sha256'],
+                    require_capability=False,
+                )
+                original_transaction = runtime.capability.authority_transaction
+
+                def untrust_before_publication(decisions, *, actor: str, operation: str):
+                    if operation == 'skill registration':
+                        runtime.skills.store.delete_skill_trust(
+                            source_type='global',
+                            source=trust['source'],
+                            package_sha256=trust['package_sha256'],
+                        )
+                    return original_transaction(
+                        decisions,
+                        actor=actor,
+                        operation=operation,
+                    )
+
+                monkeypatch.setattr(
+                    runtime.capability,
+                    'authority_transaction',
+                    untrust_before_publication,
+                )
+
+                with pytest.raises(CapabilityDenied, match='not trusted'):
+                    runtime.skills.register_global_skill_from_path(
+                        skill_dir,
+                        actor='cli',
+                        require_capability=False,
+                    )
+
+                assert runtime.store.get_skill('global-registration-race') is None
+            finally:
+                runtime.close()
+
+    def test_skill_activation_reauthorizes_inside_publication_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(
+                Path(temp_dir),
+                'activation-race-skill',
+                allowed_tools=['echo'],
+            )
+            runtime = Runtime.open('local')
+            try:
+                runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='cli',
+                    require_capability=False,
+                )
+                actor = runtime.process.spawn(goal='skill activation authority race')
+                authority = runtime.capability.grant(
+                    actor,
+                    'skill:activation-race-skill',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test.host',
+                )
+                original_transaction = runtime.capability.authority_transaction
+
+                def revoke_before_publication(decisions, *, actor: str, operation: str):
+                    if operation == 'skill activation':
+                        runtime.capability.revoke(
+                            authority.cap_id,
+                            revoked_by='test.host',
+                            reason='activation race regression',
+                            require_authority=False,
+                        )
+                    return original_transaction(
+                        decisions,
+                        actor=actor,
+                        operation=operation,
+                    )
+
+                monkeypatch.setattr(
+                    runtime.capability,
+                    'authority_transaction',
+                    revoke_before_publication,
+                )
+
+                with pytest.raises(CapabilityDenied, match='authority changed'):
+                    runtime.skills.activate_skill(
+                        actor,
+                        'activation-race-skill',
+                        actor=actor,
+                    )
+
+                assert 'activation-race-skill' not in runtime.process.get(actor).loaded_skills
+                assert 'echo' not in runtime.process.get(actor).tool_table
+            finally:
+                runtime.close()
+
+    def test_skill_activation_rejects_failed_reservation_settlement_atomically(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skill_dir = write_skill_package(
+                Path(temp_dir),
+                'activation-settlement-skill',
+                allowed_tools=['echo'],
+            )
+            runtime = Runtime.open('local')
+            try:
+                runtime.skills.register_skill_from_path(
+                    skill_dir,
+                    actor='cli',
+                    require_capability=False,
+                )
+                actor = runtime.process.spawn(goal='skill activation settlement')
+                authority = runtime.capability.grant_once(
+                    actor,
+                    'skill:activation-settlement-skill',
+                    [CapabilityRight.EXECUTE],
+                    issued_by='test.host',
+                )
+                monkeypatch.setattr(
+                    runtime.capability,
+                    'commit_reserved_use',
+                    lambda *args, **kwargs: False,
+                )
+
+                with pytest.raises(CapabilityDenied, match='reservation is no longer active'):
+                    runtime.skills.activate_skill(
+                        actor,
+                        'activation-settlement-skill',
+                        actor=actor,
+                    )
+
+                persisted = runtime.store.get_capability(authority.cap_id)
+                assert persisted is not None
+                assert persisted.active
+                assert persisted.uses_remaining == 1
+                assert 'activation-settlement-skill' not in runtime.process.get(actor).loaded_skills
+                assert 'echo' not in runtime.process.get(actor).tool_table
+            finally:
+                runtime.close()
+
     def test_workspace_register_and_activate_reads_via_filesystem_and_uses_human_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             write_skill_package(Path(temp_dir), 'workspace-skill', allowed_tools=['echo'], extra_resources={'references/guide.md': 'Workspace resource guide.'})

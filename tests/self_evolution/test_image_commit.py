@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from agent_libos import Runtime
 from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ResourceBudget, ResourceUsage, ToolCandidateStatus
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ValidationError
 from tests.support.deno import COUNT_CHARS_SOURCE
 from tests.support.skills import write_skill_package
 
@@ -379,6 +379,148 @@ class TestImageCommit:
             other_call = runtime.tools.call(other, 'committed_echo_value', {'value': 'x'})
             assert not other_call.ok
             assert 'not in process tool table' in (other_call.error or '')
+
+    def test_failed_committed_jit_launch_removes_new_tool_artifacts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='toolmaker-agent:v0', goal='jit source')
+            candidate_id = runtime.tools.propose(
+                source,
+                {
+                    'name': 'rollback_committed_echo',
+                    'description': 'Echo a value.',
+                    'input_schema': {'type': 'object'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code=(
+                    'export function run(args, libos) { return { value: args.value }; }'
+                ),
+            )
+            candidate = runtime.store.get_tool_candidate(candidate_id)
+            assert candidate is not None
+            candidate.status = ToolCandidateStatus.VALIDATED
+            candidate.validation = {'ok': True, 'language': 'typescript'}
+            runtime.store.update_tool_candidate(candidate)
+            runtime.tools.register(source, candidate_id)
+            checkpoint_id = runtime.checkpoint.create(source, 'jit ready', actor=source)
+            runtime.image_registry.grant_register(
+                source,
+                'jit-launch-rollback:v0',
+                issued_by='test',
+            )
+            runtime.image_registry.commit_from_checkpoint(
+                actor=source,
+                checkpoint_id=checkpoint_id,
+                image_id='jit-launch-rollback:v0',
+                name='jit-launch-rollback',
+            )
+            before_tool_ids = {row['tool_id'] for row in runtime.store.list_tools()}
+            before_loaded_jit = runtime.tools.loaded_jit_tool_ids()
+            original_advance = runtime.store.advance_runtime_publication
+
+            def reject_launch_commit(publication_id: str, **kwargs: Any) -> bool:
+                publication = runtime.store.get_runtime_publication(publication_id)
+                if (
+                    kwargs.get('state') == 'committed'
+                    and publication is not None
+                    and publication['kind'] == 'process_launch'
+                    and publication['plan'].get('image_id') == 'jit-launch-rollback:v0'
+                ):
+                    return False
+                return original_advance(publication_id, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.store,
+                'advance_runtime_publication',
+                reject_launch_commit,
+            )
+
+            with pytest.raises(ProcessError, match='cannot commit process publication'):
+                runtime.process.spawn(
+                    image='jit-launch-rollback:v0',
+                    goal='must be compensated',
+                )
+
+            failed_publication = [
+                item
+                for item in runtime.store.list_runtime_publications()
+                if item['kind'] == 'process_launch'
+                and item['plan'].get('image_id') == 'jit-launch-rollback:v0'
+            ][-1]
+            failed_pid = failed_publication['pid']
+            assert runtime.store.get_process(failed_pid) is None
+            assert runtime.store.select_table_rows(
+                'tool_candidates',
+                'pid = ?',
+                [failed_pid],
+            ) == []
+            assert {row['tool_id'] for row in runtime.store.list_tools()} == before_tool_ids
+            assert runtime.tools.loaded_jit_tool_ids() == before_loaded_jit
+            assert failed_publication['state'] == 'rolled_back'
+
+    def test_checkpoint_image_final_audit_failure_leaves_no_jit_orphan(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with _runtime() as runtime:
+            source = runtime.process.spawn(image='toolmaker-agent:v0', goal='jit source')
+            candidate_id = runtime.tools.propose(
+                source,
+                {
+                    'name': 'audit_failure_committed_echo',
+                    'description': 'Echo a value.',
+                    'input_schema': {'type': 'object'},
+                    'output_schema': {'type': 'object'},
+                },
+                source_code='export function run(args) { return { value: args.value }; }',
+            )
+            candidate = runtime.store.get_tool_candidate(candidate_id)
+            assert candidate is not None
+            candidate.status = ToolCandidateStatus.VALIDATED
+            candidate.validation = {'ok': True, 'language': 'typescript'}
+            runtime.store.update_tool_candidate(candidate)
+            runtime.tools.register(source, candidate_id)
+            checkpoint_id = runtime.checkpoint.create(source, 'jit ready', actor=source)
+            runtime.image_registry.grant_register(
+                source,
+                'jit-audit-rollback:v0',
+                issued_by='test',
+            )
+            runtime.image_registry.commit_from_checkpoint(
+                actor=source,
+                checkpoint_id=checkpoint_id,
+                image_id='jit-audit-rollback:v0',
+                name='jit-audit-rollback',
+            )
+            before_tool_ids = {row['tool_id'] for row in runtime.store.list_tools()}
+            before_loaded_jit = runtime.tools.loaded_jit_tool_ids()
+            original_record = runtime.audit.record
+
+            def fail_checkpoint_boot_audit(*args: Any, **kwargs: Any) -> Any:
+                if kwargs.get('action') == 'image.boot.checkpoint_commit':
+                    raise RuntimeError('injected checkpoint image final audit failure')
+                return original_record(*args, **kwargs)
+
+            monkeypatch.setattr(runtime.audit, 'record', fail_checkpoint_boot_audit)
+
+            with pytest.raises(RuntimeError, match='final audit failure'):
+                runtime.process.spawn(
+                    image='jit-audit-rollback:v0',
+                    goal='must be compensated before receipt publication',
+                )
+
+            failed_publication = [
+                item
+                for item in runtime.store.list_runtime_publications()
+                if item['kind'] == 'process_launch'
+                and item['plan'].get('image_id') == 'jit-audit-rollback:v0'
+            ][-1]
+            assert failed_publication['state'] == 'rolled_back'
+            assert runtime.store.get_process(failed_publication['pid']) is None
+            assert {row['tool_id'] for row in runtime.store.list_tools()} == before_tool_ids
+            assert runtime.tools.loaded_jit_tool_ids() == before_loaded_jit
 
     @pytest.mark.real_deno
     def test_committed_jit_tool_source_survives_runtime_reopen(self) -> None:

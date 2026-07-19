@@ -100,6 +100,25 @@ tool grant; the exact tool is then authorized after the server spec is loaded,
 and any one-shot use from that decision is consumed only after pre-provider
 validation has passed.
 
+Per-use Human approval is additionally bound to the immutable SHA-256 digest
+of the complete registered server spec and the durable MCP registry generation,
+alongside the canonical arguments hash. Register, replace, and unregister each
+advance the generation atomically with the row mutation. Approval obtained for
+an unregistered id cannot authorize a server subsequently installed under that
+id, and even a byte-identical re-registration defeats ABA reuse. Digest-only
+binding state is read only after ASK or an already constrained invocation grant
+is found, preserving the no-registry-oracle denial path for callers with no
+matching authority. Tool calls and live `list_tools(refresh=True)` bind the
+captured server digest/generation to the protected operation and compare it
+with the live registry inside the effect transaction before every provider
+phase. Replace, unregister, or byte-identical re-registration completed before
+the first phase therefore calls no provider; a change after an earlier phase
+prevents every later provider phase and retains conservative evidence for work
+already observed. A per-registry phase guard serializes
+register/replace/unregister with the interval from that live compare through
+provider-call return; the runtime's single-writer store lease excludes a second
+supported Runtime writer from bypassing the in-process guard.
+
 Tool visibility is not authority. Default images can see the MCP tools, but a
 process cannot call a registered MCP tool without the matching capability.
 
@@ -145,6 +164,19 @@ finalizes information-flow evidence even without a tool request. The primitive
 asks the provider for live tool metadata and fails closed if the
 server no longer exposes the tool or if a pinned `input_schema` changed; those
 post-boundary failures do not restore the use.
+
+One absolute deadline covers dispatch setup, DNS, executable snapshotting,
+live `tools/list`, validation, and `call_tool`; each phase receives only the
+remaining time. An exhausted deadline cannot start the next provider phase.
+Legacy two-call providers reserve the complete request/response envelope before
+dispatch, but settlement follows observed stage progress: completed response
+bytes are charged exactly, an ordinary exception with unknown response size
+charges only the current stage's `max_response_bytes`, and later stages that
+never started charge zero. Thus a call-stage failure after a 128-byte live list
+settles `128 + max_response_bytes`, while a list-stage failure settles one
+`max_response_bytes`, never the two-stage reserved response maximum. A
+provider-certified not-started phase retains the existing narrower release or
+prior-stage settlement semantics described below.
 
 HTTP transport follows the same default network posture as JSON-RPC: HTTPS for
 remote hosts, plain HTTP only for local development hosts, no URL userinfo or

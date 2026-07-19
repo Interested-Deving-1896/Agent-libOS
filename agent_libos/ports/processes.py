@@ -9,7 +9,20 @@ from agent_libos.models import (
     DataLabels,
     ObjectHandle,
     ObjectMetadata,
+    ProcessOutcome,
+    ProcessRestoreEpoch,
+    ProcessStatus,
+    ProcessWaitState,
 )
+
+
+class ProcessRestoreEpochRepositoryPort(Protocol):
+    """Bulk durable allocator for checkpoint-restore concurrency epochs."""
+
+    def reserve_process_restore_epochs(
+        self,
+        floors: Iterable[ProcessRestoreEpoch],
+    ) -> tuple[ProcessRestoreEpoch, ...]: ...
 
 
 class ProcessControlPort(Protocol):
@@ -34,3 +47,26 @@ class ProcessControlPort(Protocol):
 
     def pause_for_host_resume(self, pid: str, reason: str) -> None:
         ...
+
+
+class ProcessTransitionRepositoryPort(Protocol):
+    """Single typed persistence seam for semantic process transitions."""
+
+    def get_process(self, pid: str) -> AgentProcess | None:
+        ...
+
+    def apply_process_state_transition(
+        self,
+        pid: str,
+        status: ProcessStatus | str,
+        *,
+        expected_revision: int,
+        expected_status: ProcessStatus | str | None = None,
+        expected_state_generation: int | None = None,
+        wait_state: ProcessWaitState | None = None,
+        outcome: ProcessOutcome | None = None,
+        status_message: str | None = None,
+        control: bool = False,
+        allowed_statuses: Iterable[ProcessStatus | str] | None = None,
+        reason: str | None = None,
+    ) -> AgentProcess: ...

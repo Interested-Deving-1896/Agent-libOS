@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-libos"
-version = "0.3.0"
+version = "0.3.1"
 description = "A minimal Agent libOS runtime with process, object memory, capability, human approval, JIT tool, checkpoint, and audit primitives."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Agent libOS contributors" }]
 classifiers = [

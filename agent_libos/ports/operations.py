@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
+
+from agent_libos.models import (
+    OperationKind,
+    OperationOutcome,
+    OperationRecord,
+)
 
 
 class OperationPort(Protocol):
@@ -53,3 +60,46 @@ class OperationPort(Protocol):
 
     def finish(self, outcome: str, *, operation_id: str | None = None) -> Any:
         ...
+
+
+class RuntimePublicationOperationPort(Protocol):
+    """Exact operation boundary required by publication reconciliation."""
+
+    def current_id(self) -> str | None: ...
+
+    def attach(self, operation_id: str) -> AbstractContextManager[Any]: ...
+
+    def get_operation(self, operation_id: str) -> OperationRecord | None: ...
+
+    def bind_runtime_publication(
+        self,
+        operation_id: str,
+        *,
+        publication_id: str,
+        publication_kind: str,
+        expected_kind: OperationKind | str,
+        expected_name: str,
+        expected_actor: str,
+        expected_pid: str | None,
+    ) -> OperationRecord: ...
+
+    def runtime_publication_binding_operation_ids(
+        self,
+        publication_id: str,
+    ) -> list[str]: ...
+
+    def reconcile_runtime_publication(
+        self,
+        operation_id: str,
+        outcome: OperationOutcome | str,
+        *,
+        publication_id: str,
+        publication_kind: str,
+        publication_state: str,
+        publication_phase: str,
+        expected_kind: OperationKind | str,
+        expected_name: str,
+        expected_actor: str,
+        expected_pid: str | None,
+        _publication_reconciled_marker: Callable[..., bool] | None = None,
+    ) -> OperationRecord: ...

@@ -5,7 +5,7 @@ import math
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import ConfigDict
+from pydantic import ConfigDict, StrictInt
 from pydantic.dataclasses import dataclass
 
 from agent_libos.models.capability import AuthorityRule
@@ -24,6 +24,23 @@ ShellPolicyLevel = Literal[
     "blocklist_ask_else_auto",
     "always_allow",
 ]
+
+
+def _validate_runtime_page_bounds(
+    name: str,
+    *,
+    page_size: int,
+    hard_limit: int,
+) -> None:
+    if page_size <= 0:
+        raise ValueError(f"runtime.{name}_page_size must be greater than zero")
+    if hard_limit <= 0:
+        raise ValueError(f"runtime.{name}_page_hard_limit must be greater than zero")
+    if page_size > hard_limit:
+        raise ValueError(
+            f"runtime.{name}_page_size must not exceed "
+            f"runtime.{name}_page_hard_limit"
+        )
 
 
 class _ImmutableDict(dict):
@@ -78,6 +95,127 @@ class RuntimeDefaults:
     run_until_idle_max_quanta: int | None = None
     launcher_max_quanta: int = 40
     launch_authority_mode: Literal["manifest_required"] = "manifest_required"
+    publication_recovery_max_attempts: StrictInt = 3
+    publication_reconciliation_page_size: StrictInt = 500
+    publication_reconciliation_page_hard_limit: StrictInt = 5_000
+    publication_artifact_lookup_hard_limit: StrictInt = 5_000
+    resource_usage_reservation_recovery_page_size: StrictInt = 500
+    resource_usage_reservation_recovery_page_hard_limit: StrictInt = 5_000
+    capability_use_reservation_recovery_page_size: StrictInt = 500
+    capability_use_reservation_recovery_page_hard_limit: StrictInt = 5_000
+    object_payload_recovery_page_size: StrictInt = 500
+    object_payload_recovery_page_hard_limit: StrictInt = 5_000
+    object_task_recovery_page_size: StrictInt = 500
+    object_task_recovery_page_hard_limit: StrictInt = 5_000
+    jit_rehydration_page_size: StrictInt = 500
+    jit_rehydration_page_hard_limit: StrictInt = 5_000
+    external_effect_recovery_page_size: StrictInt = 500
+    external_effect_recovery_page_hard_limit: StrictInt = 5_000
+    operation_recovery_page_size: StrictInt = 500
+    operation_recovery_page_hard_limit: StrictInt = 5_000
+    payload_retention_enabled: bool = False
+    payload_retention_summary_after_seconds: StrictInt | None = None
+    payload_retention_hash_only_after_seconds: StrictInt | None = None
+    payload_retention_page_size: StrictInt = 100
+    payload_retention_page_hard_limit: StrictInt = 1_000
+
+    def __post_init__(self) -> None:
+        if self.publication_recovery_max_attempts <= 0:
+            raise ValueError(
+                "runtime.publication_recovery_max_attempts must be greater than zero"
+            )
+        _validate_runtime_page_bounds(
+            "publication_reconciliation",
+            page_size=self.publication_reconciliation_page_size,
+            hard_limit=self.publication_reconciliation_page_hard_limit,
+        )
+        if self.publication_artifact_lookup_hard_limit <= 0:
+            raise ValueError(
+                "runtime.publication_artifact_lookup_hard_limit must be greater than zero"
+            )
+        _validate_runtime_page_bounds(
+            "resource_usage_reservation_recovery",
+            page_size=self.resource_usage_reservation_recovery_page_size,
+            hard_limit=self.resource_usage_reservation_recovery_page_hard_limit,
+        )
+        _validate_runtime_page_bounds(
+            "capability_use_reservation_recovery",
+            page_size=self.capability_use_reservation_recovery_page_size,
+            hard_limit=self.capability_use_reservation_recovery_page_hard_limit,
+        )
+        _validate_runtime_page_bounds(
+            "object_payload_recovery",
+            page_size=self.object_payload_recovery_page_size,
+            hard_limit=self.object_payload_recovery_page_hard_limit,
+        )
+        _validate_runtime_page_bounds(
+            "object_task_recovery",
+            page_size=self.object_task_recovery_page_size,
+            hard_limit=self.object_task_recovery_page_hard_limit,
+        )
+        _validate_runtime_page_bounds(
+            "jit_rehydration",
+            page_size=self.jit_rehydration_page_size,
+            hard_limit=self.jit_rehydration_page_hard_limit,
+        )
+        _validate_runtime_page_bounds(
+            "external_effect_recovery",
+            page_size=self.external_effect_recovery_page_size,
+            hard_limit=self.external_effect_recovery_page_hard_limit,
+        )
+        _validate_runtime_page_bounds(
+            "operation_recovery",
+            page_size=self.operation_recovery_page_size,
+            hard_limit=self.operation_recovery_page_hard_limit,
+        )
+        for name in (
+            "payload_retention_summary_after_seconds",
+            "payload_retention_hash_only_after_seconds",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(
+                    f"runtime.{name} must be a non-negative integer or None"
+                )
+        if (
+            self.payload_retention_enabled
+            and self.payload_retention_summary_after_seconds is None
+        ):
+            raise ValueError(
+                "runtime.payload_retention_enabled requires "
+                "payload_retention_summary_after_seconds"
+            )
+        if (
+            self.payload_retention_hash_only_after_seconds is not None
+            and self.payload_retention_summary_after_seconds is None
+        ):
+            raise ValueError(
+                "runtime.payload_retention_hash_only_after_seconds requires "
+                "payload_retention_summary_after_seconds"
+            )
+        if (
+            self.payload_retention_hash_only_after_seconds is not None
+            and self.payload_retention_summary_after_seconds is not None
+            and self.payload_retention_hash_only_after_seconds
+            < self.payload_retention_summary_after_seconds
+        ):
+            raise ValueError(
+                "runtime.payload_retention_hash_only_after_seconds must be at least "
+                "payload_retention_summary_after_seconds"
+            )
+        if self.payload_retention_page_size <= 0:
+            raise ValueError(
+                "runtime.payload_retention_page_size must be greater than zero"
+            )
+        if self.payload_retention_page_hard_limit <= 0:
+            raise ValueError(
+                "runtime.payload_retention_page_hard_limit must be greater than zero"
+            )
+        if self.payload_retention_page_size > self.payload_retention_page_hard_limit:
+            raise ValueError(
+                "runtime.payload_retention_page_size must not exceed "
+                "runtime.payload_retention_page_hard_limit"
+            )
 
     @property
     def default_human_resource(self) -> str:
@@ -655,7 +793,6 @@ def _validate_config(config: AgentLibOSConfig) -> None:
             )
     _positive_optional("runtime.run_until_idle_max_quanta", runtime.run_until_idle_max_quanta)
     _positive("runtime.launcher_max_quanta", runtime.launcher_max_quanta)
-
     data_flow = config.data_flow
     if data_flow.default_trust_level is not SinkTrustLevel.UNTRUSTED:
         raise ValueError("data_flow.default_trust_level must remain untrusted")

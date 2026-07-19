@@ -12,10 +12,17 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.utils.ids import utc_now
-from agent_libos.models import ProcessExecutionToken, ProcessStatus, ResourceUsage
+from agent_libos.models import (
+    FailedProcessOutcome,
+    ProcessExecutionToken,
+    ProcessStatus,
+    ResourceUsage,
+)
 from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
+from agent_libos.process_execution import bind_process_execution
+from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.runtime.audit_manager import AuditManager
+from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.storage import ProcessRepository
 
 
@@ -51,6 +58,7 @@ class AsyncProcessScheduler:
         cancel_process: Callable[[str, str], None] | None = None,
         blocking_work: Any | None = None,
         owner_id: str = "scheduler.local",
+        transitions: ProcessTransitionService | None = None,
     ):
         self.store = store
         self.audit = audit
@@ -63,6 +71,7 @@ class AsyncProcessScheduler:
         self._cancel_process = cancel_process
         self._blocking_work = blocking_work
         self.owner_id = str(owner_id)
+        self._transitions = transitions or ProcessTransitionService(store)
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="agent-libos-scheduler")
         self._unblock_executor = ThreadPoolExecutor(
             max_workers=max(1, max_workers),
@@ -291,7 +300,7 @@ class AsyncProcessScheduler:
 
     async def _run_blocking(self, function: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
         if self._blocking_work is None:
-            return await asyncio.to_thread(function, *args, **kwargs)
+            return await run_blocking_once(function, *args, **kwargs)
         return await self._blocking_work.run(function, *args, **kwargs)
 
     def run_pid_until_idle(
@@ -353,9 +362,10 @@ class AsyncProcessScheduler:
         try:
             token = _ACTIVE_QUANTUM.set((id(self), pid))
             try:
-                result = quantum(pid)
-                if inspect.isawaitable(result):
-                    result = self._run_awaitable(pid, result)
+                with bind_process_execution(execution_token):
+                    result = quantum(pid)
+                    if inspect.isawaitable(result):
+                        result = self._run_awaitable(pid, result)
             finally:
                 _ACTIVE_QUANTUM.reset(token)
         except BaseException as exc:
@@ -437,14 +447,15 @@ class AsyncProcessScheduler:
     def _fail_process_task(self, pid: str, exc: Exception) -> None:
         process = self.store.get_process(pid)
         if process is not None and process.status not in self.TERMINAL_STATUSES:
-            process.status = ProcessStatus.FAILED
-            process.status_message = f"scheduler task failed: {exc}"
-            process.updated_at = utc_now()
-            self.store.transition_process(
+            message = f"scheduler task failed: {exc}"
+            self._transitions.transition(
                 pid,
                 ProcessStatus.FAILED,
                 expected_revision=process.revision,
-                status_message=process.status_message,
+                expected_status=process.status,
+                expected_state_generation=process.state_generation,
+                outcome=FailedProcessOutcome(code="scheduler_task_failed"),
+                status_message=message,
             )
         self.audit.record(
             actor="scheduler",

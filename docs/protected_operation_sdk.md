@@ -116,6 +116,18 @@ decision/trust/source/label hashes and ids. Together, the early primitive check,
 transactional prepare, and per-phase dispatch recheck close
 provider-before-policy and mutable-source TOCTOU paths.
 
+Registry-backed provider invocations may additionally supply an immutable
+`ProviderRegistryBinding` and its typed live resolver. The SDK compares the
+captured spec SHA-256 and generation with the resolver result inside the same
+effect transaction before every provider phase. A mismatch before the first
+phase abandons the prepared intent and restores finite-use reservations without
+calling provider code; a mismatch after an earlier phase blocks later phases
+and follows the existing conservative unknown-effect settlement. Registry-bound
+sync phases also provide a phase guard shared with their supported registry
+mutators, so the live compare and provider callable have one in-process
+linearization interval. Async facades for these primitives offload that complete
+synchronous interval rather than holding a thread lock across an `await`.
+
 ## Synchronous operation
 
 Every real provider call is a named phase:

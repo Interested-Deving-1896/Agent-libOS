@@ -10,6 +10,11 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import CapabilityRight, ProcessStatus
 from agent_libos.utils.serde import to_jsonable
 
+if __package__:  # pragma: no branch - depends on module versus file execution
+    from scripts.runtime_assembly import aopen_runtime
+else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
+    from runtime_assembly import aopen_runtime
+
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -25,7 +30,7 @@ def main() -> None:
 
 
 async def amain(args: argparse.Namespace) -> None:
-    runtime = Runtime.open(_RUNTIME_DEFAULTS.local_store_target)
+    runtime = await aopen_runtime(_RUNTIME_DEFAULTS.local_store_target)
     try:
         goal = (
             f"Use the write_text_file tool to create workspace file {args.path!r} "
@@ -54,7 +59,7 @@ async def amain(args: argparse.Namespace) -> None:
         if process.status != ProcessStatus.EXITED:
             raise SystemExit(3)
     finally:
-        runtime.shutdown(actor="script", reason="script.complete")
+        await runtime.ashutdown(actor="script", reason="script.complete")
 
 
 def _action_name(result: object) -> str | None:

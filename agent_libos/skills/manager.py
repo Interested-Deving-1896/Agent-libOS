@@ -8,9 +8,11 @@ import json
 import os
 import re
 import stat
-from dataclasses import asdict
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from functools import wraps
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
 from jsonschema.validators import validator_for as jsonschema_validator_for
@@ -28,7 +30,7 @@ from agent_libos.models import (
     is_openai_tool_name,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
-from agent_libos.ports import AuditPort, EventPort
+from agent_libos.ports import AuditPort, EventPort, RuntimePublicationReceiptRecorder
 from agent_libos.skills.schema import ActionSchema, JitToolSpec, LoadedSkill, SkillPackage, SkillResource
 from agent_libos.storage import UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
@@ -45,6 +47,31 @@ _AGENT_LIBOS_METADATA_KEYS = {
     "agent-libos.required-capabilities",
     "agent-libos.jit-tools",
 }
+
+
+@dataclass(slots=True)
+class _DeferredJitRegistryFinalization:
+    """JIT registry changes finalized by an enclosing authority transaction."""
+
+    published_tool_ids: set[str] = field(default_factory=set)
+    retired_tool_ids: set[str] = field(default_factory=set)
+
+    def capture(self, handles: Mapping[str, Any], retired_tool_ids: Iterable[str]) -> None:
+        self.published_tool_ids.update(
+            str(handle.tool_id) for handle in handles.values()
+        )
+        self.retired_tool_ids.update(str(tool_id) for tool_id in retired_tool_ids)
+
+
+def _with_registry_lifecycle_lock(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Guard direct manager calls before their first durable/registry read."""
+
+    @wraps(method)
+    def guarded(self: "SkillManager", *args: Any, **kwargs: Any) -> Any:
+        with self._lifecycle_lock:
+            return method(self, *args, **kwargs)
+
+    return guarded
 
 
 class SkillManager:
@@ -74,6 +101,7 @@ class SkillManager:
         self.unit_of_work = unit_of_work
         self.store = unit_of_work.extensions
         self.processes = unit_of_work.processes
+        self.publications = unit_of_work.publications
         self.capabilities = capabilities
         self.audit = audit
         self.events = events
@@ -131,13 +159,18 @@ class SkillManager:
             self._require_trusted_global_source(selected_source, selected_sha)
         if require_capability:
             decisions = self._require_skill_right(actor, spec.skill_id, CapabilityRight.WRITE)
-            reservations = self._reserve_skill_rights(decisions, used_by="skill")
         else:
-            reservations = {}
+            decisions = []
         now = utc_now()
         if spec.package_sha256 != selected_sha:
             spec = self._replace_package_hash(spec, selected_sha)
-        try:
+        with self.capabilities.authority_transaction(
+            decisions,
+            actor=actor,
+            operation="skill registration",
+        ):
+            if selected_source_type == "global":
+                self._require_trusted_global_source(selected_source, selected_sha)
             with self.unit_of_work.transaction():
                 existing = self.store.get_skill(spec.skill_id)
                 if existing is not None and not replace:
@@ -170,10 +203,6 @@ class SkillManager:
                         "resources": [resource.path for resource in spec.resources],
                     },
                 )
-        except Exception:
-            self._restore_skill_rights(reservations)
-            raise
-        self._commit_skill_rights(reservations)
         return self.inspect_skill(spec.skill_id, actor=actor, require_capability=False)
 
     def register_skill_from_path(
@@ -237,26 +266,15 @@ class SkillManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         package, source = self._load_package_from_workspace(pid, path)
-        if require_capability:
-            decisions = self._require_skill_right(pid, package.skill_id, CapabilityRight.WRITE)
-            reservations = self._reserve_skill_rights(decisions, used_by="skill")
-        else:
-            reservations = {}
-        try:
-            result = self.register_skill_package(
-                package,
-                actor=pid,
-                replace=replace,
-                require_capability=False,
-                source_type="workspace",
-                source=source,
-                package_sha256=package.package_sha256,
-            )
-        except Exception:
-            self._restore_skill_rights(reservations)
-            raise
-        self._commit_skill_rights(reservations)
-        return result
+        return self.register_skill_package(
+            package,
+            actor=pid,
+            replace=replace,
+            require_capability=require_capability,
+            source_type="workspace",
+            source=source,
+            package_sha256=package.package_sha256,
+        )
 
     def activate_skill_from_workspace_path(
         self,
@@ -269,33 +287,79 @@ class SkillManager:
         package, source = self._load_package_from_workspace(pid, path)
         if require_capability:
             decisions = self._require_skill_rights(pid, package.skill_id, [CapabilityRight.WRITE, CapabilityRight.EXECUTE])
-            reservations = self._reserve_skill_rights(decisions, used_by="skill")
-            write_capability_ids = self._decision_consume_ids(
-                decision for decision in decisions if decision.right == CapabilityRight.WRITE.value
-            )
         else:
-            reservations = {}
-            write_capability_ids = set()
-        try:
+            decisions = []
+        write_uses = self._decision_consume_ids(
+            decision
+            for decision in decisions
+            if decision.right == CapabilityRight.WRITE.value
+        )
+        execute_uses = self._decision_consume_ids(
+            decision
+            for decision in decisions
+            if decision.right == CapabilityRight.EXECUTE.value
+        )
+        shared_one_time_authority = write_uses & execute_uses
+        if shared_one_time_authority:
+            activation_error: Exception | None = None
+            result: dict[str, Any] | None = None
+            deferred_jit = _DeferredJitRegistryFinalization()
+            with self._lifecycle_lock:
+                try:
+                    with self.capabilities.authority_transaction(
+                        decisions,
+                        actor=pid,
+                        operation="workspace skill registration and activation",
+                    ):
+                        self.register_skill_package(
+                            package,
+                            actor=pid,
+                            replace=replace,
+                            require_capability=False,
+                            source_type="workspace",
+                            source=source,
+                            package_sha256=package.package_sha256,
+                        )
+                        try:
+                            result = self.activate_skill(
+                                pid,
+                                package.skill_id,
+                                actor=pid,
+                                require_capability=False,
+                                _deferred_jit_finalization=deferred_jit,
+                            )
+                        except Exception as exc:
+                            activation_error = exc
+                except BaseException as exc:
+                    try:
+                        self._forget_jit_tool_ids(deferred_jit.published_tool_ids)
+                    except Exception as cleanup_exc:
+                        exc.add_note(
+                            "failed to discard workspace Skill JIT publications "
+                            "after authority rollback: "
+                            f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                        )
+                    raise
+                self._forget_jit_tool_ids(deferred_jit.retired_tool_ids)
+            if activation_error is not None:
+                raise activation_error
+            assert result is not None
+        else:
             self.register_skill_package(
                 package,
                 actor=pid,
                 replace=replace,
-                require_capability=False,
+                require_capability=require_capability,
                 source_type="workspace",
                 source=source,
                 package_sha256=package.package_sha256,
             )
-        except Exception:
-            self._restore_skill_rights(reservations)
-            raise
-        self._commit_skill_rights(reservations, capability_ids=write_capability_ids)
-        try:
-            result = self.activate_skill(pid, package.skill_id, actor=pid, require_capability=False)
-        except Exception:
-            self._restore_skill_rights(reservations, exclude_capability_ids=write_capability_ids)
-            raise
-        self._commit_skill_rights(reservations, exclude_capability_ids=write_capability_ids)
+            result = self.activate_skill(
+                pid,
+                package.skill_id,
+                actor=pid,
+                require_capability=require_capability,
+            )
         return {**result, "source": source, "registered": True}
 
     def discover_skills(
@@ -431,6 +495,7 @@ class SkillManager:
             result.append(entry)
         return result
 
+    @_with_registry_lifecycle_lock
     def activate_skill(
         self,
         pid: str,
@@ -438,6 +503,9 @@ class SkillManager:
         *,
         actor: str | None = None,
         require_capability: bool = True,
+        publication_id: str | None = None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
+        _deferred_jit_finalization: _DeferredJitRegistryFinalization | None = None,
     ) -> dict[str, Any]:
         selected_actor = actor or pid
         skill, metadata = self._get_skill(skill_id)
@@ -446,145 +514,135 @@ class SkillManager:
             admin_decision = self._require_process_admin_if_cross_actor(selected_actor, pid)
             if admin_decision is not None:
                 decisions.append(admin_decision)
-            reservations = self._reserve_skill_rights(decisions, used_by="skill")
         else:
-            reservations = {}
+            decisions = []
         process = self.processes.get_process(pid)
         jit_handles: dict[str, Any] = {}
-        prepared_jit_tools: list[tuple[JitToolSpec, str]] = []
         retired_jit_ids: set[str] = set()
-        try:
-            if process is None:
-                raise NotFound(f"process not found: {pid}")
-            preflight_loaded = process.loaded_skills.get(skill.skill_id)
-            preflight_jit_ids = self._loaded_tool_id_map(preflight_loaded, "jit_tool_ids")
-            self._validate_loadable(
-                pid,
-                skill,
-                process.tool_table,
-                replacing_jit_tool_ids=preflight_jit_ids,
+        if process is None:
+            raise NotFound(f"process not found: {pid}")
+        preflight_loaded = process.loaded_skills.get(skill.skill_id)
+        preflight_jit_ids = self._loaded_tool_id_map(preflight_loaded, "jit_tool_ids")
+        self._validate_loadable(
+            pid,
+            skill,
+            process.tool_table,
+            replacing_jit_tool_ids=preflight_jit_ids,
+        )
+        # Candidate creation is durable state, so it must be enrolled in the
+        # same authority transaction as registration and process publication.
+        # This also lets a recovery-fence commit rejection roll it back without
+        # attempting a new mutation through the now-stale admission lease.
+        with self._activation_authority_scope(
+            decisions,
+            actor=selected_actor,
+            jit_state=lambda: (jit_handles, retired_jit_ids),
+            deferred_jit_finalization=_deferred_jit_finalization,
+        ):
+            prepared_jit_tools = self._prepare_jit_tools(
+                pid, skill, publication_id=publication_id, receipt_recorder=receipt_recorder
             )
-            prepared_jit_tools = self._prepare_jit_tools(pid, skill)
-            # Tool registry lifecycle operations acquire this lock before the
-            # store lock. Skill activation must use the same order because it
-            # resolves/registers tools while its store transaction is open.
-            with self._lifecycle_lock:
-                try:
-                    with self.unit_of_work.transaction():
-                        process = self.processes.get_process(pid)
-                        if process is None:
-                            raise NotFound(f"process not found: {pid}")
-                        previous_loaded = process.loaded_skills.get(skill.skill_id)
-                        previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
-                        previous_jit_ids = self._loaded_tool_id_map(previous_loaded, "jit_tool_ids")
-                        self._validate_loadable(
-                            pid,
-                            skill,
-                            process.tool_table,
-                            replacing_jit_tool_ids=previous_jit_ids,
-                        )
-                        existing_handles = self._resolve_existing_tools(skill.allowed_tools)
-                        base_tool_ids, base_model_tool_ids = self._activation_base_bindings(
-                            process,
-                            skill.skill_id,
-                            set(existing_handles)
-                            | {jit.name for jit, _candidate_id in prepared_jit_tools},
-                        )
-                        jit_handles = self._register_prepared_jit_tools(
-                            pid,
-                            skill,
-                            prepared_jit_tools,
-                            replacing_jit_tool_ids=previous_jit_ids,
-                        )
-                        # Registering each JIT tool publishes a process-local
-                        # tool binding and therefore advances the process CAS.
-                        # Continue from that committed row instead of using
-                        # the pre-registration revision captured above.
-                        process = self.processes.get_process(pid)
-                        if process is None:
-                            raise NotFound(f"process not found: {pid}")
-                        tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
-                        jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
-                        updated_table = dict(process.tool_table)
-                        updated_model_table = dict(process.model_tool_table)
-                        for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
-                            if updated_table.get(name) == tool_id:
-                                updated_table.pop(name, None)
-                            if updated_model_table.get(name) == tool_id:
-                                updated_model_table.pop(name, None)
-                        for name, handle in {**existing_handles, **jit_handles}.items():
-                            updated_table[name] = handle.tool_id
-                            # Loading a Skill is an explicit tool-visibility action,
-                            # independent of the base image's lazy built-in groups.
-                            updated_model_table[name] = handle.tool_id
-                        loaded = LoadedSkill(
-                            skill_id=skill.skill_id,
-                            version=skill.version,
-                            source=metadata.get("source"),
-                            package_sha256=skill.package_sha256,
-                            loaded_at=utc_now(),
-                            tool_names=sorted([*tool_ids, *jit_tool_ids]),
-                            tool_ids=tool_ids,
-                            jit_tool_ids=jit_tool_ids,
-                            instructions_hash=self._hash_text(skill.instructions),
-                            package_snapshot=self._skill_snapshot(skill),
-                            base_tool_ids=base_tool_ids,
-                            base_model_tool_ids=base_model_tool_ids,
-                        )
-                        process.tool_table = updated_table
-                        process.model_tool_table = updated_model_table
-                        process.loaded_skills[skill.skill_id] = to_jsonable(loaded)
-                        process.updated_at = utc_now()
-                        process = self.processes.patch_process(
-                            pid,
-                            {
-                                "tool_table": process.tool_table,
-                                "model_tool_table": process.model_tool_table,
-                                "loaded_skills": process.loaded_skills,
-                                "updated_at": process.updated_at,
-                            },
-                            expected_revision=process.revision,
-                        )
-                        retired_jit_ids = set(previous_jit_ids.values()) - set(jit_tool_ids.values())
-                        self._delete_jit_rows(pid, retired_jit_ids)
-                        self.events.emit(
-                            EventType.SKILL_LOADED,
-                            source=selected_actor,
-                            target=pid,
-                            payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
-                        )
-                        self.audit.record(
-                            actor=selected_actor,
-                            action="skill.activate",
-                            target=f"process:{pid}",
-                            decision={
-                                "skill_id": skill.skill_id,
-                                "version": skill.version,
-                                "replaced_loaded_version": self._loaded_version(previous_loaded),
-                                "tool_ids": tool_ids,
-                                "jit_tool_ids": jit_tool_ids,
-                                "retired_jit_tool_ids": sorted(retired_jit_ids),
-                                "source": metadata.get("source"),
-                                "package_sha256": skill.package_sha256,
-                            },
-                        )
-                except Exception:
-                    # Do not expose in-memory JIT handles after the outer store
-                    # transaction rolled back and before releasing the lock.
-                    self._discard_uncommitted_jit_tools(jit_handles)
-                    raise
-                self._forget_jit_tool_ids(retired_jit_ids)
-        except Exception as exc:
+            # Tool registry lifecycle operations acquire this lock before the store
+            # lock; activation must keep that order while its store transaction is open.
             try:
-                self._discard_prepared_jit_candidates(pid, prepared_jit_tools)
-            except Exception as cleanup_exc:
-                exc.add_note(
-                    "failed to discard uncommitted Skill JIT candidates: "
-                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-                )
-            self._restore_skill_rights(reservations)
-            raise
-        self._commit_skill_rights(reservations)
+                with self.unit_of_work.transaction():
+                    process = self.processes.get_process(pid)
+                    if process is None:
+                        raise NotFound(f"process not found: {pid}")
+                    previous_loaded = process.loaded_skills.get(skill.skill_id)
+                    previous_tool_ids = self._loaded_tool_id_map(previous_loaded, "tool_ids")
+                    previous_jit_ids = self._loaded_tool_id_map(previous_loaded, "jit_tool_ids")
+                    self._validate_loadable(
+                        pid,
+                        skill,
+                        process.tool_table,
+                        replacing_jit_tool_ids=previous_jit_ids,
+                    )
+                    existing_handles = self._resolve_existing_tools(skill.allowed_tools)
+                    base_tool_ids, base_model_tool_ids = self._activation_base_bindings(
+                        process,
+                        skill.skill_id,
+                        set(existing_handles)
+                        | {jit.name for jit, _candidate_id in prepared_jit_tools},
+                    )
+                    jit_handles = self._register_prepared_jit_tools(
+                        pid,
+                        skill,
+                        prepared_jit_tools,
+                        replacing_jit_tool_ids=previous_jit_ids,
+                        approver=selected_actor,
+                        publication_id=publication_id,
+                        receipt_recorder=receipt_recorder,
+                    )
+                    # JIT registration advances process CAS; continue from
+                    # that committed row, not the pre-registration revision.
+                    process = self.processes.get_process(pid)
+                    if process is None:
+                        raise NotFound(f"process not found: {pid}")
+                    tool_ids = {name: handle.tool_id for name, handle in existing_handles.items()}
+                    jit_tool_ids = {name: handle.tool_id for name, handle in jit_handles.items()}
+                    updated_table = dict(process.tool_table)
+                    updated_model_table = dict(process.model_tool_table)
+                    for name, tool_id in {**previous_tool_ids, **previous_jit_ids}.items():
+                        if updated_table.get(name) == tool_id:
+                            updated_table.pop(name, None)
+                        if updated_model_table.get(name) == tool_id:
+                            updated_model_table.pop(name, None)
+                    for name, handle in {**existing_handles, **jit_handles}.items():
+                        updated_table[name] = handle.tool_id
+                        # Loading a Skill is an explicit tool-visibility action,
+                        # independent of the base image's lazy built-in groups.
+                        updated_model_table[name] = handle.tool_id
+                    loaded = LoadedSkill(
+                        skill_id=skill.skill_id,
+                        version=skill.version,
+                        source=metadata.get("source"),
+                        package_sha256=skill.package_sha256,
+                        loaded_at=utc_now(),
+                        tool_names=sorted([*tool_ids, *jit_tool_ids]),
+                        tool_ids=tool_ids,
+                        jit_tool_ids=jit_tool_ids,
+                        instructions_hash=self._hash_text(skill.instructions),
+                        package_snapshot=self._skill_snapshot(skill),
+                        base_tool_ids=base_tool_ids,
+                        base_model_tool_ids=base_model_tool_ids,
+                    )
+                    process = self._persist_loaded_skill(
+                        process,
+                        loaded=loaded,
+                        tool_table=updated_table,
+                        model_tool_table=updated_model_table,
+                        publication_id=publication_id,
+                        receipt_recorder=receipt_recorder,
+                    )
+                    retired_jit_ids = set(previous_jit_ids.values()) - set(jit_tool_ids.values())
+                    self._delete_jit_rows(pid, retired_jit_ids)
+                    self.events.emit(
+                        EventType.SKILL_LOADED,
+                        source=selected_actor,
+                        target=pid,
+                        payload={"skill_id": skill.skill_id, "tool_names": loaded.tool_names},
+                    )
+                    self.audit.record(
+                        actor=selected_actor,
+                        action="skill.activate",
+                        target=f"process:{pid}",
+                        decision={
+                            "skill_id": skill.skill_id,
+                            "version": skill.version,
+                            "replaced_loaded_version": self._loaded_version(previous_loaded),
+                            "tool_ids": tool_ids,
+                            "jit_tool_ids": jit_tool_ids,
+                            "retired_jit_tool_ids": sorted(retired_jit_ids),
+                            "source": metadata.get("source"),
+                            "package_sha256": skill.package_sha256,
+                        },
+                    )
+            except BaseException:
+                # Do not expose in-memory JIT handles after the outer store
+                # transaction rolled back and before releasing the lock.
+                self._discard_uncommitted_jit_tools(jit_handles)
+                raise
         return {
             "pid": pid,
             "skill_id": skill.skill_id,
@@ -611,14 +669,17 @@ class SkillManager:
             admin_decision = self._require_process_admin_if_cross_actor(selected_actor, pid)
             if admin_decision is not None:
                 decisions.append(admin_decision)
-            reservations = self._reserve_skill_rights(decisions, used_by="skill")
         else:
-            reservations = {}
+            decisions = []
         removed: list[str] = []
         jit_tool_ids: dict[str, str] = {}
         retired_jit_ids: set[str] = set()
-        try:
-            with self._lifecycle_lock:
+        with self._lifecycle_lock:
+            with self.capabilities.authority_transaction(
+                decisions,
+                actor=selected_actor,
+                operation="skill unload",
+            ):
                 with self.unit_of_work.transaction():
                     process = self.processes.get_process(pid)
                     if process is None:
@@ -684,11 +745,10 @@ class SkillManager:
                             "retired_jit_tool_ids": sorted(retired_jit_ids),
                         },
                     )
-                self._forget_jit_tool_ids(retired_jit_ids)
-        except Exception:
-            self._restore_skill_rights(reservations)
-            raise
-        self._commit_skill_rights(reservations)
+            # A failed authority settlement rolls back the process/tool rows and
+            # their evidence, so retire in-memory implementations only after the
+            # enclosing AuthorityTransaction has committed successfully.
+            self._forget_jit_tool_ids(retired_jit_ids)
         return {"pid": pid, "skill_id": skill_id, "removed_tools": sorted(removed)}
 
     def read_skill_resource(
@@ -747,42 +807,42 @@ class SkillManager:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         selected_source_type = self._validate_source_type(source_type)
-        reservations: dict[str, str] = {}
+        decisions: list[CapabilityDecision] = []
         if require_capability:
-            decision = self.capabilities.require(
-                actor,
-                self.config.skills.trust_resource,
-                CapabilityRight.ADMIN,
-                consume=False,
+            decisions.append(
+                self.capabilities.require(
+                    actor,
+                    self.config.skills.trust_resource,
+                    CapabilityRight.ADMIN,
+                    consume=False,
+                )
             )
-            reservations = self._reserve_skill_rights([decision], used_by="skill")
-        try:
-            with self.unit_of_work.transaction():
-                self.store.insert_skill_trust(
-                    trust_id=new_id("strust"),
-                    source_type=selected_source_type,
-                    source=source,
-                    package_sha256=package_sha256,
-                    trusted_by=actor,
-                    created_at=utc_now(),
-                    metadata=metadata or {},
-                )
-                self.events.emit(
-                    EventType.SKILL_TRUSTED,
-                    source=actor,
-                    target=self.trust_resource(package_sha256),
-                    payload={"source_type": selected_source_type, "source": source},
-                )
-                self.audit.record(
-                    actor=actor,
-                    action="skill.trust",
-                    target=self.trust_resource(package_sha256),
-                    decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
-                )
-        except Exception:
-            self._restore_skill_rights(reservations)
-            raise
-        self._commit_skill_rights(reservations)
+        with self.capabilities.authority_transaction(
+            decisions,
+            actor=actor,
+            operation="skill source trust",
+        ):
+            self.store.insert_skill_trust(
+                trust_id=new_id("strust"),
+                source_type=selected_source_type,
+                source=source,
+                package_sha256=package_sha256,
+                trusted_by=actor,
+                created_at=utc_now(),
+                metadata=metadata or {},
+            )
+            self.events.emit(
+                EventType.SKILL_TRUSTED,
+                source=actor,
+                target=self.trust_resource(package_sha256),
+                payload={"source_type": selected_source_type, "source": source},
+            )
+            self.audit.record(
+                actor=actor,
+                action="skill.trust",
+                target=self.trust_resource(package_sha256),
+                decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
+            )
         return {"source_type": selected_source_type, "source": source, "package_sha256": package_sha256, "trusted": True}
 
     def untrust_skill_source(
@@ -795,28 +855,28 @@ class SkillManager:
         require_capability: bool = True,
     ) -> dict[str, Any]:
         selected_source_type = self._validate_source_type(source_type)
-        reservations: dict[str, str] = {}
+        decisions: list[CapabilityDecision] = []
         if require_capability:
-            decision = self.capabilities.require(
-                actor,
-                self.config.skills.trust_resource,
-                CapabilityRight.ADMIN,
-                consume=False,
-            )
-            reservations = self._reserve_skill_rights([decision], used_by="skill")
-        try:
-            with self.unit_of_work.transaction():
-                self.store.delete_skill_trust(source_type=selected_source_type, source=source, package_sha256=package_sha256)
-                self.audit.record(
-                    actor=actor,
-                    action="skill.untrust",
-                    target=self.trust_resource(package_sha256),
-                    decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
+            decisions.append(
+                self.capabilities.require(
+                    actor,
+                    self.config.skills.trust_resource,
+                    CapabilityRight.ADMIN,
+                    consume=False,
                 )
-        except Exception:
-            self._restore_skill_rights(reservations)
-            raise
-        self._commit_skill_rights(reservations)
+            )
+        with self.capabilities.authority_transaction(
+            decisions,
+            actor=actor,
+            operation="skill source untrust",
+        ):
+            self.store.delete_skill_trust(source_type=selected_source_type, source=source, package_sha256=package_sha256)
+            self.audit.record(
+                actor=actor,
+                action="skill.untrust",
+                target=self.trust_resource(package_sha256),
+                decision={"source_type": selected_source_type, "source": source, "package_sha256": package_sha256},
+            )
         return {"source_type": selected_source_type, "source": source, "package_sha256": package_sha256, "trusted": False}
 
     def _load_package_from_host_path(self, path: str | Path) -> tuple[SkillPackage, str]:
@@ -1218,48 +1278,118 @@ class SkillManager:
     def _resolve_existing_tools(self, names: list[str]) -> dict[str, Any]:
         return {name: self._tools.resolve(name) for name in names}
 
-    def _prepare_jit_tools(self, pid: str, skill: SkillPackage) -> list[tuple[JitToolSpec, str]]:
-        prepared: list[tuple[JitToolSpec, str]] = []
-        try:
-            for jit in skill.jit_tools:
-                candidate_id = self._tools.propose(
-                    pid,
-                    {
-                        "name": jit.name,
-                        "description": jit.description,
-                        "input_schema": jit.input_schema,
-                        "output_schema": jit.output_schema,
-                        "metadata": {"skill_id": skill.skill_id, "source_path": jit.source_path, **jit.metadata},
-                    },
-                    source_code=jit.source,
-                    tests=jit.tests,
-                )
-                prepared.append((jit, candidate_id))
-                validation = self._tools.validate(candidate_id, pid=pid)
-                if not validation.ok:
-                    raise ValidationError(f"JIT skill tool {jit.name} failed validation: {'; '.join(validation.errors)}")
-                candidate = self.store.get_tool_candidate(candidate_id)
-                if candidate is None:
-                    raise NotFound(f"tool candidate not found after validation: {candidate_id}")
-                candidate.status = ToolCandidateStatus.VALIDATED
-                self.store.update_tool_candidate(candidate)
-        except Exception:
-            self._discard_prepared_jit_candidates(pid, prepared)
-            raise
-        return prepared
-
-    def _discard_prepared_jit_candidates(
+    def _prepare_jit_tools(
         self,
         pid: str,
-        prepared: Iterable[tuple[JitToolSpec, str]],
-    ) -> None:
-        for _jit, candidate_id in reversed(list(prepared)):
-            self._tools.discard_candidate(
+        skill: SkillPackage,
+        *,
+        publication_id: str | None = None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
+    ) -> list[tuple[JitToolSpec, str]]:
+        prepared: list[tuple[JitToolSpec, str]] = []
+        for jit in skill.jit_tools:
+            candidate_id = self._tools.propose(
                 pid,
-                candidate_id,
-                discarded_by="skill",
-                reason="skill activation did not commit",
+                {
+                    "name": jit.name,
+                    "description": jit.description,
+                    "input_schema": jit.input_schema,
+                    "output_schema": jit.output_schema,
+                    "metadata": {"skill_id": skill.skill_id, "source_path": jit.source_path, **jit.metadata},
+                },
+                source_code=jit.source,
+                tests=jit.tests,
+                publication_id=publication_id,
+                receipt_recorder=receipt_recorder,
             )
+            prepared.append((jit, candidate_id))
+            validation = self._tools.validate(candidate_id, pid=pid)
+            if not validation.ok:
+                raise ValidationError(f"JIT skill tool {jit.name} failed validation: {'; '.join(validation.errors)}")
+            candidate = self.store.get_tool_candidate(candidate_id)
+            if candidate is None:
+                raise NotFound(f"tool candidate not found after validation: {candidate_id}")
+            candidate.status = ToolCandidateStatus.VALIDATED
+            self.store.update_tool_candidate(candidate)
+        return prepared
+
+    def _record_publication_activation(
+        self,
+        publication_id: str,
+        *,
+        pid: str,
+        skill_id: str,
+        loaded_record: dict[str, Any],
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+    ) -> None:
+        loaded_at = str(loaded_record.get("loaded_at") or "")
+        if not loaded_at:
+            raise ValidationError("loaded Skill publication receipt has no loaded_at locator")
+        jit_tool_ids = loaded_record.get("jit_tool_ids")
+        recorder = (
+            receipt_recorder
+            if receipt_recorder is not None
+            else self.publications
+        )
+        if not recorder.record_runtime_publication_artifact(
+            publication_id,
+            {
+                "artifact_id": f"skill:{pid}:{skill_id}:{loaded_at}",
+                "kind": "loaded_skill",
+                "pid": pid,
+                "skill_id": skill_id,
+                "loaded_at": loaded_at,
+                "package_sha256": str(loaded_record.get("package_sha256") or ""),
+                "jit_tool_ids": sorted(
+                    str(tool_id)
+                    for tool_id in (
+                        jit_tool_ids.values()
+                        if isinstance(jit_tool_ids, dict)
+                        else []
+                    )
+                ),
+            },
+            expected_states={"planning", "applying"},
+        ):
+            raise ValidationError(
+                "runtime publication changed while recording loaded Skill: "
+                f"{publication_id}"
+            )
+
+    def _persist_loaded_skill(
+        self,
+        process: Any,
+        *,
+        loaded: LoadedSkill,
+        tool_table: dict[str, str],
+        model_tool_table: dict[str, str],
+        publication_id: str | None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+    ) -> Any:
+        loaded_record = to_jsonable(loaded)
+        process.tool_table = tool_table
+        process.model_tool_table = model_tool_table
+        process.loaded_skills[loaded.skill_id] = loaded_record
+        process.updated_at = utc_now()
+        committed = self.processes.patch_process(
+            process.pid,
+            {
+                "tool_table": process.tool_table,
+                "model_tool_table": process.model_tool_table,
+                "loaded_skills": process.loaded_skills,
+                "updated_at": process.updated_at,
+            },
+            expected_revision=process.revision,
+        )
+        if publication_id is not None:
+            self._record_publication_activation(
+                publication_id,
+                pid=process.pid,
+                skill_id=loaded.skill_id,
+                loaded_record=loaded_record,
+                receipt_recorder=receipt_recorder,
+            )
+        return committed
 
     def _register_prepared_jit_tools(
         self,
@@ -1268,6 +1398,9 @@ class SkillManager:
         prepared: list[tuple[JitToolSpec, str]],
         *,
         replacing_jit_tool_ids: dict[str, str] | None = None,
+        approver: str | None = None,
+        publication_id: str | None = None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
     ) -> dict[str, Any]:
         replaceable = replacing_jit_tool_ids or {}
         handles: dict[str, Any] = {}
@@ -1276,10 +1409,12 @@ class SkillManager:
                 handles[jit.name] = self._tools.register(
                     pid,
                     candidate_id,
-                    approver=f"skill:{skill.skill_id}",
+                    approver=approver or f"skill:{skill.skill_id}",
                     replace_tool_id=replaceable.get(jit.name),
+                    publication_id=publication_id,
+                    receipt_recorder=receipt_recorder,
                 )
-        except Exception:
+        except BaseException:
             self._discard_uncommitted_jit_tools(handles)
             raise
         return handles
@@ -1288,14 +1423,46 @@ class SkillManager:
         """Remove process-local runtime aliases after the enclosing DB transaction rolled back."""
 
         for handle in handles.values():
-            self._tools.forget_loaded_jit(handle.tool_id)
+            # Activation owns the shared registry lifecycle lock here.  This is
+            # rollback of unpublished in-memory state, not a new mutation that
+            # may acquire admission (the active lease can already be fenced).
+            self._tools.registry.forget_jit(handle.tool_id)
+
+    @contextmanager
+    def _activation_authority_scope(
+        self,
+        decisions: Iterable[CapabilityDecision],
+        *,
+        actor: str,
+        jit_state: Callable[[], tuple[dict[str, Any], set[str]]],
+        deferred_jit_finalization: _DeferredJitRegistryFinalization | None = None,
+    ) -> Iterator[None]:
+        """Keep JIT handle publication aligned with authority settlement."""
+
+        with self._lifecycle_lock:
+            try:
+                with self.capabilities.authority_transaction(
+                    decisions,
+                    actor=actor,
+                    operation="skill activation",
+                ):
+                    yield
+            except BaseException:
+                handles, _retired = jit_state()
+                self._discard_uncommitted_jit_tools(handles)
+                raise
+            handles, retired = jit_state()
+            if deferred_jit_finalization is None:
+                self._forget_jit_tool_ids(retired)
+            else:
+                deferred_jit_finalization.capture(handles, retired)
 
     def _delete_jit_rows(self, pid: str, tool_ids: Iterable[str]) -> None:
         self.store.delete_jit_tool_rows(pid, set(tool_ids))
 
     def _forget_jit_tool_ids(self, tool_ids: Iterable[str]) -> None:
         for tool_id in set(tool_ids):
-            self._tools.forget_loaded_jit(tool_id)
+            self._tools.registry.forget_jit(tool_id)
 
     def _loaded_tool_id_map(self, loaded: Any, field: str) -> dict[str, str]:
         if not isinstance(loaded, dict) or not isinstance(loaded.get(field), dict):
@@ -1419,8 +1586,17 @@ class SkillManager:
 
     def _reserve_skill_rights(self, decisions: Iterable[CapabilityDecision], *, used_by: str) -> dict[str, str]:
         reserved: dict[str, str] = {}
-        try:
-            for decision in decisions:
+        # A single finite grant may authorize several rights for one skill
+        # operation.  Revalidate the complete decision set before reserving
+        # any use so the first reservation cannot make a sibling decision
+        # appear revoked.  Keeping both phases in one store transaction also
+        # prevents a policy mutation from being interleaved between them.
+        with self.capabilities.store.transaction():
+            current = tuple(
+                self.capabilities.reauthorize_decision(prepared)
+                for prepared in decisions
+            )
+            for decision in current:
                 cap_id = str(decision.consume_capability_id) if decision.consume_capability_id is not None else None
                 if cap_id is None or cap_id in reserved:
                     continue
@@ -1431,9 +1607,6 @@ class SkillManager:
                 )
                 if reservation_id is not None:
                     reserved[cap_id] = reservation_id
-        except Exception:
-            self._restore_skill_rights(reserved)
-            raise
         return reserved
 
     def _commit_skill_rights(
@@ -1449,11 +1622,15 @@ class SkillManager:
             exclude_capability_ids=exclude_capability_ids,
         )
         for cap_id, reservation_id in selected.items():
-            self.capabilities.commit_reserved_use(
+            committed = self.capabilities.commit_reserved_use(
                 reservation_id,
                 committed_by="skill",
                 reason=f"one-time skill permission committed: {cap_id}",
             )
+            if not committed:
+                raise CapabilityDenied(
+                    "skill authority reservation is no longer active"
+                )
             reservations.pop(cap_id, None)
 
     def _restore_skill_rights(

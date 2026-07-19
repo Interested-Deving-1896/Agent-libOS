@@ -19,6 +19,11 @@ from agent_libos.models import Capability, CapabilityRight, ProcessStatus  # noq
 from agent_libos.utils.serde import to_jsonable  # noqa: E402
 from agent_libos.substrate import LocalResourceProviderSubstrate  # noqa: E402
 
+if __package__:  # pragma: no branch - depends on module versus file execution
+    from scripts.runtime_assembly import aopen_runtime  # noqa: E402
+else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
+    from runtime_assembly import aopen_runtime  # noqa: E402
+
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _LAUNCHER_DEFAULTS = DEFAULT_CONFIG.launcher
@@ -41,7 +46,7 @@ def main(argv: list[str] | None = None) -> None:
 async def amain(args: argparse.Namespace) -> None:
     _load_env(args)
     workspace = _resolve_workspace(args.workspace)
-    runtime = _open_runtime(args, workspace)
+    runtime = await _aopen_runtime(args, workspace)
     try:
         goal = _load_goal(args, workspace)
         pid = runtime.process.spawn(image=_RUNTIME_DEFAULTS.coding_image_id, goal=goal)
@@ -72,7 +77,7 @@ async def amain(args: argparse.Namespace) -> None:
         if args.strict and process.status in {ProcessStatus.FAILED, ProcessStatus.KILLED}:
             raise SystemExit(2)
     finally:
-        runtime.shutdown(actor="script", reason="script.complete")
+        await runtime.ashutdown(actor="script", reason="script.complete")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -182,11 +187,14 @@ def _load_env(args: argparse.Namespace) -> None:
         load_dotenv(env_path)
 
 
-def _open_runtime(args: argparse.Namespace, workspace: Path) -> Runtime:
+async def _aopen_runtime(args: argparse.Namespace, workspace: Path) -> Runtime:
     substrate = LocalResourceProviderSubstrate(workspace)
-    if args.ephemeral_db:
-        return Runtime.open(_RUNTIME_DEFAULTS.local_store_target, substrate=substrate)
-    return Runtime.open(_resolve_db_path(args, workspace), substrate=substrate)
+    target = (
+        _RUNTIME_DEFAULTS.local_store_target
+        if args.ephemeral_db
+        else _resolve_db_path(args, workspace)
+    )
+    return await aopen_runtime(target, substrate=substrate)
 
 
 def _resolve_workspace(value: str) -> Path:

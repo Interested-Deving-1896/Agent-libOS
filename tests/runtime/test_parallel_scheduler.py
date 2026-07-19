@@ -4,9 +4,12 @@ import asyncio
 import threading
 import time
 
+import pytest
+
 from agent_libos import Runtime
 from agent_libos.config import AgentLibOSConfig, SchedulerDefaults
-from agent_libos.models import ProcessStatus, ResourceBudget
+from agent_libos.models import ChildProcessWait, ProcessStatus, ResourceBudget
+from agent_libos.models.exceptions import ProcessRevisionConflict
 
 
 def _parallel_config(max_workers: int = 4) -> AgentLibOSConfig:
@@ -21,6 +24,27 @@ def _parallel_config(max_workers: int = 4) -> AgentLibOSConfig:
 
 
 class TestParallelScheduler:
+    def test_terminal_process_rejects_direct_tool_table_mutation(self) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(goal="terminal process tool fence")
+            runtime.process.cancel(pid, "terminal fence regression")
+            terminal = runtime.process.get(pid)
+
+            with pytest.raises(ProcessRevisionConflict, match="terminal process"):
+                runtime.tools.configure_process_tools(
+                    pid,
+                    ["human_output"],
+                    assigned_by="late host mutation",
+                )
+
+            current = runtime.process.get(pid)
+            assert current.status == ProcessStatus.KILLED
+            assert current.revision == terminal.revision
+            assert current.tool_table == terminal.tool_table
+        finally:
+            runtime.close()
+
     def test_concurrent_direct_single_step_calls_do_not_reenter_same_process(self) -> None:
         runtime = Runtime.open("local", config=_parallel_config(max_workers=2))
         try:
@@ -166,9 +190,13 @@ class TestParallelScheduler:
                     )
                     state["child"] = child
                     process = runtime.process.get(parent)
-                    process.status = ProcessStatus.WAITING_EVENT
-                    process.status_message = f"waiting for {child}"
-                    runtime.store.update_process(process)
+                    runtime.process_transitions.transition(
+                        parent,
+                        ProcessStatus.WAITING_EVENT,
+                        expected_revision=process.revision,
+                        expected_status=process.status,
+                        wait_state=ChildProcessWait(child_pid=child),
+                    )
                     while runtime.process.get(child).status not in runtime.process.TERMINAL_STATUSES:
                         await asyncio.sleep(runtime.scheduler.poll_interval_s)
                     return {"pid": pid, "done": "parent"}
@@ -251,4 +279,76 @@ class TestParallelScheduler:
             time.sleep(0.15)
             assert runtime.shutdown(actor="test", reason="detached quantum complete")["ok"] is True
         finally:
+            runtime.close()
+
+    def test_detached_quantum_token_cannot_mutate_after_external_cancel(self) -> None:
+        runtime = Runtime.open(
+            "local",
+            config=AgentLibOSConfig(
+                scheduler=SchedulerDefaults(
+                    max_workers=1,
+                    poll_interval_s=0.001,
+                    drain_window_s=0.01,
+                    shutdown_join_timeout_s=0.5,
+                )
+            ),
+        )
+        pid = runtime.process.spawn(goal="detached execution fence")
+        started = threading.Event()
+        release = threading.Event()
+        rejected: list[BaseException] = []
+        tool_rejected: list[BaseException] = []
+        scheduler_errors: list[BaseException] = []
+        try:
+            def quantum(selected_pid: str) -> dict[str, str]:
+                started.set()
+                assert release.wait(timeout=2)
+                latest = runtime.process.get(selected_pid)
+                latest.status_message = "stale detached worker write"
+                try:
+                    runtime.store.update_process(latest)
+                except BaseException as error:
+                    rejected.append(error)
+                try:
+                    runtime.tools.configure_process_tools(
+                        selected_pid,
+                        ['human_output'],
+                        assigned_by='stale detached worker',
+                    )
+                except BaseException as error:
+                    tool_rejected.append(error)
+                return {"pid": selected_pid}
+
+            def run_scheduler() -> None:
+                try:
+                    runtime.scheduler.run_until_idle(quantum, max_quanta=1)
+                except BaseException as error:
+                    scheduler_errors.append(error)
+
+            scheduler_thread = threading.Thread(target=run_scheduler)
+            scheduler_thread.start()
+            assert started.wait(timeout=1)
+            runtime.process.cancel(pid, "external cancel wins")
+            cancelled = runtime.process.get(pid)
+            release.set()
+            scheduler_thread.join(timeout=2)
+
+            deadline = time.monotonic() + 2
+            while (not rejected or not tool_rejected) and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            process = runtime.process.get(pid)
+            assert not scheduler_thread.is_alive()
+            assert scheduler_errors == []
+            assert len(rejected) == 1
+            assert isinstance(rejected[0], ProcessRevisionConflict)
+            assert len(tool_rejected) == 1
+            assert isinstance(tool_rejected[0], ProcessRevisionConflict)
+            assert process.status == ProcessStatus.KILLED
+            assert process.status_message == cancelled.status_message
+            assert process.revision >= cancelled.revision
+            assert process.status_message != "stale detached worker write"
+            assert process.tool_table == cancelled.tool_table
+        finally:
+            release.set()
             runtime.close()

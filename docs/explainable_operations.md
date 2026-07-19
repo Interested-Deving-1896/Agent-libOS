@@ -35,8 +35,62 @@ same operations even though a new concrete tool-call attempt may receive a new
 persisted task-start operation; Human resume reuses the operation linked to the
 request.
 
-At runtime reopen, an operation left `running` is marked `interrupted`. A
-durable `waiting` operation remains waiting. An uncertain pending provider
+At runtime reopen, durable runtime publications are reconciled before generic
+stale-operation handling. A linked publication is authoritative:
+`committed` maps to `succeeded`, `rolled_back` maps to `failed`, and a failed
+or manual compensation maps to `unknown`. Publication finalization and this
+operation outcome are written in the same store transaction. Recovery is
+idempotent and may correct a previously terminal operation written on the
+wrong side of a crash window. Only an unlinked `running` operation is then
+marked `interrupted`; a durable `waiting` operation remains waiting. If that
+terminal transaction itself fails, the publication remains nonterminal and
+its exactly linked operation remains `running` for recovery instead of being
+independently finalized by the generic operation wrapper. An unlinked or
+mismatched pending-publication signal cannot suppress ordinary terminalization.
+Launch/exec terminal reconciliation and committed checkpoint-restore operation
+repair are index-backed and hard-bounded by keyset pages. Failed/manual
+checkpoint restores remain forward-recovery inputs. Online terminal
+transactions durably set the reconciliation marker, so
+reopen visits only rows still requiring repair; returned diagnostic id lists
+are bounded even when recovery processes a larger backlog. A successful
+RuntimeStore mutation of a bound operation clears that marker in the same
+transaction, so the next reopen revalidates the changed contract without
+rescanning settled history.
+
+Checkpoint-restore plans are fully specified at insert and anchored by a
+receipt-side digest. Generic Host RuntimeStore writes cannot mutate their plan,
+receipt transcript, recovery lease, or operation marker; the storage-owned
+restore writer performs only validated state-machine transitions. Recovery
+checks the anchor and ordered causal transcript before phase/finalizer replay
+or committed-operation repair.
+
+The exact link is created during publication planning, in the same store
+transaction that inserts the publication: `plan.operation_id` points to the
+operation, while a normalized uniquely indexed column records the reverse
+publication id and operation metadata records its id, kind, and versioned
+durable binding marker. The normalized value and metadata must agree. The
+plan-side operation id and binding version become immutable after binding, and
+the reverse association must resolve to exactly one operation through the typed
+repository lookup. Reconciliation never creates this association for an
+unbound row. A blank or missing operation id, a missing operation, a fully
+matching but unbound operation, multiple reverse bindings, a changed
+kind/name/actor/PID, or an operation already bound to another publication fails
+reopen closed without rewriting the operation. As with the rest of RuntimeStore
+evidence, this is an application integrity contract rather than protection from
+a database administrator who bypasses RuntimeStore and edits an already-settled
+row directly.
+
+Online `spawn`, `fork`, and `spawn_child` commit their process transition,
+event/audit evidence, publication receipt, and successful operation outcome in
+one terminal transaction. A sink failure rolls all of it back before exact
+compensation; rolled-back/failed receipts are likewise atomic with failed or
+unknown operation outcomes. If that terminal sink also fails, the publication
+and operation stay nonterminal, mutation admission is fenced until reopen, and
+retry cannot leave a duplicate process. For root `process.spawn`, a pre-return
+crash may initially leave the operation PID unset; exact prebinding authorizes
+the terminal transaction to canonicalize it to the publication's child PID.
+
+An uncertain pending provider
 effect makes the affected primitive/tool and enclosing LLM outcome `unknown`;
 this is distinct from missing evidence. The same rule applies after settlement
 has finalized an effect with `transaction_state=unknown`; bookkeeping

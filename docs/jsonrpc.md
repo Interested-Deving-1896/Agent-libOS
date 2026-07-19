@@ -28,6 +28,25 @@ the exact method is then authorized after the method spec is known, and any
 one-shot use from that decision is consumed only after pre-provider validation
 has passed.
 
+Per-use Human approval is bound to the canonical params hash, the immutable
+SHA-256 digest of the complete registered endpoint spec, and the durable
+JSON-RPC registry generation. Register, replace, and unregister each advance
+that generation in the same transaction as the row mutation. A prompt for an
+as-yet unregistered id therefore cannot authorize whatever endpoint is later
+registered under that id; the changed digest/generation requires a new prompt.
+Re-registering byte-identical policy also advances the generation and defeats
+ABA reuse. The primitive resolves this digest-only binding only after it finds
+ASK or already constrained invocation authority, so a caller with no matching
+authority still cannot probe registry state. The captured digest and generation
+are compared with the live registry inside the protected effect transaction
+immediately before every provider phase. Replace, unregister, or byte-identical
+re-registration completed before the first phase therefore calls no provider;
+a change after an earlier phase prevents every later provider phase and retains
+the conservative evidence for work already observed. A per-registry phase guard
+serializes register/replace/unregister with the interval from that live compare
+through provider-call return; the runtime's single-writer store lease excludes
+a second supported Runtime writer from bypassing the in-process guard.
+
 ## Endpoint Manifest V1
 
 Endpoint manifests can be YAML or JSON. They may be direct mappings or wrapped

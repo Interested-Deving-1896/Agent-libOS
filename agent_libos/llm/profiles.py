@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, LLMProfile
 from agent_libos.llm.client import LLMClient, LLMError
 from agent_libos.models.exceptions import NotFound, ValidationError
+from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.storage import ProcessRepository
 from agent_libos.utils.serde import dumps
 
@@ -247,34 +248,57 @@ class LLMProfileRegistry:
         )
 
     def shutdown(self) -> None:
-        errors: list[str] = []
+        """Close every cached client from synchronous host teardown.
+
+        Synchronous method names are preferred; async-only close methods and
+        awaitable close results are driven to completion by
+        :meth:`_shutdown_client`. A client remains cached until its close method
+        returns successfully, so a failed Runtime shutdown or failed assembly
+        cleanup retains the exact Host resource for a later retry.
+        """
+
+        failures: list[BaseException] = []
         with self._lock:
             clients = self._unique_clients()
-            self._clients.clear()
-            self._client_identity_sha256.clear()
-            self._test_clients.clear()
         for client in clients:
             try:
                 self._shutdown_client(client)
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {exc}")
-        if errors:
-            raise RuntimeError(f"LLM profile shutdown failed: {errors}")
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                self._forget_closed_client(client)
+        self._raise_shutdown_failures(failures)
 
     async def ashutdown(self) -> None:
-        errors: list[str] = []
+        """Close every cached client from asynchronous host teardown.
+
+        Async-specific methods are preferred and synchronous methods are the
+        fallback.  As with :meth:`shutdown`, only a successfully closed unique
+        client is removed from every production/test cache entry that still
+        refers to that exact object.
+        """
+
+        failures: list[BaseException] = []
+        caller_interrupted = False
         with self._lock:
             clients = self._unique_clients()
-            self._clients.clear()
-            self._client_identity_sha256.clear()
-            self._test_clients.clear()
         for client in clients:
             try:
-                await self._ashutdown_client(client)
-            except Exception as exc:
-                errors.append(f"{type(exc).__name__}: {exc}")
-        if errors:
-            raise RuntimeError(f"LLM profile shutdown failed: {errors}")
+                interrupted = await self._ashutdown_client(client)
+            except BaseException as exc:
+                failures.append(exc)
+            else:
+                self._forget_closed_client(client)
+                caller_interrupted = caller_interrupted or interrupted
+        if caller_interrupted:
+            cancellation = asyncio.CancelledError()
+            if failures:
+                raise BaseExceptionGroup(
+                    "LLM profile shutdown was cancelled after all clients were attempted",
+                    [cancellation, *failures],
+                )
+            raise cancellation
+        self._raise_shutdown_failures(failures)
 
     def _create_client(
         self,
@@ -426,6 +450,31 @@ class LLMProfileRegistry:
             clients.append(client)
         return clients
 
+    def _forget_closed_client(self, client: Any) -> None:
+        """Forget every cache reference still bound to one closed identity."""
+
+        with self._lock:
+            for profile_id, cached in tuple(self._clients.items()):
+                if cached is not client:
+                    continue
+                self._clients.pop(profile_id, None)
+                self._client_identity_sha256.pop(profile_id, None)
+            for profile_id, cached in tuple(self._test_clients.items()):
+                if cached is client:
+                    self._test_clients.pop(profile_id, None)
+
+    @staticmethod
+    def _raise_shutdown_failures(failures: list[BaseException]) -> None:
+        if not failures:
+            return
+        if any(not isinstance(exc, Exception) for exc in failures):
+            raise BaseExceptionGroup(
+                "LLM profile shutdown was interrupted after all clients were attempted",
+                failures,
+            )
+        errors = [f"{type(exc).__name__}: {exc}" for exc in failures]
+        raise RuntimeError(f"LLM profile shutdown failed: {errors}")
+
     def _shutdown_client(self, client: Any | None) -> None:
         if client is None:
             return
@@ -440,33 +489,111 @@ class LLMProfileRegistry:
             result = close()
             if inspect.isawaitable(result):
                 _run_awaitable_sync(result)
-
-    async def _ashutdown_client(self, client: Any | None) -> None:
-        if client is None:
             return
         ashutdown = getattr(client, "ashutdown", None)
         if callable(ashutdown):
             result = ashutdown()
             if inspect.isawaitable(result):
-                await result
+                _run_awaitable_sync(result)
             return
         aclose = getattr(client, "aclose", None)
         if callable(aclose):
             result = aclose()
             if inspect.isawaitable(result):
-                await result
-            return
+                _run_awaitable_sync(result)
+
+    async def _ashutdown_client(self, client: Any | None) -> bool:
+        if client is None:
+            return False
+        ashutdown = getattr(client, "ashutdown", None)
+        if callable(ashutdown):
+            return await self._ainvoke_shutdown_callback(
+                ashutdown,
+                native_async=True,
+            )
+        aclose = getattr(client, "aclose", None)
+        if callable(aclose):
+            return await self._ainvoke_shutdown_callback(
+                aclose,
+                native_async=True,
+            )
         shutdown = getattr(client, "shutdown", None)
         if callable(shutdown):
-            result = shutdown()
-            if inspect.isawaitable(result):
-                await result
-            return
+            return await self._ainvoke_shutdown_callback(
+                shutdown,
+                native_async=False,
+            )
         close = getattr(client, "close", None)
         if callable(close):
-            result = close()
-            if inspect.isawaitable(result):
-                await result
+            return await self._ainvoke_shutdown_callback(
+                close,
+                native_async=False,
+            )
+        return False
+
+    @classmethod
+    async def _ainvoke_shutdown_callback(
+        cls,
+        callback: Any,
+        *,
+        native_async: bool,
+    ) -> bool:
+        """Run one client close without blocking or abandoning Host work."""
+
+        interrupted = False
+        if native_async and (
+            inspect.iscoroutinefunction(callback)
+            or inspect.iscoroutinefunction(getattr(callback, "__call__", None))
+        ):
+            # Create native async close work on the owning caller loop.
+            result = callback()
+        else:
+            result, interrupted = await cls._await_shutdown_step(
+                run_blocking_once(callback)
+            )
+        if inspect.isawaitable(result):
+            try:
+                _, await_interrupted = await cls._await_shutdown_step(result)
+            except BaseException as exc:
+                if interrupted:
+                    raise BaseExceptionGroup(
+                        "LLM client shutdown was cancelled before its awaitable failed",
+                        [asyncio.CancelledError(), exc],
+                    ) from None
+                raise
+            interrupted = interrupted or await_interrupted
+        return interrupted
+
+    @staticmethod
+    async def _await_shutdown_step(awaitable: Any) -> tuple[Any, bool]:
+        """Drain a client-close step before reporting caller cancellation."""
+
+        task = asyncio.ensure_future(awaitable)
+        interrupted = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise
+                interrupted = True
+                if task.done():
+                    try:
+                        return task.result(), True
+                    except BaseException as exc:
+                        raise BaseExceptionGroup(
+                            "LLM client shutdown was cancelled while close failed",
+                            [asyncio.CancelledError(), exc],
+                        ) from None
+                continue
+            except BaseException as exc:
+                if interrupted:
+                    raise BaseExceptionGroup(
+                        "LLM client shutdown was cancelled while close failed",
+                        [asyncio.CancelledError(), exc],
+                    ) from None
+                raise
+            return result, interrupted
 
 
 def _optional_env(env: Mapping[str, str], key: str) -> str | None:

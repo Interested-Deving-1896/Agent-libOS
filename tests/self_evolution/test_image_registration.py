@@ -15,9 +15,11 @@ from agent_libos.models import (
     ObjectType,
     ProcessStatus,
     ResourceBudget,
+    ToolCandidateStatus,
     ValidationResult,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProcessError, RuntimeRecoveryRequired, ValidationError
+from agent_libos.process_execution import bind_process_execution
 from agent_libos.substrate import LocalResourceProviderSubstrate, SubprocessLimits
 from agent_libos.tools.sandbox import DenoTypescriptSandbox
 
@@ -33,6 +35,37 @@ class RejectingValidationSandbox(DenoTypescriptSandbox):
         return_metrics: bool = False,
     ) -> ValidationResult:
         return ValidationResult(ok=False, errors=['package validation failed'])
+
+
+def _abort_exec_before_compensation(
+    *,
+    error: BaseException,
+    **_kwargs: object,
+) -> None:
+    """Model host process loss after durable exec effects are published."""
+
+    raise error
+
+
+def _group_contains(error: BaseException, kind: type[BaseException]) -> bool:
+    if isinstance(error, BaseExceptionGroup):
+        return any(_group_contains(item, kind) for item in error.exceptions)
+    return isinstance(error, kind)
+
+
+def _release_fenced_runtime_or_close(runtime: Runtime) -> None:
+    reason = runtime.lifecycle.shutdown_reason
+    if (
+        runtime.lifecycle.state == "close_failed"
+        and isinstance(reason, str)
+        and reason.startswith("runtime.recovery_required:")
+    ):
+        result = runtime.release_recovery_diagnostics()
+        assert result["ok"] is True, result
+        assert result["recovery_diagnostics_released"] is True
+        assert runtime.lifecycle.closed
+        return
+    runtime.close()
 
 
 class TestImageRegistration:
@@ -786,6 +819,324 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
+    def test_failed_package_launch_compensates_exact_publication_artifacts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            _write_image_package(root / 'package-agent')
+            runtime = Runtime.open(
+                'local',
+                substrate=LocalResourceProviderSubstrate(root),
+            )
+            try:
+                runtime.image_registry.register_from_package_path(
+                    root / 'package-agent',
+                    actor='cli',
+                )
+                original_advance = runtime.store.advance_runtime_publication
+
+                def fail_launch_commit(publication_id: str, **kwargs: Any) -> bool:
+                    publication = runtime.store.get_runtime_publication(publication_id)
+                    if (
+                        kwargs.get('state') == 'committed'
+                        and publication is not None
+                        and publication['kind'] == 'process_launch'
+                        and publication['plan'].get('image_id') == 'package-agent:v0'
+                    ):
+                        return False
+                    return original_advance(publication_id, **kwargs)
+
+                monkeypatch.setattr(
+                    runtime.store,
+                    'advance_runtime_publication',
+                    fail_launch_commit,
+                )
+                with pytest.raises(ProcessError, match='cannot commit process publication'):
+                    runtime.process.spawn(
+                        image='package-agent:v0',
+                        goal='publication artifact rollback',
+                    )
+
+                publication = [
+                    item
+                    for item in runtime.store.list_runtime_publications()
+                    if item['kind'] == 'process_launch'
+                    and item['plan'].get('image_id') == 'package-agent:v0'
+                ][-1]
+                artifacts = publication['receipt']['artifacts']
+                kinds = {item['kind'] for item in artifacts}
+                workspace_root = publication['plan']['materialized_workspace_root']
+
+                assert publication['state'] == 'rolled_back'
+                assert {'workspace', 'capability'} <= kinds
+                assert not (root / workspace_root).exists()
+                assert runtime.store.get_process(publication['pid']) is None
+                for artifact in artifacts:
+                    if artifact['kind'] == 'capability':
+                        assert runtime.store.get_capability(artifact['capability_id']) is None
+            finally:
+                runtime.close()
+
+    def test_reopen_retries_failed_package_launch_compensation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / 'runtime.sqlite'
+            _write_image_package(root / 'package-agent')
+            runtime = Runtime.open(
+                target,
+                substrate=LocalResourceProviderSubstrate(root),
+            )
+            try:
+                runtime.image_registry.register_from_package_path(
+                    root / 'package-agent',
+                    actor='cli',
+                )
+                original_advance = runtime.store.advance_runtime_publication
+
+                def fail_launch_commit(publication_id: str, **kwargs: Any) -> bool:
+                    publication = runtime.store.get_runtime_publication(publication_id)
+                    if (
+                        kwargs.get('state') == 'committed'
+                        and publication is not None
+                        and publication['kind'] == 'process_launch'
+                        and publication['plan'].get('image_id') == 'package-agent:v0'
+                    ):
+                        return False
+                    return original_advance(publication_id, **kwargs)
+
+                def fail_first_compensation(_publication: dict[str, Any]) -> None:
+                    raise RuntimeError('injected first compensation failure')
+
+                monkeypatch.setattr(
+                    runtime.store,
+                    'advance_runtime_publication',
+                    fail_launch_commit,
+                )
+                monkeypatch.setattr(
+                    runtime.image_boot,
+                    'cleanup_failed_launch_artifacts',
+                    fail_first_compensation,
+                )
+
+                with pytest.raises(ExceptionGroup, match='launch and compensation failed'):
+                    runtime.process.spawn(
+                        image='package-agent:v0',
+                        goal='retry failed publication compensation after reopen',
+                    )
+
+                publication = [
+                    item
+                    for item in runtime.store.list_runtime_publications()
+                    if item['kind'] == 'process_launch'
+                    and item['plan'].get('image_id') == 'package-agent:v0'
+                ][-1]
+                publication_id = publication['publication_id']
+                pid = publication['pid']
+                workspace_root = publication['plan']['materialized_workspace_root']
+                assert publication['state'] == 'failed'
+                assert runtime.store.get_process(pid) is not None
+                assert (root / workspace_root / 'seed.txt').exists()
+            finally:
+                _release_fenced_runtime_or_close(runtime)
+
+            reopened = Runtime.open(
+                target,
+                substrate=LocalResourceProviderSubstrate(root),
+            )
+            try:
+                publication = reopened.store.get_runtime_publication(publication_id)
+                assert publication is not None
+                assert publication['state'] == 'rolled_back'
+                assert publication_id in reopened.recovered_runtime_publications
+                assert reopened.store.get_process(pid) is None
+                assert not (root / workspace_root).exists()
+                for artifact in publication['receipt']['artifacts']:
+                    if artifact['kind'] == 'capability':
+                        assert reopened.store.get_capability(artifact['capability_id']) is None
+            finally:
+                reopened.close()
+
+    def test_reopen_cleans_image_package_workspace_after_interrupted_exec(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class SimulatedCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / 'runtime.sqlite'
+            _write_image_package(root / 'package-agent')
+            runtime = Runtime.open(
+                target,
+                substrate=LocalResourceProviderSubstrate(root),
+            )
+            try:
+                runtime.image_registry.register_from_package_path(
+                    root / 'package-agent',
+                    actor='cli',
+                )
+                pid = runtime.process.spawn(
+                    image='base-agent:v0',
+                    goal='before interrupted exec',
+                )
+                pre_exec_capability = runtime.capability.grant(
+                    pid,
+                    runtime.image_registry.resource_for('package-agent:v0'),
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                original_instantiate = runtime.image_boot._instantiate_boot
+
+                def crash_after_image_boot(*args: Any, **kwargs: Any) -> None:
+                    original_instantiate(*args, **kwargs)
+                    raise SimulatedCrash('interrupted after image workspace materialization')
+
+                monkeypatch.setattr(
+                    runtime.image_boot,
+                    '_instantiate_boot',
+                    crash_after_image_boot,
+                )
+                monkeypatch.setattr(
+                    runtime.image_boot,
+                    '_rollback_failed_exec',
+                    _abort_exec_before_compensation,
+                )
+                with pytest.raises(BaseExceptionGroup) as caught:
+                    runtime.exec_process(
+                        pid,
+                        'package-agent:v0',
+                        goal='interrupted exec',
+                    )
+                assert _group_contains(caught.value, SimulatedCrash)
+
+                materialized = root / runtime.config.image.materialized_workspace_root
+                assert list(materialized.rglob('seed.txt'))
+                publications = [
+                    item
+                    for item in runtime.store.list_runtime_publications(pid=pid)
+                    if item['kind'] == 'process_exec'
+                ]
+                assert len(publications) == 1
+                publication_id = publications[0]['publication_id']
+                capability_artifact_ids = {
+                    str(artifact['capability_id'])
+                    for artifact in publications[0]['receipt']['artifacts']
+                    if artifact['kind'] == 'capability'
+                }
+                assert capability_artifact_ids
+                assert pre_exec_capability.cap_id not in capability_artifact_ids
+            finally:
+                _release_fenced_runtime_or_close(runtime)
+
+            reopened = Runtime.open(
+                target,
+                substrate=LocalResourceProviderSubstrate(root),
+            )
+            try:
+                assert reopened.process.get(pid).image_id == 'base-agent:v0'
+                assert list(materialized.rglob('seed.txt')) == []
+                publication = reopened.store.get_runtime_publication(publication_id)
+                assert publication is not None
+                assert publication['state'] == 'rolled_back'
+                restored_pre_exec_capability = reopened.store.get_capability(
+                    pre_exec_capability.cap_id
+                )
+                assert restored_pre_exec_capability is not None
+                assert restored_pre_exec_capability.active
+                for capability_id in capability_artifact_ids:
+                    assert reopened.store.get_capability(capability_id) is None
+            finally:
+                reopened.close()
+
+    def test_reopen_restores_pre_exec_jit_handle_after_interrupted_exec(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class SimulatedCrash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / 'runtime.sqlite'
+            runtime = Runtime.open(
+                target,
+                substrate=LocalResourceProviderSubstrate(root),
+            )
+            try:
+                pid = runtime.process.spawn(
+                    image='toolmaker-agent:v0',
+                    goal='pre-exec process-local JIT',
+                )
+                candidate_id = runtime.tools.propose(
+                    pid,
+                    {
+                        'name': 'pre_exec_jit_echo',
+                        'description': 'Echo before an interrupted exec.',
+                        'input_schema': {'type': 'object'},
+                        'output_schema': {'type': 'object'},
+                    },
+                    'export function run(args) { return args; }',
+                )
+                candidate = runtime.store.get_tool_candidate(candidate_id)
+                assert candidate is not None
+                candidate.status = ToolCandidateStatus.VALIDATED
+                candidate.validation = {'ok': True, 'language': 'typescript'}
+                runtime.store.update_tool_candidate(candidate)
+                handle = runtime.tools.register(pid, candidate_id)
+                runtime.capability.grant(
+                    pid,
+                    runtime.image_registry.resource_for('review-agent:v0'),
+                    [CapabilityRight.READ],
+                    issued_by='test',
+                )
+                original_configure = runtime.image_boot._configure_tools
+
+                def crash_after_exec_tool_replacement(*args: Any, **kwargs: Any) -> Any:
+                    original_configure(*args, **kwargs)
+                    raise SimulatedCrash('interrupted after exec tool replacement')
+
+                monkeypatch.setattr(
+                    runtime.image_boot,
+                    '_configure_tools',
+                    crash_after_exec_tool_replacement,
+                )
+                monkeypatch.setattr(
+                    runtime.image_boot,
+                    '_rollback_failed_exec',
+                    _abort_exec_before_compensation,
+                )
+                with pytest.raises(BaseExceptionGroup) as caught:
+                    runtime.exec_process(pid, 'review-agent:v0', goal='interrupted exec')
+                assert _group_contains(caught.value, SimulatedCrash)
+            finally:
+                _release_fenced_runtime_or_close(runtime)
+
+            reopened = Runtime.open(
+                target,
+                substrate=LocalResourceProviderSubstrate(root),
+            )
+            try:
+                restored = reopened.process.get(pid)
+                assert restored.image_id == 'toolmaker-agent:v0'
+                assert restored.tool_table['pre_exec_jit_echo'] == handle.tool_id
+                restored_handle = reopened.tools.loaded_tool_handle(handle.tool_id)
+                assert restored_handle is not None
+                assert restored_handle.name == 'pre_exec_jit_echo'
+                publication = [
+                    item
+                    for item in reopened.store.list_runtime_publications(pid=pid)
+                    if item['kind'] == 'process_exec'
+                ][-1]
+                assert publication['state'] == 'rolled_back'
+            finally:
+                reopened.close()
+
     def test_exec_publication_commit_failure_compensates_before_return(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -836,6 +1187,14 @@ class TestImageRegistration:
                 if item['kind'] == 'process_exec' and item['pid'] == pid
             ]
             assert publications[-1]['state'] == 'rolled_back'
+            exec_operations = [
+                operation
+                for operation in runtime.store.list_operations(pid=pid)
+                if operation.name == 'process.exec'
+            ]
+            assert len(exec_operations) == 1
+            assert exec_operations[0].outcome.value == 'failed'
+            assert publications[-1]['plan']['operation_id'] == exec_operations[0].operation_id
             assert not [
                 record
                 for record in runtime.audit.trace(actor=pid, target=f'process:{pid}')
@@ -849,7 +1208,7 @@ class TestImageRegistration:
         finally:
             runtime.close()
 
-    def test_failed_exec_inside_claim_preserves_execution_token_for_quantum_completion(self) -> None:
+    def test_failed_exec_inside_claim_fences_execution_token_and_returns_to_queue(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(
                 Path(temp_dir) / 'package-agent',
@@ -863,7 +1222,7 @@ class TestImageRegistration:
                     Path(temp_dir) / 'package-agent',
                     actor='cli',
                 )
-                pid = runtime.process.spawn(goal='exec rollback keeps scheduler token')
+                pid = runtime.process.spawn(goal='exec rollback fences scheduler token')
                 runtime.capability.grant(
                     pid,
                     runtime.image_registry.resource_for('package-agent:v0'),
@@ -873,15 +1232,26 @@ class TestImageRegistration:
                 token = runtime.store.claim_execution(pid, owner_id='test.runtime')
                 assert token is not None
 
-                with pytest.raises(Exception, match='missing-package-skill'):
-                    runtime.exec_process(pid, 'package-agent:v0', goal='fail in claimed quantum')
+                with bind_process_execution(token):
+                    with pytest.raises(Exception, match='missing-package-skill'):
+                        runtime.exec_process(
+                            pid,
+                            'package-agent:v0',
+                            goal='fail in claimed quantum',
+                        )
 
                 restored = runtime.process.get(pid)
-                assert restored.status == ProcessStatus.RUNNING
-                assert restored.execution_generation == token.generation
-                assert restored.execution_owner_id == token.owner_id
-                assert restored.execution_lease_id == token.lease_id
-                assert runtime.store.complete_execution(token, status=ProcessStatus.RUNNABLE)
+                assert restored.status == ProcessStatus.RUNNABLE
+                assert restored.execution_generation > token.generation
+                assert restored.execution_owner_id is None
+                assert restored.execution_lease_id is None
+                assert (
+                    runtime.store.complete_execution(
+                        token,
+                        status=ProcessStatus.RUNNABLE,
+                    )
+                    is False
+                )
             finally:
                 runtime.close()
 
@@ -897,7 +1267,7 @@ class TestImageRegistration:
             try:
                 runtime.image_registry.register_from_package_path(Path(temp_dir) / 'package-agent', actor='cli')
                 pid = runtime.process.spawn(image='base-agent:v0', goal='before late failed exec')
-                runtime.capability.grant(
+                pre_exec_capability = runtime.capability.grant(
                     pid,
                     runtime.image_registry.resource_for('package-agent:v0'),
                     [CapabilityRight.READ],
@@ -922,6 +1292,26 @@ class TestImageRegistration:
                     if obj.type == ObjectType.TOOL_CANDIDATE
                 ]
                 assert not [row for row in runtime.store.list_tools() if row['name'] == 'package_count']
+                publication = [
+                    item
+                    for item in runtime.store.list_runtime_publications(pid=pid)
+                    if item['kind'] == 'process_exec'
+                ][-1]
+                capability_artifact_ids = {
+                    str(artifact['capability_id'])
+                    for artifact in publication['receipt']['artifacts']
+                    if artifact['kind'] == 'capability'
+                }
+                assert publication['state'] == 'rolled_back'
+                assert capability_artifact_ids
+                assert pre_exec_capability.cap_id not in capability_artifact_ids
+                restored_pre_exec_capability = runtime.store.get_capability(
+                    pre_exec_capability.cap_id
+                )
+                assert restored_pre_exec_capability is not None
+                assert restored_pre_exec_capability.active
+                for capability_id in capability_artifact_ids:
+                    assert runtime.store.get_capability(capability_id) is None
             finally:
                 runtime.close()
 
@@ -961,7 +1351,12 @@ class TestImageRegistration:
             finally:
                 runtime.close()
 
-    def test_failed_exec_does_not_resurrect_concurrent_revoke(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize('revoke_mode', ['capability', 'resource'])
+    def test_failed_exec_does_not_resurrect_concurrent_revoke(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        revoke_mode: str,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             _write_image_package(
                 Path(temp_dir) / 'package-agent',
@@ -988,12 +1383,19 @@ class TestImageRegistration:
                 original_activate = runtime.skills.activate_skill
 
                 def revoke_then_fail(*args: Any, **kwargs: Any) -> Any:
-                    runtime.capability.revoke(
-                        cap.cap_id,
-                        revoked_by='external.concurrent',
-                        reason='concurrent revoke wins',
-                        require_authority=False,
-                    )
+                    if revoke_mode == 'capability':
+                        runtime.capability.revoke(
+                            cap.cap_id,
+                            revoked_by='external.concurrent',
+                            reason='concurrent revoke wins',
+                            require_authority=False,
+                        )
+                    else:
+                        runtime.capability.revoke_resource_trusted(
+                            cap.resource,
+                            revoked_by='external.concurrent',
+                            reason='concurrent resource revoke wins',
+                        )
                     return original_activate(*args, **kwargs)
 
                 monkeypatch.setattr(runtime.skills, 'activate_skill', revoke_then_fail)
@@ -1002,11 +1404,12 @@ class TestImageRegistration:
                         pid,
                         'package-agent:v0',
                         goal='fail after concurrent revoke',
-                        preserve_capabilities=True,
+                        preserve_capabilities=False,
                     )
 
                 persisted = runtime.store.get_capability(cap.cap_id)
                 assert persisted is not None and not persisted.active
+                assert '_agent_libos_exec_rollback_token' not in persisted.metadata
             finally:
                 runtime.close()
 
@@ -1035,12 +1438,23 @@ class TestImageRegistration:
                     return original_activate(*args, **kwargs)
 
                 monkeypatch.setattr(runtime.skills, 'activate_skill', cancel_then_fail)
-                with pytest.raises(Exception, match='missing-package-skill'):
+                with pytest.raises(RuntimeRecoveryRequired) as caught:
                     runtime.exec_process(pid, 'package-agent:v0', goal='fail after cancellation')
 
                 assert runtime.process.get(pid).status == ProcessStatus.KILLED
+                publication = runtime.store.get_runtime_publication(
+                    caught.value.publication_id,
+                )
+                assert publication is not None
+                assert publication['state'] == 'failed'
+                assert publication['phase'] == 'compensation_failed'
+                assert not any(
+                    phase.get('phase') == 'compensation_applied'
+                    for phase in publication['receipt']['phases']
+                )
+                assert runtime.lifecycle.state == 'close_failed'
             finally:
-                runtime.close()
+                _release_fenced_runtime_or_close(runtime)
 
     def test_image_package_workspace_grants_are_relative_to_source_root_not_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

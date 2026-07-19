@@ -6,7 +6,7 @@ from typing import Any
 from agent_libos.models.base import CheckpointID, PID
 
 
-CHECKPOINT_SNAPSHOT_VERSION = 3
+CHECKPOINT_SNAPSHOT_VERSION = 4
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from agent_libos import Runtime
-from agent_libos.models import ProcessStatus, ResourceBudget
+from agent_libos.models import ChildProcessWait, ProcessStatus, ResourceBudget
 
 
 class TestBoundedScheduler:
@@ -25,9 +25,13 @@ class TestBoundedScheduler:
                         )
                         state["child"] = child
                     process = runtime.process.get(parent)
-                    process.status = ProcessStatus.WAITING_EVENT
-                    process.status_message = f"waiting for {child}"
-                    runtime.store.update_process(process)
+                    runtime.process_transitions.transition(
+                        parent,
+                        ProcessStatus.WAITING_EVENT,
+                        expected_revision=process.revision,
+                        expected_status=process.status,
+                        wait_state=ChildProcessWait(child_pid=child),
+                    )
                     while runtime.process.get(child).status not in runtime.process.TERMINAL_STATUSES:
                         await asyncio.sleep(runtime.scheduler.poll_interval_s)
                     return {"pid": pid, "done": "parent"}
@@ -61,9 +65,13 @@ class TestBoundedScheduler:
                         )
                         state["child"] = child
                     process = runtime.process.get(parent)
-                    process.status = ProcessStatus.WAITING_EVENT
-                    process.status_message = f"waiting for {child}"
-                    runtime.store.update_process(process)
+                    runtime.process_transitions.transition(
+                        parent,
+                        ProcessStatus.WAITING_EVENT,
+                        expected_revision=process.revision,
+                        expected_status=process.status,
+                        wait_state=ChildProcessWait(child_pid=child),
+                    )
                     while runtime.process.get(child).status not in runtime.process.TERMINAL_STATUSES:
                         await asyncio.sleep(runtime.scheduler.poll_interval_s)
                     return {"pid": pid, "done": "parent"}

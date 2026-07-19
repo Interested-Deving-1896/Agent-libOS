@@ -35,12 +35,25 @@ class InspectCheckpointArgs(BaseModel):
     checkpoint_id: str
 
 
+class CheckpointProcessInfo(BaseModel):
+    pid: str
+    parent_pid: str | None = None
+    image_id: str
+    status: str
+    working_directory: str
+    goal_oid: str | None = None
+    wait_state: dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
+    state_generation: int
+
+
 class InspectCheckpointOutput(BaseModel):
     checkpoint: dict[str, Any]
     snapshot_version: int | None = None
     subtree_pids: list[str]
+    modules: list[dict[str, Any]]
     counts: dict[str, int]
-    processes: list[dict[str, Any]]
+    processes: list[CheckpointProcessInfo]
 
 
 class DiffCheckpointArgs(BaseModel):
@@ -62,8 +75,12 @@ class RestoreCheckpointOutput(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     checkpoint_id: str
+    publication_id: str
     pid: str
     status: str
+    main_state_committed: bool
+    reconciliation_pending: bool
+    post_commit_failures: list[dict[str, str]]
     restored_pids: list[str]
     previous_pids: list[str]
     cancelled_human_request_ids: list[str] = Field(

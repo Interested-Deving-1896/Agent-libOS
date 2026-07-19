@@ -38,6 +38,7 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessSignal,
     ProcessStatus,
+    process_state_to_mapping,
 )
 from agent_libos.storage.gui_visibility import (
     is_gui_presentation_audit,
@@ -1005,6 +1006,12 @@ class GuiRuntimeService:
         )
         return {
             **to_jsonable(process),
+            **process_state_to_mapping(
+                process.status.value,
+                process.wait_state,
+                process.outcome,
+                process.state_generation,
+            ),
             "terminal": process.status in _TERMINAL,
             "unread_message_count": int(activity_row["unread_message_count"]),
             "interrupt_count": int(activity_row["interrupt_count"]),
@@ -1056,6 +1063,16 @@ class GuiRuntimeService:
             )
             for process in processes
         ]
+
+    def _process_summary_with_scheduler(
+        self,
+        pid: str,
+        process: Any,
+    ) -> dict[str, Any]:
+        return {
+            "process": self._process_summary(pid, include_messages=True, process=process),
+            "scheduler": self.scheduler.status(),
+        }
 
     def _bounded_snapshot(
         self,
@@ -1665,7 +1682,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
             body = self._read_body()
             process = service.runtime.set_process_working_directory(pid, _required_body_string(body, "path"))
             service.publish_runtime_changes("process.cd")
-            return to_jsonable(process)
+            return service._process_summary(pid, include_messages=True, process=process)
         if method == "POST" and route == ["exec"]:
             body = self._read_body()
             max_quanta = _positive_int_or_none(body.get("max_quanta"), "max_quanta")
@@ -1690,7 +1707,7 @@ class GuiRequestHandler(BaseHTTPRequestHandler):
                     max_quanta=max_quanta,
                     reason=f"exec:{pid}",
                 )
-            return {"process": to_jsonable(process), "scheduler": service.scheduler.status()}
+            return service._process_summary_with_scheduler(pid, process)
         if method == "POST" and route == ["exit"]:
             body = self._read_body()
             self._require_confirmed("process.exit", body, {"pid": pid, "failed": body.get("failed", False)})

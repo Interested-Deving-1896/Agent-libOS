@@ -13,7 +13,13 @@ from agent_libos.llm.records import observable_llm_call_fields
 from agent_libos.models import AgentImage, LLMCallRecord, ProcessStatus, ResourceBudget
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import to_jsonable
-from scripts.llm_context_probe import last_tool_result, recent_events
+
+if __package__:  # pragma: no branch - depends on module versus file execution
+    from scripts.llm_context_probe import last_tool_result, recent_events
+    from scripts.runtime_assembly import aopen_runtime
+else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
+    from llm_context_probe import last_tool_result, recent_events
+    from runtime_assembly import aopen_runtime
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
@@ -103,7 +109,7 @@ async def run_chat(
         exit_words = DEFAULT_EXIT_WORDS
     if max_turns < 1:
         raise ValueError("max_turns must be positive")
-    runtime = Runtime.open(db)
+    runtime = await aopen_runtime(db)
     outputs: list[str] = []
     client = HumanChatActionClient(
         responder=responder or ModelResponder(system_prompt=DEFAULT_SYSTEM_PROMPT),
@@ -149,7 +155,7 @@ async def run_chat(
             raise RuntimeError(f"chat process did not exit; status={process.status.value}")
         return report
     finally:
-        runtime.shutdown(actor="script", reason="script.complete")
+        await runtime.ashutdown(actor="script", reason="script.complete")
 
 
 class HumanChatActionClient:

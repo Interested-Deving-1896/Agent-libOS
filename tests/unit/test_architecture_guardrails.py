@@ -118,6 +118,52 @@ class TestArchitectureGuardrails:
 
         assert any("concrete-api-import" in error for error in errors)
 
+    def test_new_raw_asyncio_to_thread_dispatch_fails(self, tmp_path: Path) -> None:
+        relative = "agent_libos/human/provider.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+
+        _write_source(
+            tmp_path,
+            relative,
+            "import asyncio\n\nasync def invoke(provider):\n"
+            "    return await asyncio.to_thread(provider)\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("untracked-blocking-dispatch" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                "import asyncio\n\nasync def invoke(provider):\n"
+                "    loop = asyncio.get_running_loop()\n"
+                "    return await loop.run_in_executor(None, provider)\n"
+            ),
+            (
+                "async def invoke(loop, provider):\n"
+                "    return await loop.run_in_executor(executor=None, func=provider)\n"
+            ),
+        ],
+        ids=["positional", "keyword"],
+    )
+    def test_new_raw_default_executor_dispatch_fails(
+        self,
+        tmp_path: Path,
+        source: str,
+    ) -> None:
+        relative = "agent_libos/human/provider.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+
+        _write_source(tmp_path, relative, source)
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("untracked-blocking-dispatch" in error for error in errors)
+
     @pytest.mark.parametrize(
         "statement",
         [
@@ -139,6 +185,495 @@ class TestArchitectureGuardrails:
         errors = checker.check_architecture(tmp_path, allowlist)
 
         assert any("whole-process-write" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "cursor.execute('DELETE FROM processes')",
+            "store.select_table_rows('processes')",
+            "getattr(store, 'delete_table_rows')('processes')",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "agent_libos/runtime/process_manager.py",
+            "agent_libos/runtime/resource_manager.py",
+            "agent_libos/runtime/checkpoint_manager.py",
+            "agent_libos/runtime/checkpoint_reconciliation.py",
+            "agent_libos/runtime/checkpoint_image.py",
+            "agent_libos/runtime/image_boot.py",
+            "agent_libos/runtime/data_flow_manager.py",
+            "agent_libos/runtime/snapshots/exec_state.py",
+            "agent_libos/modules/registry.py",
+            "agent_libos/process_transition.py",
+        ],
+    )
+    def test_migrated_runtime_storage_sql_bypass_fails(
+        self,
+        tmp_path: Path,
+        statement: str,
+        relative: str,
+    ) -> None:
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+
+        _write_source(
+            tmp_path,
+            relative,
+            f"def mutate(store, cursor):\n    {statement}\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("runtime-storage-sql-bypass" in error for error in errors)
+
+    def test_jit_projection_raw_sql_fails_outside_storage_trust_boundary(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        cases = (
+            (
+                "agent_libos/tools/sample.py",
+                "cursor.execute('DELETE FROM tools WHERE tool_id = ?', (tool_id,))",
+                "tools",
+            ),
+            (
+                "agent_libos/runtime/sample.py",
+                "cursor.executemany("
+                "'INSERT INTO process_tool_bindings (pid, binding_kind, tool_name, tool_id) '"
+                "'VALUES (?, ?, ?, ?)', rows)",
+                "process_tool_bindings",
+            ),
+            (
+                "modules/sample.py",
+                "getattr(cursor, 'execute')("
+                "f'UPDATE tools SET ephemeral = 0 WHERE tool_id = {tool_id!r}')",
+                "tools",
+            ),
+        )
+        for index, (relative, statement, table) in enumerate(cases):
+            case_root = tmp_path / f"case-{index}"
+            _write_source(case_root, relative, "VALUE = 1\n")
+            allowlist = _write_current_baseline(case_root)
+            _write_source(
+                case_root,
+                relative,
+                "def mutate(cursor, tool_id, rows):\n"
+                f"    {statement}\n",
+            )
+
+            errors = checker.check_architecture(case_root, allowlist)
+
+            assert any(
+                "runtime-storage-sql-bypass" in error
+                and f"raw-jit-projection-sql:{table}" in error
+                for error in errors
+            ), (relative, errors)
+
+    @pytest.mark.parametrize(
+        "relative",
+        [
+            "agent_libos/storage/sql.py",
+            "agent_libos/storage/migrations/v4.py",
+            "tests/storage/test_projection_fixture.py",
+        ],
+        ids=["storage-owner", "migration", "test-fixture"],
+    )
+    def test_jit_projection_raw_sql_is_limited_to_explicit_trust_boundary(
+        self,
+        tmp_path: Path,
+        relative: str,
+    ) -> None:
+        _write_source(
+            tmp_path,
+            relative,
+            "def migrate(cursor):\n"
+            "    cursor.execute('UPDATE tools SET ephemeral = 0')\n"
+            "    cursor.execute('DELETE FROM process_tool_bindings')\n",
+        )
+
+        report = checker.scan_architecture(tmp_path)
+
+        assert not any(
+            violation.rule == "runtime-storage-sql-bypass"
+            and violation.detail.startswith("raw-jit-projection-sql:")
+            for violation in report.violations
+        )
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "self._delegate('get_process', pid)",
+            "getattr(self._process_backend, 'get_process')(pid)",
+        ],
+    )
+    def test_migrated_repository_reflection_bypass_fails(
+        self,
+        tmp_path: Path,
+        statement: str,
+    ) -> None:
+        relative = "agent_libos/storage/repositories.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+
+        _write_source(
+            tmp_path,
+            relative,
+            "class ProcessRepository:\n"
+            "    def get_process(self, pid):\n"
+            f"        return {statement}\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                "class CheckpointRestoreReconciler:\n"
+                "    def __init__(self, store: Any, writer: Any, operations: Any):\n"
+                "        self._store = store\n"
+            ),
+            (
+                "class CheckpointRestoreReconciler:\n"
+                "    def __init__(self, store: CheckpointRestorePublicationReader, "
+                "writer: CheckpointRestorePublicationWriterPort, "
+                "operations: RuntimePublicationOperationPort):\n"
+                "        self._operations = operations\n"
+                "    def read(self):\n"
+                "        return self._operations.store.get_operation('operation')\n"
+            ),
+        ],
+        ids=["untyped-constructor", "nested-operation-store"],
+    )
+    def test_checkpoint_reconciliation_requires_exact_typed_ports(
+        self,
+        tmp_path: Path,
+        source: str,
+    ) -> None:
+        relative = "agent_libos/runtime/checkpoint_reconciliation.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(tmp_path, relative, source)
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        ("relative", "source"),
+        [
+            (
+                "agent_libos/runtime/checkpoint_manager.py",
+                "class CheckpointManager:\n"
+                "    def __init__(self, checkpoint_publication_writer: Any):\n"
+                "        self._writer = checkpoint_publication_writer\n",
+            ),
+            (
+                "agent_libos/runtime/builder.py",
+                "def configure(host):\n"
+                "    return CheckpointManager(\n"
+                "        checkpoint_publication_writer=host.uow.publications,\n"
+                "    )\n",
+            ),
+            (
+                "agent_libos/runtime/checkpoint_manager.py",
+                "class CheckpointManager:\n"
+                "    def __init__(self, "
+                "checkpoint_publication_writer: "
+                "CheckpointRestorePublicationWriterPort, operations: Any):\n"
+                "        self._operations = operations\n",
+            ),
+        ],
+        ids=[
+            "untyped-manager-port",
+            "miswired-generic-publications",
+            "untyped-operation-port",
+        ],
+    )
+    def test_checkpoint_manager_requires_the_dedicated_typed_writer(
+        self,
+        tmp_path: Path,
+        relative: str,
+        source: str,
+    ) -> None:
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(tmp_path, relative, source)
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                "from agent_libos.storage import RuntimeStore\n"
+                "class CheckpointManager:\n"
+                "    def __init__(self, store: RuntimeStore):\n"
+                "        self.store = store\n"
+            ),
+            (
+                "from agent_libos.storage import UnitOfWork\n"
+                "class CheckpointManager:\n"
+                "    def __init__(self, unit_of_work: UnitOfWork):\n"
+                "        self._store = unit_of_work\n"
+                "    def read(self):\n"
+                "        return self._store.get_process('pid')\n"
+            ),
+            (
+                "from typing import Any\n"
+                "class CheckpointManager:\n"
+                "    def __init__(self, backend: Any):\n"
+                "        self._backend = backend\n"
+                "    def read(self):\n"
+                "        return self._backend.get_process('pid')\n"
+            ),
+            (
+                "from typing import Any\n"
+                "from agent_libos.storage import UnitOfWork\n"
+                "class CheckpointManager:\n"
+                "    def __init__(self, unit_of_work: UnitOfWork, "
+                "snapshot_repository: Any):\n"
+                "        self._snapshot_rows = snapshot_repository\n"
+            ),
+            (
+                "class CheckpointManager:\n"
+                "    def run(self):\n"
+                "        with self._snapshot_rows.transaction():\n"
+                "            pass\n"
+            ),
+        ],
+        ids=[
+            "raw-runtime-store",
+            "retained-store-alias",
+            "any-backend-alias",
+            "overridable-snapshot-repository",
+            "snapshot-cursor-transaction",
+        ],
+    )
+    def test_checkpoint_manager_cannot_retain_a_raw_store(
+        self,
+        tmp_path: Path,
+        source: str,
+    ) -> None:
+        relative = "agent_libos/runtime/checkpoint_manager.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(tmp_path, relative, source)
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    def test_checkpoint_manager_builder_requires_unit_of_work_wiring(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        relative = "agent_libos/runtime/builder.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(
+            tmp_path,
+            relative,
+            "def configure(host, store):\n"
+            "    return CheckpointManager(\n"
+            "        store,\n"
+            "        checkpoint_publication_writer="
+            "host.uow.checkpoint_restore_publications,\n"
+            "    )\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "self.store.patch_process('pid', {}, expected_revision=1)",
+            "self.store.append_process_memory_roots('pid', [])",
+        ],
+        ids=["patch-process", "append-memory-root"],
+    )
+    def test_runtime_facade_cannot_mutate_through_raw_host_store(
+        self,
+        tmp_path: Path,
+        statement: str,
+    ) -> None:
+        relative = "agent_libos/runtime/runtime.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(
+            tmp_path,
+            relative,
+            "class Runtime:\n"
+            "    def add_handle_to_process_view(self):\n"
+            f"        {statement}\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    def test_runtime_handle_publication_must_delegate_to_process_manager(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        relative = "agent_libos/runtime/runtime.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(
+            tmp_path,
+            relative,
+            "class Runtime:\n"
+            "    def _add_handle_to_process_view(self, pid, handle):\n"
+            "        self.uow.processes.append_process_memory_roots(pid, [handle])\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        ("relative", "source"),
+        [
+            (
+                "agent_libos/tools/broker.py",
+                "class ToolBroker:\n"
+                "    def __init__(self, store):\n"
+                "        self.store = store\n",
+            ),
+            (
+                "agent_libos/tools/broker.py",
+                "class ToolBroker:\n"
+                "    def list(self):\n"
+                "        return self.store.list_tools()\n",
+            ),
+            (
+                "agent_libos/runtime/builder.py",
+                "def configure(host, store):\n"
+                "    return ToolBroker(store)\n",
+            ),
+            (
+                "agent_libos/tools/broker.py",
+                "from typing import Any\n"
+                "class ToolBroker:\n"
+                "    def __init__(self, unit_of_work: Any):\n"
+                "        self.unit_of_work = unit_of_work\n",
+            ),
+            (
+                "agent_libos/tools/broker.py",
+                "class RuntimeStore: pass\n"
+                "class ToolBroker:\n"
+                "    def __init__(self, backend: RuntimeStore):\n"
+                "        self.backend = backend\n"
+                "    def list(self):\n"
+                "        return self.backend.list_tools()\n",
+            ),
+            (
+                "agent_libos/tools/broker.py",
+                "class ToolBroker:\n"
+                "    def read(self, pid):\n"
+                "        return self.unit_of_work.processes.get_process(pid)\n",
+            ),
+            (
+                "agent_libos/tools/broker.py",
+                "class ToolBroker:\n"
+                "    def read(self, tool_id):\n"
+                "        return self.objects.get_tool_spec(tool_id)\n",
+            ),
+        ],
+        ids=[
+            "constructor-store",
+            "retained-store",
+            "builder-raw-store",
+            "untyped-unit-of-work",
+            "renamed-runtime-store",
+            "nested-process-facade",
+            "wrong-tool-facade",
+        ],
+    )
+    def test_tool_broker_requires_unit_of_work_facades(
+        self,
+        tmp_path: Path,
+        relative: str,
+        source: str,
+    ) -> None:
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(tmp_path, relative, source)
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "self.runtime.store.get_process(self.pid)",
+            "self.runtime.store.get_capability(capability_id)",
+        ],
+        ids=["process-read", "capability-read"],
+    )
+    def test_syscall_session_cannot_read_through_raw_runtime_store(
+        self,
+        tmp_path: Path,
+        statement: str,
+    ) -> None:
+        relative = "agent_libos/runtime/syscalls.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(
+            tmp_path,
+            relative,
+            "class LibOSSyscallSession:\n"
+            "    def inspect(self, capability_id):\n"
+            f"        return {statement}\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
+
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            "operations.store.get_operation(operation_id)",
+            "self.capabilities.store.list_capabilities(pid)",
+            "self.store.get_operation(operation_id)",
+            "self.store.list_capabilities(pid)",
+        ],
+        ids=[
+            "nested-operation-store",
+            "nested-capability-store",
+            "process-facade-operation",
+            "process-facade-capability",
+        ],
+    )
+    def test_process_manager_launch_recovery_uses_exact_typed_facades(
+        self,
+        tmp_path: Path,
+        statement: str,
+    ) -> None:
+        relative = "agent_libos/runtime/process_manager.py"
+        _write_source(tmp_path, relative, "VALUE = 1\n")
+        allowlist = _write_current_baseline(tmp_path)
+        _write_source(
+            tmp_path,
+            relative,
+            "class ProcessManager:\n"
+            "    def recover(self, operations, operation_id, pid):\n"
+            f"        return {statement}\n",
+        )
+
+        errors = checker.check_architecture(tmp_path, allowlist)
+
+        assert any("typed-storage-reflection-bypass" in error for error in errors)
 
     def test_runtime_module_concrete_runtime_import_fails(
         self,

@@ -8,6 +8,7 @@ from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
+    CapabilityStatus,
     CapabilitySpec,
     DataFlowContext,
     ForkMode,
@@ -24,6 +25,7 @@ from agent_libos.models import (
     Provenance,
     ResourceUsage,
     ViewMode,
+    process_state_to_mapping,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -34,6 +36,7 @@ from agent_libos.models.exceptions import (
     ProcessWaitRequired,
     ValidationError,
 )
+from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.tools.observability import sanitize_for_observability
 from agent_libos.runtime.syscall_descriptors import (
     BUILTIN_SYSCALL_NAMES,
@@ -56,7 +59,14 @@ class LibOSSyscallSession:
 
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
 
-    def __init__(self, runtime: "Runtime", pid: str, config: AgentLibOSConfig | None = None) -> None:
+    def __init__(
+        self,
+        runtime: "Runtime",
+        pid: str,
+        config: AgentLibOSConfig | None = None,
+        *,
+        transitions: ProcessTransitionService | None = None,
+    ) -> None:
         self.runtime = runtime
         self.pid = pid
         self.config = config or DEFAULT_CONFIG
@@ -65,7 +75,11 @@ class LibOSSyscallSession:
         self._deferred_exec: dict[str, Any] | None = None
         self._deferred_exec_context: DataFlowContext | None = None
         self._observed_context = runtime.data_flow.current_context()
-        self._tracked_wait_states: set[tuple[ProcessStatus, str]] = set()
+        self._tracked_wait_states: set[tuple[ProcessStatus, int]] = set()
+        self._processes = runtime.uow.processes
+        self._transitions = transitions or ProcessTransitionService(
+            self._processes
+        )
 
     async def handle(self, name: str, args: dict[str, Any]) -> Any:
         normalized = name.strip()
@@ -202,32 +216,30 @@ class LibOSSyscallSession:
                 await self._wait_for_process_message(exc.recipient_pid, exc.filters)
 
     def _require_non_terminal_process(self) -> None:
-        process = self.runtime.store.get_process(self.pid)
+        process = self._processes.get_process(self.pid)
         if process is None:
             raise NotFound(f"process not found: {self.pid}")
         if process.status in self.TERMINAL_STATUSES:
             raise ProcessError(f"terminal process cannot issue syscalls: {self.pid} status={process.status.value}")
 
     def _remember_wait_state(self) -> None:
-        process = self.runtime.store.get_process(self.pid)
+        process = self._processes.get_process(self.pid)
         if process is None or process.status not in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_HUMAN}:
             return
-        if not process.status_message:
+        if process.wait_state is None:
             return
-        self._tracked_wait_states.add((process.status, process.status_message))
+        self._tracked_wait_states.add((process.status, process.state_generation))
 
     def _cleanup_interrupted_wait(self, syscall_name: str) -> None:
         process = self.runtime.process.get(self.pid)
-        if process is None or not process.status_message:
+        if process is None or process.wait_state is None:
             return
-        if (process.status, process.status_message) not in self._tracked_wait_states:
+        if (process.status, process.state_generation) not in self._tracked_wait_states:
             return
-        self.runtime.store.transition_process(
-            self.pid,
-            ProcessStatus.RUNNABLE,
-            expected_revision=process.revision,
-            expected_status=process.status,
-            status_message=None,
+        self._transitions.wake(
+            self._transitions.wait_token(process),
+            control=False,
+            reason=f"syscall {syscall_name} wait interrupted",
         )
         self.runtime.audit.record(
             actor=self.pid,
@@ -408,7 +420,12 @@ class LibOSSyscallSession:
                 {
                     "pid": child.pid,
                     "image": child.image_id,
-                    "status": child.status.value,
+                    **process_state_to_mapping(
+                        child.status.value,
+                        child.wait_state,
+                        child.outcome,
+                        child.state_generation,
+                    ),
                     "working_directory": child.working_directory,
                     "goal_oid": child.goal_oid,
                     "status_message": child.status_message,
@@ -427,8 +444,13 @@ class LibOSSyscallSession:
         )
         return {
             "child_pid": child.pid,
-            "status": child.status.value,
             "signal": signal.value,
+            **process_state_to_mapping(
+                child.status.value,
+                child.wait_state,
+                child.outcome,
+                child.state_generation,
+            ),
         }
 
     def _process_merge_child_memory(self, args: dict[str, Any]) -> Any:
@@ -813,12 +835,18 @@ class LibOSSyscallSession:
         return {"capabilities": [self.runtime.capability.inspect(cap.cap_id) for cap in caps]}
 
     def _capability_inspect(self, args: dict[str, Any]) -> dict[str, Any]:
-        cap = self.runtime.store.get_capability(str(args["capability_id"]))
-        if cap is None:
-            raise NotFound(f"capability not found: {args['capability_id']}")
-        if cap.subject != self.pid:
+        capability_id = str(args["capability_id"])
+        capability = self.runtime.capability.inspect(capability_id)
+        if capability.get("cap_id") != capability_id:
+            raise ValidationError(
+                "capability inspect returned a mismatched capability identity"
+            )
+        if capability.get("subject") != self.pid:
             raise CapabilityDenied("process syscalls may inspect only their own capabilities")
-        return {"capability": self.runtime.capability.inspect(cap.cap_id)}
+        status = capability.get("status")
+        if status not in {item.value for item in CapabilityStatus}:
+            raise ValidationError("capability inspect returned an invalid capability status")
+        return {"capability": capability}
 
     def _capability_delegate(self, args: dict[str, Any]) -> dict[str, Any]:
         child_pid = str(args["child_pid"])
@@ -893,13 +921,28 @@ class LibOSSyscallSession:
             )
         except TimeoutError:
             child = self.runtime.process.get(str(args["child_pid"]))
-            return {"child_pid": child.pid, "status": child.status.value, "ready": False, "message": child.status_message}
+            return {
+                "child_pid": child.pid,
+                "ready": False,
+                "message": child.status_message,
+                **process_state_to_mapping(
+                    child.status.value,
+                    child.wait_state,
+                    child.outcome,
+                    child.state_generation,
+                ),
+            }
         return {
             "child_pid": result.pid,
-            "status": result.status.value,
             "ready": True,
             "result_oid": result.result.oid if result.result is not None else None,
             "message": result.message,
+            **process_state_to_mapping(
+                result.status.value,
+                result.wait_state,
+                result.outcome,
+                result.state_generation,
+            ),
         }
 
     def _process_read_messages(self, args: dict[str, Any], *, default_block: bool) -> dict[str, Any]:

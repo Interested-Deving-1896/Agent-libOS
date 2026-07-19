@@ -10,7 +10,13 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import ProcessStatus
 from agent_libos.utils.serde import to_jsonable
-from scripts.llm_context_probe import last_tool_result, recent_events
+
+if __package__:  # pragma: no branch - depends on module versus file execution
+    from scripts.llm_context_probe import last_tool_result, recent_events
+    from scripts.runtime_assembly import aopen_runtime
+else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
+    from llm_context_probe import last_tool_result, recent_events
+    from runtime_assembly import aopen_runtime
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
@@ -64,7 +70,7 @@ async def run_file_viewer(
 ) -> dict[str, Any]:
     if max_bytes < 1:
         raise ValueError("max_bytes must be positive")
-    runtime = Runtime.open(db)
+    runtime = await aopen_runtime(db)
     outputs: list[str] = []
     client = AskFileViewerClient(max_bytes=max_bytes)
     runtime.llm.client = client
@@ -117,7 +123,7 @@ async def run_file_viewer(
             raise RuntimeError(f"process did not exit after {max_quanta} quanta; status={process.status.value}")
         return report
     finally:
-        runtime.shutdown(actor="script", reason="script.complete")
+        await runtime.ashutdown(actor="script", reason="script.complete")
 
 
 class AskFileViewerClient:

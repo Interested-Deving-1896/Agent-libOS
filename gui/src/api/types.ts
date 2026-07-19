@@ -11,6 +11,19 @@ export type SchedulerStatus = {
   default_max_quanta: number | null;
 };
 
+export type ProcessWaitState =
+  | { schema_version: 1; kind: "child"; child_pid: string }
+  | { schema_version: 1; kind: "message"; filters: Record<string, unknown> }
+  | { schema_version: 1; kind: "human"; request_ids: string[] }
+  | { schema_version: 1; kind: "tool"; operation_id: string }
+  | { schema_version: 1; kind: "paused"; reason_oid: string | null }
+  | { schema_version: 1; kind: "host_resume"; reason_oid: string };
+
+export type ProcessOutcome =
+  | { schema_version: 1; kind: "exited"; result_oid: string | null }
+  | { schema_version: 1; kind: "failed"; result_oid: string | null; code: string | null }
+  | { schema_version: 1; kind: "killed"; reason_oid: string | null; code: string | null };
+
 export type RuntimeProcess = {
   pid: string;
   parent_pid: string | null;
@@ -21,6 +34,9 @@ export type RuntimeProcess = {
   checkpoint_head: string | null;
   working_directory: string;
   status_message: string | null;
+  wait_state: ProcessWaitState | null;
+  outcome: ProcessOutcome | null;
+  state_generation: number;
   loaded_skills: Record<string, unknown>;
   tool_table: Record<string, string>;
   capabilities: string[];
@@ -34,6 +50,27 @@ export type RuntimeProcess = {
   resource_usage?: Record<string, unknown>;
   resource_remaining?: Record<string, unknown>;
   rating: AgentRating | null;
+};
+
+export type CheckpointProcess = {
+  pid: string;
+  parent_pid: string | null;
+  image_id: string;
+  status: string;
+  working_directory: string;
+  goal_oid: string | null;
+  wait_state: ProcessWaitState | null;
+  outcome: ProcessOutcome | null;
+  state_generation: number;
+};
+
+export type CheckpointInspectResult = {
+  checkpoint: Record<string, unknown> & { checkpoint_id: string; pid: string };
+  snapshot_version: number | null;
+  subtree_pids: string[];
+  modules: Record<string, unknown>[];
+  counts: Record<string, number>;
+  processes: CheckpointProcess[];
 };
 
 export type AgentRating = {

@@ -259,6 +259,7 @@ def initialize_pty(runtime: "ModuleHost") -> None:
     runtime.set_runtime_attribute(_PTY_ADAPTER_ATTR, adapter)
     runtime.bind_object_release_finalizer(_object_release_finalizer(adapter))
     runtime.bind_shutdown_finalizer(adapter.shutdown)
+    runtime.bind_recovery_cleanup(adapter.release_recovery_diagnostics)
 
 
 def _object_release_finalizer(adapter: "PtyAdapter"):
@@ -834,6 +835,7 @@ class _PtyRuntimeSession:
     closing: bool = False
     closed: bool = False
     close_outcome_unknown: bool = False
+    recovery_abandoning: bool = False
     exit_code: int | None = None
     last_wall_seconds: float = 0.0
     last_cpu_seconds: float = 0.0
@@ -2040,6 +2042,84 @@ class PtyAdapter:
                 )
         return self._wait_for_worker_threads(self.config.pty.close_timeout_s) and ok
 
+    def release_recovery_diagnostics(self) -> bool:
+        """Abandon process-local PTY ownership without durable publication.
+
+        RuntimeLifecycle invokes this callback only after a recovery fence and
+        admission drain.  It deliberately bypasses the protected close path:
+        the durable PTY Object and its evidence are diagnostics for the next
+        Runtime's stale-session recovery, while the current Runtime must stop
+        its reader/monitor threads and release the live host handle before the
+        store can be closed.  A partial failure keeps the session registered so
+        the same callback can retry it.
+        """
+
+        return self.abandon_transient_sessions()
+
+    def abandon_transient_sessions(self) -> bool:
+        """Idempotently release every live PTY handle and worker in memory."""
+
+        with self._lock:
+            sessions = tuple(self._sessions.values())
+        ok = True
+        for session in sessions:
+            if not self._abandon_transient_session(session):
+                ok = False
+        workers_stopped = self._wait_for_worker_threads(
+            self.config.pty.close_timeout_s
+        )
+        return ok and workers_stopped
+
+    def _abandon_transient_session(self, session: _PtyRuntimeSession) -> bool:
+        # This is the only intentionally evidence-free provider phase in the
+        # PTY module. The opaque lifecycle lease makes the raw close reachable
+        # only from Runtime's explicit recovery-diagnostics handoff callback;
+        # ordinary/public calls fail before any session or provider mutation.
+        self.host.require_recovery_cleanup_lease()
+        with session.control_lock:
+            with self._lock:
+                if self._sessions.get(session.session_oid) is not session:
+                    return True
+            with session.lock:
+                session.recovery_abandoning = True
+                session.stop_event.set()
+
+            close_error: BaseException | None = None
+            exit_code: int | None = None
+            try:
+                exit_code = session.handle.close(
+                    force=True,
+                    timeout_s=self.config.pty.close_timeout_s,
+                )
+            except BaseException as exc:
+                close_error = exc
+            finally:
+                # Provider close is expected to unblock a pending read. Always
+                # join after the attempt, including ambiguous/interrupt paths.
+                session.stop_event.set()
+                self._join_session_workers(
+                    session,
+                    timeout_s=self.config.pty.close_timeout_s,
+                )
+
+            workers_stopped = self._session_workers_stopped(session)
+            if close_error is not None:
+                if isinstance(close_error, Exception):
+                    return False
+                raise close_error.with_traceback(close_error.__traceback__)
+            if not workers_stopped:
+                return False
+
+            with session.lock:
+                session.closed = True
+                session.closing = False
+                session.exit_code = exit_code
+                session.close_complete.set()
+            with self._lock:
+                if self._sessions.get(session.session_oid) is session:
+                    self._sessions.pop(session.session_oid, None)
+            return True
+
     def _create_session_object(
         self,
         pid: str,
@@ -2205,51 +2285,61 @@ class PtyAdapter:
         parent_operation_id: str | None,
     ) -> None:
         try:
-            operation_context = (
-                self.host.operations.attach(parent_operation_id)
-                if parent_operation_id is not None
-                else contextlib.nullcontext()
-            )
-            with operation_context:
-                effect_context = {
-                    "session_oid": session.session_oid,
-                    "backend": session.backend,
-                    "resource": resource,
-                    "mode": "continuous_drain",
-                }
-                invocation = ProtectedOperationInvocation(
-                    pid=session.owner_pid,
-                    actor="runtime.pty",
-                    target=f"pty:{session.session_oid}",
-                    canonical_args=effect_context,
-                    observation=effect_context,
-                    data_flow_ingress_context=self._session_ingress_context(session),
-                    failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
-                        "runtime.pty", session.session_oid, "ingest", error, phase
-                    ),
+            try:
+                operation_context = (
+                    self.host.operations.attach(parent_operation_id)
+                    if parent_operation_id is not None
+                    else contextlib.nullcontext()
                 )
-                with self._protected().start(
-                    "primitive.pty.ingest", invocation, provider=self.provider
-                ) as protected:
-                    result = protected.call(
-                        ProviderPhase("ingest", information_flow=True),
-                        self._reader_provider_phase,
-                        session,
-                    )
-                    protected.complete(
-                        result,
-                        self._protected_pty_evidence(
-                            "runtime.pty",
-                            session.session_oid,
-                            "ingest",
-                            result,
-                            input_refs=(session.session_oid,),
+                with operation_context:
+                    effect_context = {
+                        "session_oid": session.session_oid,
+                        "backend": session.backend,
+                        "resource": resource,
+                        "mode": "continuous_drain",
+                    }
+                    invocation = ProtectedOperationInvocation(
+                        pid=session.owner_pid,
+                        actor="runtime.pty",
+                        target=f"pty:{session.session_oid}",
+                        canonical_args=effect_context,
+                        observation=effect_context,
+                        data_flow_ingress_context=self._session_ingress_context(session),
+                        failure_evidence=lambda error, phase: self._protected_pty_failure_evidence(
+                            "runtime.pty", session.session_oid, "ingest", error, phase
                         ),
-                        classification_context=effect_context,
-                        classification_result=result,
                     )
-            if result["exited"]:
-                self._mark_session_exited(session, resource=resource)
+                    with self._protected().start(
+                        "primitive.pty.ingest", invocation, provider=self.provider
+                    ) as protected:
+                        result = protected.call(
+                            ProviderPhase("ingest", information_flow=True),
+                            self._reader_provider_phase,
+                            session,
+                        )
+                        protected.complete(
+                            result,
+                            self._protected_pty_evidence(
+                                "runtime.pty",
+                                session.session_oid,
+                                "ingest",
+                                result,
+                                input_refs=(session.session_oid,),
+                            ),
+                            classification_context=effect_context,
+                            classification_result=result,
+                        )
+                if result["exited"]:
+                    self._mark_session_exited(session, resource=resource)
+            except BaseException:
+                # Recovery handoff intentionally fences the continuous ingest
+                # settlement. Its commit guard rolls back every attempted
+                # store/evidence write; suppress that expected worker failure
+                # only after the explicit transient-abandon flag is visible.
+                with session.lock:
+                    recovery_abandoning = session.recovery_abandoning
+                if not recovery_abandoning:
+                    raise
         finally:
             self._worker_finished(threading.current_thread())
 
@@ -2886,6 +2976,13 @@ class PtyAdapter:
                 if remaining <= 0:
                     return False
                 self._worker_condition.wait(timeout=min(remaining, 0.05))
+
+    @staticmethod
+    def _session_workers_stopped(session: _PtyRuntimeSession) -> bool:
+        return all(
+            thread is None or not thread.is_alive()
+            for thread in (session.reader_thread, session.monitor_thread)
+        )
 
     def _require_session(self, session_oid: str) -> _PtyRuntimeSession:
         with self._lock:

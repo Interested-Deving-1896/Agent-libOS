@@ -3,8 +3,10 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import replace
 import hashlib
+import json
+import math
 from reprlib import Repr
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import threading
 from types import TracebackType
 from typing import Any, Iterable
@@ -17,7 +19,12 @@ from agent_libos.memory.data_labels import (
     labels_for_explain,
     propagate_object_labels,
 )
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    DurableObjectFinalizerUnavailable,
+    NotFound,
+    ValidationError,
+)
 from agent_libos.utils.ids import estimate_tokens, new_id, utc_now
 from agent_libos.models import (
     CapabilityRight,
@@ -164,6 +171,13 @@ class ObjectMemoryManager:
         self._object_pin_checker: Callable[[str], bool] | None = None
         self._object_change_notifier: Callable[[str, dict[str, Any], str], None] | None = None
         self._object_release_finalizers: list[Callable[[AgentObject, str, str], None]] = []
+        self._durable_object_release_finalizers: dict[
+            str,
+            tuple[
+                Callable[[AgentObject, str, str, str], Mapping[str, Any]],
+                Callable[[Mapping[str, Any], str, str, str], None],
+            ],
+        ] = {}
         # Object lifecycle mutations share a re-entrant linearization lock.
         # The global order is ownership first, then the store transaction;
         # finalizers may safely re-enter Object Memory on the same thread.
@@ -192,6 +206,290 @@ class ObjectMemoryManager:
                 del self._object_release_finalizers[index]
                 return True
         return False
+
+    def bind_durable_object_release_finalizer(
+        self,
+        finalizer_id: str,
+        prepare: Callable[[AgentObject, str, str, str], Mapping[str, Any]],
+        finalize: Callable[[Mapping[str, Any], str, str, str], None],
+    ) -> None:
+        """Register a restart-safe Object cleanup protocol.
+
+        ``prepare`` must be side-effect free. It converts a live Object into a
+        bounded JSON cleanup intent before a destructive checkpoint restore
+        commits. ``finalize`` is at-least-once and receives the same stable
+        idempotency key on every retry.
+        """
+
+        selected_id = self._normalize_durable_finalizer_id(finalizer_id)
+        if not callable(prepare) or not callable(finalize):
+            raise ValidationError("durable object release finalizer callbacks must be callable")
+        if selected_id in self._durable_object_release_finalizers:
+            raise ValidationError(
+                f"durable object release finalizer is already registered: {selected_id}"
+            )
+        self._durable_object_release_finalizers[selected_id] = (prepare, finalize)
+
+    def unbind_durable_object_release_finalizer(self, finalizer_id: str) -> bool:
+        selected_id = self._normalize_durable_finalizer_id(finalizer_id)
+        return self._durable_object_release_finalizers.pop(selected_id, None) is not None
+
+    def prepare_checkpoint_restore_finalizers(
+        self,
+        objects: Iterable[AgentObject],
+        *,
+        publication_id: str,
+        actor: str,
+        reason: str,
+        intent_limit_bytes: int,
+        total_limit_bytes: int,
+    ) -> list[dict[str, Any]]:
+        """Freeze exact restart-safe cleanup work before Object rows disappear."""
+
+        self._require_non_negative_byte_limit(
+            intent_limit_bytes,
+            "durable finalizer intent limit",
+        )
+        self._require_non_negative_byte_limit(
+            total_limit_bytes,
+            "checkpoint restore durable finalizer work limit",
+        )
+        work_items: list[dict[str, Any]] = []
+        # A JSON array costs two bytes before any items are added.  Track the
+        # exact canonical size incrementally so a hostile/lossy prepare hook
+        # cannot make us materialize every Object and work item before the
+        # configured aggregate bound is enforced.
+        total_size_bytes = len(self._canonical_json_bytes(work_items))
+        saw_object = False
+        for obj in objects:
+            if not saw_object:
+                saw_object = True
+                if self._object_release_finalizers:
+                    raise ValidationError(
+                        "checkpoint restore cannot delete Objects while anonymous release "
+                        "finalizers are registered; use bind_durable_object_release_finalizer"
+                    )
+                if total_size_bytes > total_limit_bytes:
+                    raise ValidationError(
+                        "checkpoint restore durable finalizer work exceeds "
+                        f"{total_limit_bytes} bytes (got at least {total_size_bytes})"
+                    )
+            for finalizer_id, (prepare, _finalize) in self._durable_object_release_finalizers.items():
+                idempotency_key = self._checkpoint_finalizer_idempotency_key(
+                    publication_id,
+                    obj.oid,
+                    obj.version,
+                    finalizer_id,
+                )
+                raw_intent = prepare(
+                    deepcopy(obj),
+                    actor,
+                    reason,
+                    idempotency_key,
+                )
+                intent = self._normalize_durable_finalizer_intent(
+                    raw_intent,
+                    finalizer_id=finalizer_id,
+                )
+                encoded_intent = self._canonical_json_bytes(intent)
+                if len(encoded_intent) > intent_limit_bytes:
+                    raise ValidationError(
+                        f"durable finalizer intent {finalizer_id} exceeds "
+                        f"{intent_limit_bytes} bytes (got {len(encoded_intent)})"
+                    )
+                work_item = {
+                    "work_id": idempotency_key,
+                    "finalizer_id": finalizer_id,
+                    "object_oid": str(obj.oid),
+                    "object_version": int(obj.version),
+                    "intent": intent,
+                    "intent_sha256": hashlib.sha256(encoded_intent).hexdigest(),
+                }
+                item_size_bytes = len(self._canonical_json_bytes(work_item))
+                # ``json.dumps`` separates array items with ``, ``.
+                separator_size_bytes = 2 if work_items else 0
+                projected_size_bytes = (
+                    total_size_bytes + separator_size_bytes + item_size_bytes
+                )
+                if projected_size_bytes > total_limit_bytes:
+                    raise ValidationError(
+                        "checkpoint restore durable finalizer work exceeds "
+                        f"{total_limit_bytes} bytes (got at least {projected_size_bytes})"
+                    )
+                work_items.append(work_item)
+                total_size_bytes = projected_size_bytes
+        return work_items
+
+    def run_checkpoint_restore_finalizer(
+        self,
+        work_item: Mapping[str, Any],
+        *,
+        actor: str,
+        reason: str,
+    ) -> None:
+        """Run one prepared cleanup item with its stable retry key."""
+
+        selected = dict(work_item)
+        finalizer_id = self._normalize_durable_finalizer_id(
+            str(selected.get("finalizer_id") or "")
+        )
+        work_id = str(selected.get("work_id") or "")
+        if not work_id:
+            raise ValidationError("durable object release work item has no work_id")
+        intent = selected.get("intent")
+        normalized_intent = self._normalize_durable_finalizer_intent(
+            intent,
+            finalizer_id=finalizer_id,
+            label=f"durable object release work item intent {work_id}",
+        )
+        expected_sha256 = str(selected.get("intent_sha256") or "")
+        actual_sha256 = hashlib.sha256(
+            self._canonical_json_bytes(normalized_intent)
+        ).hexdigest()
+        if not expected_sha256 or expected_sha256 != actual_sha256:
+            raise ValidationError(
+                f"durable object release intent digest mismatch: {work_id}"
+            )
+        registered = self._durable_object_release_finalizers.get(finalizer_id)
+        if registered is None:
+            raise DurableObjectFinalizerUnavailable(
+                f"durable object release finalizer is not registered: {finalizer_id}"
+            )
+        _prepare, finalize = registered
+        # Normalization created a detached plain JSON tree, so the finalizer
+        # receives exactly the value whose canonical bytes were authenticated.
+        finalize(normalized_intent, actor, reason, work_id)
+
+    @staticmethod
+    def _normalize_durable_finalizer_id(finalizer_id: str) -> str:
+        selected = str(finalizer_id).strip()
+        if (
+            not selected
+            or len(selected) > 256
+            or any(ord(char) < 33 or ord(char) == 127 for char in selected)
+        ):
+            raise ValidationError("durable object release finalizer_id is invalid")
+        return selected
+
+    @staticmethod
+    def _checkpoint_finalizer_idempotency_key(
+        publication_id: str,
+        oid: str,
+        version: int,
+        finalizer_id: str,
+    ) -> str:
+        material = f"{publication_id}\0{oid}\0{version}\0{finalizer_id}".encode("utf-8")
+        return f"checkpoint_finalizer:{hashlib.sha256(material).hexdigest()}"
+
+    @staticmethod
+    def _canonical_json_bytes(value: Any) -> bytes:
+        # Keep the canonical representation compatible with persisted serde
+        # while refusing extensions that serde would otherwise stringify or
+        # coerce.  Callers pass a tree produced by _strict_json_value.
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+
+    @staticmethod
+    def _require_non_negative_byte_limit(value: Any, label: str) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValidationError(f"{label} must be a non-negative integer")
+
+    @classmethod
+    def _normalize_durable_finalizer_intent(
+        cls,
+        value: Any,
+        *,
+        finalizer_id: str,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        selected_label = label or f"durable finalizer intent {finalizer_id}"
+        if not isinstance(value, Mapping):
+            if label is not None:
+                raise ValidationError(f"{selected_label} is invalid")
+            raise ValidationError(
+                "durable object release finalizer prepare must return a mapping: "
+                f"{finalizer_id}"
+            )
+        normalized = cls._strict_json_value(
+            value,
+            label=selected_label,
+            path="$",
+            active_containers=set(),
+        )
+        if not isinstance(normalized, dict):  # pragma: no cover - guarded above
+            raise ValidationError(f"{selected_label} must be a JSON object")
+        return normalized
+
+    @classmethod
+    def _strict_json_value(
+        cls,
+        value: Any,
+        *,
+        label: str,
+        path: str,
+        active_containers: set[int],
+    ) -> Any:
+        value_type = type(value)
+        if value is None or value_type in {str, bool, int}:
+            return value
+        if value_type is float:
+            if not math.isfinite(value):
+                raise ValidationError(
+                    f"{label} contains a non-finite JSON number at {path}"
+                )
+            return value
+
+        if isinstance(value, Mapping):
+            identity = id(value)
+            if identity in active_containers:
+                raise ValidationError(f"{label} contains a cycle at {path}")
+            active_containers.add(identity)
+            try:
+                normalized_mapping: dict[str, Any] = {}
+                for key, item in value.items():
+                    if type(key) is not str:
+                        raise ValidationError(
+                            f"{label} contains a non-string JSON object key at {path}"
+                        )
+                    if key in normalized_mapping:
+                        raise ValidationError(
+                            f"{label} contains a duplicate JSON object key at {path}"
+                        )
+                    normalized_mapping[key] = cls._strict_json_value(
+                        item,
+                        label=label,
+                        path=f"{path}[{key!r}]",
+                        active_containers=active_containers,
+                    )
+                return normalized_mapping
+            finally:
+                active_containers.remove(identity)
+
+        if value_type is list:
+            identity = id(value)
+            if identity in active_containers:
+                raise ValidationError(f"{label} contains a cycle at {path}")
+            active_containers.add(identity)
+            try:
+                return [
+                    cls._strict_json_value(
+                        item,
+                        label=label,
+                        path=f"{path}[{index}]",
+                        active_containers=active_containers,
+                    )
+                    for index, item in enumerate(value)
+                ]
+            finally:
+                active_containers.remove(identity)
+
+        raise ValidationError(
+            f"{label} contains non-JSON value {value_type.__name__} at {path}"
+        )
 
     def create_object(
         self,
@@ -1425,6 +1723,36 @@ class ObjectMemoryManager:
                     target=f"object:{obj.oid}",
                     input_refs=[obj.oid],
                     decision={"reason": reason, "error_type": type(exc).__name__, "error": str(exc)},
+                )
+                raise
+        for finalizer_id, (prepare, finalize) in list(
+            self._durable_object_release_finalizers.items()
+        ):
+            idempotency_key = self._checkpoint_finalizer_idempotency_key(
+                f"object_release:{reason}",
+                obj.oid,
+                obj.version,
+                finalizer_id,
+            )
+            try:
+                raw_intent = prepare(deepcopy(obj), actor, reason, idempotency_key)
+                intent = self._normalize_durable_finalizer_intent(
+                    raw_intent,
+                    finalizer_id=finalizer_id,
+                )
+                finalize(intent, actor, reason, idempotency_key)
+            except Exception as exc:
+                self.audit.record(
+                    actor=actor,
+                    action="memory.object_release_finalizer_failed",
+                    target=f"object:{obj.oid}",
+                    input_refs=[obj.oid],
+                    decision={
+                        "reason": reason,
+                        "finalizer_id": finalizer_id,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    },
                 )
                 raise
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from agent_libos.capability.manager import CAPABILITY_MANAGER_MUTATION_PUBLIC_METHODS
 from agent_libos.ports import ExplainBoundaryDescriptor
 
 
@@ -13,6 +14,7 @@ def boundary(
     *,
     result_pid: bool = False,
     preflight_method: str = "",
+    lifecycle_lock_attr: str = "",
 ) -> ExplainBoundaryDescriptor:
     return ExplainBoundaryDescriptor(
         component=component,
@@ -23,6 +25,7 @@ def boundary(
         pid_arg=pid_arg,
         result_pid=result_pid,
         preflight_method=preflight_method,
+        lifecycle_lock_attr=lifecycle_lock_attr,
     )
 
 
@@ -55,10 +58,6 @@ PROCESS_BOUNDARIES = (
         "process", "spawn_child", "runtime", "process.spawn_child", "parent", "parent",
         preflight_method="preflight_spawn_child",
     ),
-    boundary(
-        "process", "exec", "runtime", "process.exec", "pid", "pid",
-        preflight_method="preflight_exec",
-    ),
     boundary("process", "set_working_directory", "runtime", "process.chdir", "pid", "pid"),
     boundary("process", "signal_child", "runtime", "process.signal_child", "pid", "pid"),
     boundary("process", "signal", "runtime", "process.signal", "target", "target"),
@@ -67,6 +66,18 @@ PROCESS_BOUNDARIES = (
     boundary("process", "resume", "runtime", "process.resume", "pid", "pid"),
     boundary("process", "cancel", "runtime", "process.cancel", "pid", "pid"),
     boundary("process", "exit", "runtime", "process.exit", "pid", "pid"),
+)
+
+IMAGE_BOOT_BOUNDARIES = (
+    boundary(
+        "image_boot",
+        "exec",
+        "runtime",
+        "process.exec",
+        "pid",
+        "pid",
+        preflight_method="preflight_exec",
+    ),
 )
 
 MEMORY_BOUNDARIES = (
@@ -139,7 +150,15 @@ AUTHORITY_BOUNDARIES = (
 EXTENSION_BOUNDARIES = (
     boundary("tools", "activate_tool_group", "runtime", "tool_group.activate", "pid", "pid"),
     boundary("skills", "register_skill_package", "runtime", "skill.register", "actor", "actor"),
-    boundary("skills", "activate_skill", "runtime", "skill.activate", "pid", "pid"),
+    boundary(
+        "skills",
+        "activate_skill",
+        "runtime",
+        "skill.activate",
+        "pid",
+        "pid",
+        lifecycle_lock_attr="_lifecycle_lock",
+    ),
     boundary("skills", "unload_skill", "runtime", "skill.unload", "pid", "pid"),
     boundary("skills", "trust_skill_source", "runtime", "skill.trust", "actor", "actor"),
     boundary("skills", "untrust_skill_source", "runtime", "skill.untrust", "actor", "actor"),
@@ -158,6 +177,7 @@ EXTENSION_BOUNDARIES = (
 EXPLAIN_BOUNDARY_DESCRIPTORS = (
     *PRIMITIVE_BOUNDARIES,
     *PROCESS_BOUNDARIES,
+    *IMAGE_BOOT_BOUNDARIES,
     *MEMORY_BOUNDARIES,
     *CHECKPOINT_BOUNDARIES,
     *HUMAN_BOUNDARIES,
@@ -167,14 +187,347 @@ EXPLAIN_BOUNDARY_DESCRIPTORS = (
     *EXTENSION_BOUNDARIES,
 )
 
+# HumanObjectManager is also a direct Host control surface (CLI/GUI and
+# recovery code call it without going through a Tool).  Classify every public
+# method here so a newly added Human method cannot silently escape lifecycle
+# admission.  Methods in this set may persist state, publish protected
+# evidence, call a provider, or update Host data-flow/presentation state.
+HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
+    ("human", "request_data_release", "control.human.request_data_release"),
+    ("human", "answer_for_request", "control.human.answer_for_request"),
+    ("human", "approve", "control.human.approve"),
+    ("human", "approve_for_presentation", "control.human.approve_for_presentation"),
+    ("human", "reject", "control.human.reject"),
+    ("human", "reject_for_presentation", "control.human.reject_for_presentation"),
+    ("human", "list_for_presentation", "control.human.list_for_presentation"),
+    (
+        "human",
+        "list_for_presentation_window",
+        "control.human.list_for_presentation_window",
+    ),
+    ("human", "present_request_view", "control.human.present_request_view"),
+    ("human", "cancel_pending_for_process", "control.human.cancel_pending_for_process"),
+    ("human", "process_next_terminal", "control.human.process_next_terminal"),
+    ("human", "aprocess_next_terminal", "control.human.aprocess_next_terminal"),
+    ("human", "drain_terminal_queue", "control.human.drain_terminal_queue"),
+    ("human", "adrain_terminal_queue", "control.human.adrain_terminal_queue"),
+    ("human", "present_terminal_request", "control.human.present_terminal_request"),
+    ("human", "recover_prepared_output", "control.human.recover_prepared_output"),
+)
+
+# These are the only public HumanObjectManager methods intentionally excluded
+# from mutation admission.  The shutdown contract test compares this allowlist
+# plus the mutation inventory with the concrete class, turning the
+# classification into a static ratchet.
+HUMAN_READ_ONLY_PUBLIC_METHODS = frozenset(
+    {
+        "format_terminal_request",
+        "get",
+        "is_request_withheld_for_presentation",
+        "list",
+        "pending",
+        "public_request_payload",
+        "public_request_view",
+    }
+)
+
+_CAPABILITY_EXPLAIN_MUTATION_METHODS = frozenset(
+    {"delegate", "derive_authority", "issue", "revoke"}
+)
+
+CAPABILITY_CONTROL_MUTATION_ADMISSION_BOUNDARIES = tuple(
+    (
+        "capability",
+        method,
+        f"control.capability.{method}",
+    )
+    for method in sorted(
+        CAPABILITY_MANAGER_MUTATION_PUBLIC_METHODS
+        - _CAPABILITY_EXPLAIN_MUTATION_METHODS
+    )
+)
+
+
+# Runtime is the public composition-root facade.  Guard the facade as well as
+# the delegated service so one lease spans validation, provider work, and all
+# follow-up evidence.  Nested guards inherit the active lifecycle lease and do
+# not increment the active-lease count a second time.
+RUNTIME_PUBLIC_MUTATION_METHODS = frozenset(
+    {
+        "activate_skill",
+        "add_handle_to_process_view",
+        "arun_next_process_once",
+        "arun_process_once",
+        "arun_process_until_idle",
+        "arun_until_idle",
+        "arun_workflow",
+        "exec_process",
+        "fork_child_process",
+        "register_image",
+        "register_sink_trust",
+        "register_skill_from_path",
+        "resolve_process_working_directory",
+        "run_next_process_once",
+        "run_process_once",
+        "run_process_until_idle",
+        "run_until_idle",
+        "run_workflow",
+        "set_process_working_directory",
+        "spawn_child_process",
+        "trust_skill_source",
+        "unload_skill",
+        "unregister_sink_trust",
+    }
+)
+
+RUNTIME_CONTROL_MUTATION_ADMISSION_BOUNDARIES = tuple(
+    ("runtime", method, f"control.runtime.{method}")
+    for method in sorted(RUNTIME_PUBLIC_MUTATION_METHODS)
+)
+
+RUNTIME_READ_ONLY_PUBLIC_METHODS = frozenset(
+    {
+        "current_human_run_context",
+        "discover_skills",
+        "get_image",
+        "inspect_sink_trust",
+        "inspect_skill",
+        "list_sink_trust",
+    }
+)
+
+# These methods deliberately manage host lifecycle or caller-local ContextVar
+# state instead of entering the ordinary operation-admission gate.
+RUNTIME_LIFECYCLE_PUBLIC_METHODS = frozenset(
+    {
+        "arelease_recovery_diagnostics",
+        "ashutdown",
+        "bind_shutdown_finalizer",
+        "close",
+        "release_recovery_diagnostics",
+        "shutdown",
+    }
+)
+RUNTIME_CONTEXT_PUBLIC_METHODS = frozenset({"human_run_context"})
+
+
+SCHEDULER_PUBLIC_MUTATION_METHODS = frozenset(
+    {
+        "arun_once",
+        "arun_pid_once",
+        "arun_pid_until_idle",
+        "arun_until_idle",
+        "run_once",
+        "run_pid_once",
+        "run_pid_until_idle",
+        "run_until_idle",
+    }
+)
+
+SCHEDULER_CONTROL_MUTATION_ADMISSION_BOUNDARIES = tuple(
+    ("scheduler", method, f"control.scheduler.{method}")
+    for method in sorted(SCHEDULER_PUBLIC_MUTATION_METHODS)
+)
+
+SCHEDULER_READ_ONLY_PUBLIC_METHODS = frozenset(
+    {"active_pids", "is_active_quantum", "next_runnable", "runnable_pids"}
+)
+SCHEDULER_COORDINATION_PUBLIC_METHODS = frozenset({"quiescent_state"})
+SCHEDULER_LIFECYCLE_PUBLIC_METHODS = frozenset({"shutdown"})
+
+
+# DataFlow has several methods that look like queries but deliberately append
+# decisions or capability evidence.  Keep them in the mutation inventory;
+# ambient-flow ContextVar helpers are classified separately so reset/finally
+# cleanup remains possible after a recovery fence.
+DATA_FLOW_PUBLIC_MUTATION_METHODS = frozenset(
+    {
+        "authorize_egress",
+        "bind_written_file",
+        "bootstrap_configured_rules",
+        "context_from_source_oids",
+        "persist_denied_decision",
+        "precheck_egress_clearance",
+        "register_sink_trust",
+        "reject_sink_identity_change",
+        "run_sync_in_worker",
+        "tombstone_file",
+        "tombstone_path_tree",
+        "unregister_sink_trust",
+    }
+)
+
+DATA_FLOW_CONTROL_MUTATION_ADMISSION_BOUNDARIES = tuple(
+    ("data_flow", method, f"control.data_flow.{method}")
+    for method in sorted(DATA_FLOW_PUBLIC_MUTATION_METHODS)
+)
+
+DATA_FLOW_READ_ONLY_PUBLIC_METHODS = frozenset(
+    {
+        "classify_egress_snapshot",
+        "context_from_materialization",
+        "context_from_trusted_source_oids",
+        "current_context",
+        "directory_label_snapshot",
+        "directory_label_state_version",
+        "external_file_context",
+        "file_context",
+        "file_deletion_snapshot",
+        "file_snapshot",
+        "file_state_version",
+        "file_tree_context",
+        "file_tree_deletion_snapshot",
+        "file_tree_snapshot",
+        "file_tree_state_version",
+        "inspect_sink_trust",
+        "is_release_binding_current",
+        "list_sink_trust",
+        "provenance_sources",
+        "release_binding",
+        "resolve_sink_trust",
+        "unclassified_ingress_context",
+    }
+)
+
+DATA_FLOW_CONTEXT_PUBLIC_METHODS = frozenset(
+    {
+        "activate",
+        "observe_ingress",
+        "observe_unclassified_ingress",
+        "push",
+        "recovered_source_snapshot_access",
+        "reset",
+    }
+)
+DATA_FLOW_COMPOSITION_PUBLIC_METHODS = frozenset({"bind_human"})
+
+
+_OBJECT_TASK_EXPLAIN_MUTATION_METHODS = frozenset(
+    descriptor.method for descriptor in OBJECT_TASK_BOUNDARIES
+)
+OBJECT_TASK_CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
+    ("object_tasks", "get", "control.object_tasks.get"),
+    ("object_tasks", "has_active_for_owner", "control.object_tasks.has_active_for_owner"),
+    ("object_tasks", "list", "control.object_tasks.list"),
+    ("object_tasks", "notify_owner_changed", "control.object_tasks.notify_owner_changed"),
+    ("object_tasks", "notify_process_message", "control.object_tasks.notify_process_message"),
+    ("object_tasks", "notify_process_terminal", "control.object_tasks.notify_process_terminal"),
+    ("object_tasks", "shutdown", "control.object_tasks.shutdown"),
+)
+OBJECT_TASK_PUBLIC_MUTATION_METHODS = (
+    _OBJECT_TASK_EXPLAIN_MUTATION_METHODS
+    | frozenset(
+        method
+        for _component, method, _name in OBJECT_TASK_CONTROL_MUTATION_ADMISSION_BOUNDARIES
+    )
+)
+OBJECT_TASK_READ_ONLY_PUBLIC_METHODS = frozenset({"is_runner_pid"})
+OBJECT_TASK_RECOVERY_PUBLIC_METHODS = frozenset({"recover"})
+OBJECT_TASK_LIFECYCLE_PUBLIC_METHODS = frozenset({"start_worker"})
+
+# Public Host/control mutations that do not open their own explainable
+# operation.  They still require the same lifecycle admission lease.  Keeping
+# this list beside the explainable boundary inventory makes admission coverage
+# machine-checkable instead of relying on a representative shutdown test.
+CONTROL_MUTATION_ADMISSION_BOUNDARIES = (
+    *HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES,
+    *CAPABILITY_CONTROL_MUTATION_ADMISSION_BOUNDARIES,
+    *RUNTIME_CONTROL_MUTATION_ADMISSION_BOUNDARIES,
+    *SCHEDULER_CONTROL_MUTATION_ADMISSION_BOUNDARIES,
+    *DATA_FLOW_CONTROL_MUTATION_ADMISSION_BOUNDARIES,
+    *OBJECT_TASK_CONTROL_MUTATION_ADMISSION_BOUNDARIES,
+    (
+        "process",
+        "add_handle_to_process_view",
+        "control.process.add_handle_to_process_view",
+    ),
+    (
+        "checkpoint",
+        "reconcile_terminal_restore_publications",
+        "control.checkpoint.reconcile_terminal_restore_publications",
+    ),
+    ("tools", "register_tool", "control.tools.register_tool"),
+    ("tools", "unregister_tool", "control.tools.unregister_tool"),
+    ("tools", "discard_tool_registration", "control.tools.discard_tool_registration"),
+    ("tools", "configure_process_tools", "control.tools.configure_process_tools"),
+    ("tools", "grant_execute", "control.tools.grant_execute"),
+    ("tools", "propose", "control.tools.propose"),
+    ("tools", "validate", "control.tools.validate"),
+    ("tools", "register", "control.tools.register"),
+    ("tools", "discard_candidate", "control.tools.discard_candidate"),
+    ("tools", "call", "control.tools.call"),
+    ("tools", "acall", "control.tools.acall"),
+    ("tools", "configure_model_tool_projection", "control.tools.configure_model_tool_projection"),
+    ("tools", "restore_loaded_jit_state", "control.tools.restore_loaded_jit_state"),
+    ("tools", "forget_loaded_jit", "control.tools.forget_loaded_jit"),
+    ("tools", "install_committed_jit", "control.tools.install_committed_jit"),
+    ("tools", "rehydrate_registered_jit_tools", "control.tools.rehydrate_registered_jit_tools"),
+    ("modules", "load_core_module", "control.modules.load_core_module"),
+    ("modules", "load_startup_modules", "control.modules.load_startup_modules"),
+    ("modules", "load_module_manifest", "control.modules.load_module_manifest"),
+    ("modules", "run_startup_hooks", "control.modules.run_startup_hooks"),
+)
+
+HUMAN_PUBLIC_MUTATION_METHODS = frozenset(
+    descriptor.method
+    for descriptor in HUMAN_BOUNDARIES
+) | frozenset(
+    method
+    for component, method, _name in HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES
+    if component == "human"
+)
+
+PUBLIC_MUTATION_ADMISSION_BOUNDARY_NAMES = frozenset(
+    descriptor.name for descriptor in EXPLAIN_BOUNDARY_DESCRIPTORS
+) | frozenset(name for _component, _method, name in CONTROL_MUTATION_ADMISSION_BOUNDARIES)
+
 
 def validate_explain_descriptors() -> None:
     names = [descriptor.name for descriptor in EXPLAIN_BOUNDARY_DESCRIPTORS]
     if len(names) != len(set(names)):
         raise ValueError("duplicate explain boundary descriptor")
+    control_names = [name for _component, _method, name in CONTROL_MUTATION_ADMISSION_BOUNDARIES]
+    control_targets = [
+        (component, method)
+        for component, method, _name in CONTROL_MUTATION_ADMISSION_BOUNDARIES
+    ]
+    if len(control_names) != len(set(control_names)):
+        raise ValueError("duplicate control mutation admission boundary name")
+    if len(control_targets) != len(set(control_targets)):
+        raise ValueError("duplicate control mutation admission boundary target")
+    if set(names) & set(control_names):
+        raise ValueError("explain and control admission boundary names overlap")
 
 
 validate_explain_descriptors()
 
 
-__all__ = ["EXPLAIN_BOUNDARY_DESCRIPTORS"]
+__all__ = [
+    "CAPABILITY_CONTROL_MUTATION_ADMISSION_BOUNDARIES",
+    "CONTROL_MUTATION_ADMISSION_BOUNDARIES",
+    "DATA_FLOW_COMPOSITION_PUBLIC_METHODS",
+    "DATA_FLOW_CONTEXT_PUBLIC_METHODS",
+    "DATA_FLOW_CONTROL_MUTATION_ADMISSION_BOUNDARIES",
+    "DATA_FLOW_PUBLIC_MUTATION_METHODS",
+    "DATA_FLOW_READ_ONLY_PUBLIC_METHODS",
+    "EXPLAIN_BOUNDARY_DESCRIPTORS",
+    "HUMAN_CONTROL_MUTATION_ADMISSION_BOUNDARIES",
+    "HUMAN_PUBLIC_MUTATION_METHODS",
+    "HUMAN_READ_ONLY_PUBLIC_METHODS",
+    "OBJECT_TASK_CONTROL_MUTATION_ADMISSION_BOUNDARIES",
+    "OBJECT_TASK_LIFECYCLE_PUBLIC_METHODS",
+    "OBJECT_TASK_PUBLIC_MUTATION_METHODS",
+    "OBJECT_TASK_READ_ONLY_PUBLIC_METHODS",
+    "OBJECT_TASK_RECOVERY_PUBLIC_METHODS",
+    "PUBLIC_MUTATION_ADMISSION_BOUNDARY_NAMES",
+    "RUNTIME_CONTEXT_PUBLIC_METHODS",
+    "RUNTIME_CONTROL_MUTATION_ADMISSION_BOUNDARIES",
+    "RUNTIME_LIFECYCLE_PUBLIC_METHODS",
+    "RUNTIME_PUBLIC_MUTATION_METHODS",
+    "RUNTIME_READ_ONLY_PUBLIC_METHODS",
+    "SCHEDULER_CONTROL_MUTATION_ADMISSION_BOUNDARIES",
+    "SCHEDULER_COORDINATION_PUBLIC_METHODS",
+    "SCHEDULER_LIFECYCLE_PUBLIC_METHODS",
+    "SCHEDULER_PUBLIC_MUTATION_METHODS",
+    "SCHEDULER_READ_ONLY_PUBLIC_METHODS",
+]

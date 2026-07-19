@@ -4,6 +4,8 @@ import contextlib
 import json
 import os
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -12,13 +14,20 @@ import pytest
 from agent_libos.config import AgentLibOSConfig, RuntimeDefaults
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
+    AgentImage,
+    CapabilityEffect,
     CapabilityRight,
+    CapabilitySpec,
+    CapabilityStatus,
+    EventType,
     JsonRpcEndpointSpec,
     JsonRpcMethodSpec,
     LLMCallRecord,
 )
+from agent_libos.models.exceptions import CapabilityDenied
 from agent_libos.runtime.runtime import Runtime
-from agent_libos.storage import open_store
+from agent_libos.storage import StoreCloseClaimOutcome, open_store
+from agent_libos.storage.postgres import PostgresStore
 from agent_libos.utils.ids import utc_now
 
 
@@ -58,6 +67,459 @@ def _dsn_with_search_path(dsn: str, schema: str) -> str:
 
 @pytest.mark.postgres
 class TestPostgresStore:
+    def test_admission_guard_handoff_closes_session_lease_and_allows_reopen(
+        self,
+    ) -> None:
+        with _postgres_schema_dsn() as dsn:
+            store = PostgresStore(dsn)
+
+            @contextlib.contextmanager
+            def expected_guard() -> Iterator[None]:
+                yield
+
+            store.bind_admission_commit_guard(expected_guard)
+            assert (
+                store.probe_admission_guard_close(expected_guard)
+                is StoreCloseClaimOutcome.READY
+            )
+            assert (
+                store.claim_admission_guard_close(expected_guard)
+                is StoreCloseClaimOutcome.READY
+            )
+            outcome = store.release_admission_guard_and_close(expected_guard)
+
+            assert outcome.guard_matched is True
+            assert outcome.ownership_released is True
+            assert outcome.warnings == ()
+            assert store._admission_commit_guard is None
+            assert store._runtime_lease_acquired is False
+            assert store._runtime_lease_key is None
+
+            reopened = PostgresStore(dsn)
+            reopened.close()
+
+    def test_interrupted_initialization_releases_session_advisory_lease(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with _postgres_schema_dsn() as dsn:
+            primary_error = KeyboardInterrupt(
+                "injected PostgreSQL initialization interrupt"
+            )
+
+            def fail_initialization(*_args: object, **_kwargs: object) -> None:
+                raise primary_error
+
+            with monkeypatch.context() as scoped:
+                scoped.setattr(PostgresStore, "_init_store", fail_initialization)
+                with pytest.raises(KeyboardInterrupt) as caught:
+                    PostgresStore(dsn)
+
+            assert caught.value is primary_error
+            reopened = PostgresStore(dsn)
+            try:
+                assert reopened.list_processes() == []
+            finally:
+                reopened.close()
+
+    @pytest.mark.parametrize("policy_change", ["revoke", "deny"])
+    def test_authority_transaction_orders_policy_change_before_registry_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        policy_change: str,
+    ) -> None:
+        with _postgres_schema_dsn() as dsn:
+            config = AgentLibOSConfig(
+                runtime=RuntimeDefaults(store_backend="postgres", store_dsn=dsn)
+            )
+            runtime = Runtime(open_store(dsn, config=config), config=config)
+            try:
+                actor = runtime.process.spawn(goal=f"postgres authority {policy_change}")
+                endpoint_id = f"pg-authority-{policy_change}"
+                resource = runtime.jsonrpc.endpoint_resource(endpoint_id)
+                authority = runtime.capability.grant(
+                    actor,
+                    resource,
+                    [CapabilityRight.WRITE],
+                    issued_by="test.host",
+                )
+                endpoint = JsonRpcEndpointSpec(
+                    schema_version=1,
+                    endpoint_id=endpoint_id,
+                    url="https://api.example.test/jsonrpc",
+                    headers={},
+                    methods=[
+                        JsonRpcMethodSpec(
+                            method_id="probe",
+                            rpc_method="probe.read",
+                            right="read",
+                            rollback_class="no_rollback_required",
+                            state_mutation=False,
+                            information_flow=True,
+                        )
+                    ],
+                    timeout_s=1.0,
+                    max_request_bytes=1024,
+                    max_response_bytes=2048,
+                )
+                original_require = runtime.capability.require
+
+                def change_policy_after_preflight(*args: object, **kwargs: object):
+                    decision = original_require(*args, **kwargs)
+                    if policy_change == "revoke":
+                        runtime.capability.revoke(
+                            authority.cap_id,
+                            revoked_by="test.host",
+                            require_authority=False,
+                        )
+                    else:
+                        runtime.capability.issue_trusted(
+                            actor,
+                            resource,
+                            [CapabilityRight.WRITE],
+                            issued_by="test.host",
+                            effect=CapabilityEffect.DENY,
+                        )
+                    return decision
+
+                monkeypatch.setattr(
+                    runtime.capability,
+                    "require",
+                    change_policy_after_preflight,
+                )
+
+                with pytest.raises(CapabilityDenied, match="authority changed"):
+                    runtime.jsonrpc.register_endpoint(endpoint, actor=actor)
+
+                assert runtime.store.get_jsonrpc_endpoint(endpoint_id) is None
+            finally:
+                runtime.close()
+
+    @pytest.mark.parametrize("policy_change", ["deny", "revoke"])
+    def test_grant_transfer_recomputes_requested_rights_inside_authority_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        policy_change: str,
+    ) -> None:
+        with _postgres_schema_dsn() as dsn:
+            config = AgentLibOSConfig(
+                runtime=RuntimeDefaults(store_backend="postgres", store_dsn=dsn)
+            )
+            runtime = Runtime(open_store(dsn, config=config), config=config)
+            try:
+                actor = runtime.process.spawn(goal=f"postgres grant transfer {policy_change} actor")
+                child = runtime.process.spawn(goal=f"postgres grant transfer {policy_change} child")
+                resource = f"object:postgres-grant-transfer-{policy_change}"
+                parent = runtime.capability.issue_trusted(
+                    actor,
+                    resource,
+                    [CapabilityRight.READ],
+                    issued_by="test.host",
+                )
+                grant_once = runtime.capability.grant_once(
+                    actor,
+                    resource,
+                    [CapabilityRight.GRANT],
+                    issued_by="test.host",
+                )
+                barrier = Barrier(2)
+                original_require = runtime.capability._require_issue_authority
+
+                def pause_after_preflight(who: str, spec: CapabilitySpec):
+                    decision = original_require(who, spec)
+                    barrier.wait(timeout=5)
+                    barrier.wait(timeout=5)
+                    return decision
+
+                monkeypatch.setattr(
+                    runtime.capability,
+                    "_require_issue_authority",
+                    pause_after_preflight,
+                )
+                before_reservations = runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                )
+
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(
+                        runtime.capability.issue,
+                        actor,
+                        child,
+                        CapabilitySpec(
+                            resource=resource,
+                            rights={CapabilityRight.READ.value},
+                        ),
+                    )
+                    barrier.wait(timeout=5)
+                    if policy_change == "deny":
+                        runtime.capability.issue_trusted(
+                            actor,
+                            resource,
+                            [CapabilityRight.READ],
+                            issued_by="test.defender",
+                            effect=CapabilityEffect.DENY,
+                        )
+                    else:
+                        runtime.capability.revoke(
+                            parent.cap_id,
+                            revoked_by="test.defender",
+                            require_authority=False,
+                        )
+                    barrier.wait(timeout=5)
+                    with pytest.raises(CapabilityDenied):
+                        future.result(timeout=5)
+
+                latest_grant = runtime.store.get_capability(grant_once.cap_id)
+                assert latest_grant is not None
+                assert latest_grant.status == CapabilityStatus.ACTIVE
+                assert latest_grant.uses_remaining == 1
+                assert runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                ) == before_reservations
+                assert not runtime.capability.check(
+                    child,
+                    resource,
+                    CapabilityRight.READ,
+                )
+            finally:
+                runtime.close()
+
+    def test_one_shot_authority_has_one_concurrent_winner_without_stranded_reservation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with _postgres_schema_dsn() as dsn:
+            config = AgentLibOSConfig(
+                runtime=RuntimeDefaults(store_backend="postgres", store_dsn=dsn)
+            )
+            runtime = Runtime(open_store(dsn, config=config), config=config)
+            try:
+                actor = runtime.process.spawn(goal="postgres one-shot authority actor")
+                children = [
+                    runtime.process.spawn(goal="postgres one-shot child one"),
+                    runtime.process.spawn(goal="postgres one-shot child two"),
+                ]
+                resource = "object:postgres-one-shot-authority"
+                authority = runtime.capability.grant_once(
+                    actor,
+                    resource,
+                    [CapabilityRight.ADMIN],
+                    issued_by="test.host",
+                )
+                barrier = Barrier(2)
+                original_require = runtime.capability._require_issue_authority
+
+                def synchronize_preflights(who: str, spec: CapabilitySpec):
+                    decision = original_require(who, spec)
+                    barrier.wait(timeout=5)
+                    return decision
+
+                monkeypatch.setattr(
+                    runtime.capability,
+                    "_require_issue_authority",
+                    synchronize_preflights,
+                )
+
+                def issue(child: str):
+                    try:
+                        return runtime.capability.issue(
+                            actor,
+                            child,
+                            CapabilitySpec(
+                                resource=resource,
+                                rights={CapabilityRight.READ.value},
+                            ),
+                        )
+                    except CapabilityDenied as exc:
+                        return exc
+
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    outcomes = list(executor.map(issue, children))
+
+                assert sum(not isinstance(outcome, CapabilityDenied) for outcome in outcomes) == 1
+                assert sum(isinstance(outcome, CapabilityDenied) for outcome in outcomes) == 1
+                latest = runtime.store.get_capability(authority.cap_id)
+                assert latest is not None
+                assert latest.status == CapabilityStatus.REVOKED
+                assert latest.uses_remaining == 0
+                rows = runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    "cap_id = ?",
+                    (authority.cap_id,),
+                    order_by="reservation_id",
+                )
+                assert [row["status"] for row in rows] == ["committed"]
+            finally:
+                runtime.close()
+
+    def test_checkpoint_restore_audit_failure_rolls_back_main_state_and_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with _postgres_schema_dsn() as dsn:
+            config = AgentLibOSConfig(
+                runtime=RuntimeDefaults(store_backend="postgres", store_dsn=dsn)
+            )
+            runtime = Runtime(open_store(dsn, config=config), config=config)
+            try:
+                owner = runtime.process.spawn(goal="postgres restore owner")
+                controller = runtime.process.spawn(goal="postgres restore controller")
+                checkpoint_id = runtime.checkpoint.create(
+                    owner,
+                    "postgres authority atomicity",
+                    actor=owner,
+                )
+                current_owner = runtime.process.get(owner)
+                runtime.store.patch_process(
+                    owner,
+                    {"status_message": "current state"},
+                    expected_revision=current_owner.revision,
+                )
+                authority = runtime.capability.grant_once(
+                    controller,
+                    f"checkpoint:{checkpoint_id}",
+                    [CapabilityRight.ADMIN],
+                    issued_by="test.host",
+                )
+                before_event_ids = {event.event_id for event in runtime.events.list()}
+                before_audit_ids = {record.record_id for record in runtime.audit.trace()}
+                before_reservations = runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                )
+                original_record = runtime.audit.record
+
+                def fail_after_restore_audit(*args, **kwargs):
+                    result = original_record(*args, **kwargs)
+                    if kwargs.get("action") == "checkpoint.restore":
+                        raise RuntimeError("injected postgres restore audit failure")
+                    return result
+
+                monkeypatch.setattr(runtime.audit, "record", fail_after_restore_audit)
+
+                with pytest.raises(RuntimeError, match="postgres restore audit failure"):
+                    runtime.checkpoint.restore(controller, checkpoint_id)
+
+                assert runtime.process.get(owner).status_message == "current state"
+                latest = runtime.store.get_capability(authority.cap_id)
+                assert latest is not None
+                assert latest.status == CapabilityStatus.ACTIVE
+                assert latest.uses_remaining == 1
+                assert runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                ) == before_reservations
+                assert not [
+                    event
+                    for event in runtime.events.list()
+                    if event.event_id not in before_event_ids
+                    and event.type == EventType.ROLLBACK
+                ]
+                assert not [
+                    record
+                    for record in runtime.audit.trace()
+                    if record.record_id not in before_audit_ids
+                    and record.action == "checkpoint.restore"
+                ]
+            finally:
+                runtime.close()
+
+    def test_checkpoint_restore_settlement_failure_rolls_back_composite_unit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with _postgres_schema_dsn() as dsn:
+            config = AgentLibOSConfig(
+                runtime=RuntimeDefaults(store_backend="postgres", store_dsn=dsn)
+            )
+            runtime = Runtime(open_store(dsn, config=config), config=config)
+            image_id = "postgres-checkpoint-settlement:v0"
+            try:
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name=image_id,
+                        system_prompt="captured",
+                    ),
+                    actor="test.host",
+                )
+                owner = runtime.process.spawn(image=image_id, goal="postgres settlement owner")
+                controller = runtime.process.spawn(goal="postgres settlement controller")
+                checkpoint_id = runtime.checkpoint.create(
+                    owner,
+                    "postgres settlement atomicity",
+                    actor=owner,
+                )
+                current_owner = runtime.process.get(owner)
+                runtime.store.patch_process(
+                    owner,
+                    {"status_message": "current state"},
+                    expected_revision=current_owner.revision,
+                )
+                runtime.register_image(
+                    AgentImage(
+                        image_id=image_id,
+                        name=image_id,
+                        system_prompt="current",
+                    ),
+                    actor="test.host",
+                    replace=True,
+                )
+                authorities = [
+                    runtime.capability.grant_once(
+                        controller,
+                        f"checkpoint:{checkpoint_id}",
+                        [CapabilityRight.ADMIN],
+                        issued_by="test.host",
+                    ),
+                    runtime.capability.grant_once(
+                        controller,
+                        f"image:{image_id}",
+                        [CapabilityRight.ADMIN],
+                        issued_by="test.host",
+                    ),
+                ]
+                before_reservations = runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                )
+                original_commit = runtime.capability.commit_reserved_use
+                commit_calls = 0
+
+                def fail_after_second_settlement(*args, **kwargs):
+                    nonlocal commit_calls
+                    result = original_commit(*args, **kwargs)
+                    commit_calls += 1
+                    if commit_calls == 2:
+                        raise RuntimeError("injected postgres settlement failure")
+                    return result
+
+                monkeypatch.setattr(
+                    runtime.capability,
+                    "commit_reserved_use",
+                    fail_after_second_settlement,
+                )
+
+                with pytest.raises(RuntimeError, match="postgres settlement failure"):
+                    runtime.checkpoint.restore(controller, checkpoint_id)
+
+                assert commit_calls == 2
+                assert runtime.process.get(owner).status_message == "current state"
+                assert runtime.get_image(image_id).system_prompt == "current"
+                for authority in authorities:
+                    latest = runtime.store.get_capability(authority.cap_id)
+                    assert latest is not None
+                    assert latest.status == CapabilityStatus.ACTIVE
+                    assert latest.uses_remaining == 1
+                assert runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                ) == before_reservations
+            finally:
+                runtime.close()
+
     def test_postgres_runtime_store_smoke(self) -> None:
         with _postgres_schema_dsn() as dsn:
             config = AgentLibOSConfig(runtime=RuntimeDefaults(store_backend="postgres", store_dsn=dsn))

@@ -22,6 +22,8 @@ from agent_libos.models.exceptions import (
     ValidationError as LibOSValidationError,
 )
 from agent_libos.models import DataFlowContext, ToolSpec
+from agent_libos.ports.blocking_work import run_blocking_once
+from agent_libos.utils.public_errors import provider_error_envelope
 
 InputT = TypeVar("InputT", bound=BaseModel)
 
@@ -356,15 +358,34 @@ class BaseAgentTool(ABC, Generic[InputT]):
                 metadata=self._base_metadata(ctx, started_at),
             )
         except Exception as exc:
-            details: dict[str, Any] = {"error_type": type(exc).__name__}
-            if self.expose_internal_errors:
-                details["message"] = str(exc)
+            return self._unexpected_failure_result(exc, ctx, started_at)
+
+    def _unexpected_failure_result(
+        self,
+        exc: Exception,
+        ctx: ToolContext,
+        started_at: float,
+    ) -> ToolResult:
+        public_error = provider_error_envelope(exc)
+        if public_error is not None:
             return ToolResult.failure(
                 code=ToolErrorCode.EXECUTION_ERROR,
-                message=f"Tool `{self.name}` failed during execution.",
-                details=details,
+                message=public_error["message"],
+                details={
+                    key: public_error[key]
+                    for key in ("code", "error_type", "correlation_id")
+                },
                 metadata=self._base_metadata(ctx, started_at),
             )
+        details: dict[str, Any] = {"error_type": type(exc).__name__}
+        if self.expose_internal_errors:
+            details["message"] = str(exc)
+        return ToolResult.failure(
+            code=ToolErrorCode.EXECUTION_ERROR,
+            message=f"Tool `{self.name}` failed during execution.",
+            details=details,
+            metadata=self._base_metadata(ctx, started_at),
+        )
 
     def invoke(self, raw_args: Mapping[str, Any] | str | InputT, ctx: ToolContext) -> ToolResult:
         try:
@@ -464,12 +485,12 @@ class SyncAgentTool(BaseAgentTool[InputT], ABC):
         if manager is None:
             if blocking_work is not None:
                 return await blocking_work.run(self.run, args, ctx)
-            return await asyncio.to_thread(self.run, args, ctx)
+            return await run_blocking_once(self.run, args, ctx)
 
-        # ``asyncio.to_thread`` copies ContextVars into the worker but does not
-        # copy mutations back into the event-loop task.  Return the trusted
-        # post-call flow explicitly so ToolBroker can label the result Object
-        # with every source observed by synchronous primitives.
+        # Worker ContextVars do not copy mutations back into the event-loop
+        # task. Return the trusted post-call flow explicitly so ToolBroker can
+        # label the result Object with every source observed by synchronous
+        # primitives.
         def run_with_flow() -> tuple[bool, Any, Any]:
             try:
                 return True, self.run(args, ctx), manager.current_context()
@@ -483,7 +504,7 @@ class SyncAgentTool(BaseAgentTool[InputT], ABC):
         if blocking_work is not None:
             succeeded, raw_result, returned_context = await blocking_work.run(run_with_flow)
         else:
-            succeeded, raw_result, returned_context = await asyncio.to_thread(run_with_flow)
+            succeeded, raw_result, returned_context = await run_blocking_once(run_with_flow)
         returned_context = _merge_result_data_flow_context(
             raw_result,
             returned_context,

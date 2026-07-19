@@ -13,7 +13,7 @@ class TestAsyncScheduler:
 
     def test_concurrent_runs_keep_human_policy_in_the_originating_run_context(self) -> None:
         async def scenario() -> None:
-            runtime = Runtime.open('local')
+            runtime = await Runtime.aopen('local')
             try:
                 pid = runtime.process.spawn(image='base-agent:v0', goal='concurrent run context')
                 first_quantum_started = threading.Event()

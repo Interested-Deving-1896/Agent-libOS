@@ -132,6 +132,7 @@ demo          run the deterministic local demo
 audit         print audit records
 explain       inspect evidence-backed protected-operation causal trees
 llm-calls     print persisted LLM call records
+payload-retention preview or apply one bounded LLM/effect retention page
 processes     print process table
 resources     print process resource budget, usage, and remaining budget
 tools         print registered tools
@@ -330,6 +331,26 @@ training and fine-tuning pipelines under the deployment's user agreement. Set
 sensitive prompt, tool, reasoning, and provider payload fields; the runtime
 then persists only bounded previews and hashes for those fields.
 
+## Payload Retention
+
+Payload retention is disabled by default and never runs on startup. Configure
+the Host policy under `runtime.payload_retention_*`, then preview one bounded
+page before applying it:
+
+```bash
+uv run agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call
+uv run agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call --apply
+uv run agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention external_effect --apply
+```
+
+The command returns counts and an optional `next_cursor`. Continue with both
+`--after-created-at <value>` and `--after-record-id <value>`; providing only
+one cursor component fails closed. Dry runs still write a metadata-only audit
+summary, while `--apply` commits payload CAS updates and that audit in one
+transaction. Live/unknown effects, Responses-chain anchors, and process-result
+recovery calls are not eligible. See
+[Evidence and LLM Payload Retention](evidence_payload_retention.md).
+
 ## Explainable Operations
 
 List causal-root operations for one process or explain one causal tree:
@@ -465,8 +486,16 @@ per-process directory under `agent_outputs/image_workspaces/`. For any target
 image, `required_modules` are checked before boot; the runtime must already
 have loaded each declared `(module_id, source_sha256)` pair.
 
+Exec is admitted only for a Host-owned `runnable` process or from the process's
+exact active execution lease. A child/message/Human/Tool/pause/Host-resume wait
+must be resolved or resumed first; exec rejects it before publication so its
+durable dependency cannot be orphaned by image replacement.
+
 Exit accepts either `--payload` or `--result-oid`, not both. Non-JSON payload
-text is wrapped as `{"content": "<text>"}`.
+text is wrapped as `{"content": "<text>"}`. The response includes canonical
+tagged `wait_state` and `outcome` values plus `state_generation`; when exit
+materializes a message-only result Object, `result_oid` is that exact durable
+outcome Object id.
 
 ## AgentImage Packages
 
@@ -584,9 +613,11 @@ checkpoint capabilities. Restore requires checkpoint `admin`, exact image
 command runs as an audited admin actor named `cli`.
 Restore prints `status: restored` after complete reconciliation, or
 `status: restored_with_warnings` with `main_state_committed: true` and
-`post_commit_failures` when image/JIT/finalizer reconciliation or the final
-restore event/audit sink fails after the scoped state transaction. Do not retry
-the latter as an uncommitted restore.
+`post_commit_failures` when image/JIT/finalizer reconciliation fails after the
+scoped state transaction. Restore's finite authority, main state, core event,
+and core audit share one transaction; a failure in any of those stages leaves
+the restore uncommitted and returns an error. Do not retry a warning result as
+an uncommitted restore.
 Fork similarly returns `status: forked` after complete publication, or
 `status: forked_with_warnings` with `main_state_committed: true` when its
 post-commit event/audit sink fails. Do not retry that warning result as an

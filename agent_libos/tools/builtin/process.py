@@ -12,6 +12,8 @@ from agent_libos.models import (
     AgentProcess,
     CapabilityRight,
     DataFlowContext,
+    ExitedProcessOutcome,
+    FailedProcessOutcome,
     ForkMode,
     MemoryViewSpec,
     MergePolicy,
@@ -20,6 +22,7 @@ from agent_libos.models import (
     ProcessSignal,
     ResourceBudget,
     ViewMode,
+    process_state_to_mapping,
 )
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolErrorCode, ToolExecutionError, ToolPolicy
 
@@ -205,6 +208,9 @@ class WaitChildProcessOutput(BaseModel):
     ready: bool
     result_oid: str | None = None
     message: str | None = None
+    wait_state: dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
+    state_generation: int
 
 
 class ChildProcessInfo(BaseModel):
@@ -215,6 +221,9 @@ class ChildProcessInfo(BaseModel):
     goal_oid: str | None
     result_oid: str | None = None
     status_message: str | None = None
+    wait_state: dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
+    state_generation: int
 
 
 class ListChildProcessesArgs(BaseModel):
@@ -238,6 +247,9 @@ class SignalChildProcessOutput(BaseModel):
     child_pid: str
     signal: str
     status: str
+    wait_state: dict[str, Any] | None = None
+    outcome: dict[str, Any] | None = None
+    state_generation: int
 
 
 class MergeChildMemoryArgs(BaseModel):
@@ -602,16 +614,26 @@ class WaitChildProcessTool(SyncAgentTool[WaitChildProcessArgs]):
             child = runtime.process.get(args.child_pid)
             return WaitChildProcessOutput(
                 child_pid=args.child_pid,
-                status=child.status.value,
                 ready=False,
                 message=child.status_message,
+                **process_state_to_mapping(
+                    child.status.value,
+                    child.wait_state,
+                    child.outcome,
+                    child.state_generation,
+                ),
             )
         return WaitChildProcessOutput(
             child_pid=result.pid,
-            status=result.status.value,
             ready=True,
             result_oid=result.result.oid if result.result is not None else None,
             message=result.message,
+            **process_state_to_mapping(
+                result.status.value,
+                result.wait_state,
+                result.outcome,
+                result.state_generation,
+            ),
         )
 
 
@@ -673,7 +695,16 @@ class SignalChildProcessTool(SyncAgentTool[SignalChildProcessArgs]):
             source_labels=source_labels,
             source_context=source_context,
         )
-        return SignalChildProcessOutput(child_pid=child.pid, signal=signal.value, status=child.status.value)
+        return SignalChildProcessOutput(
+            child_pid=child.pid,
+            signal=signal.value,
+            **process_state_to_mapping(
+                child.status.value,
+                child.wait_state,
+                child.outcome,
+                child.state_generation,
+            ),
+        )
 
 
 class MergeChildMemoryTool(SyncAgentTool[MergeChildMemoryArgs]):
@@ -726,16 +757,21 @@ def _view_mode_for_fork(mode: ForkMode) -> ViewMode:
 
 def _child_info(child: AgentProcess) -> ChildProcessInfo:
     result_oid = None
-    if child.status_message and child.status_message.startswith("result_oid:"):
-        result_oid = child.status_message.split(":", 1)[1]
+    if isinstance(child.outcome, (ExitedProcessOutcome, FailedProcessOutcome)):
+        result_oid = child.outcome.result_oid
     return ChildProcessInfo(
         pid=child.pid,
         image=child.image_id,
-        status=child.status.value,
         working_directory=child.working_directory,
         goal_oid=child.goal_oid,
         result_oid=result_oid,
         status_message=child.status_message,
+        **process_state_to_mapping(
+            child.status.value,
+            child.wait_state,
+            child.outcome,
+            child.state_generation,
+        ),
     )
 
 

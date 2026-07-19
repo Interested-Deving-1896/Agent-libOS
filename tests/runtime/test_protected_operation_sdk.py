@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, RLock, Thread
 
 import pytest
 
@@ -31,6 +31,7 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.sdk import (
     PostProviderFailureMode,
+    ProviderRegistryBinding,
     ProtectedOperationContract,
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
@@ -132,6 +133,62 @@ def _ingress_setup(runtime):
         data_flow_ingress_context=context,
     )
     return pid, capability, contract, invocation, context
+
+
+def test_sdk_revalidates_provider_registry_binding_before_every_phase() -> None:
+    with temporary_runtime() as runtime:
+        pid, capability, contract, base_invocation = _setup(runtime)
+        captured = ProviderRegistryBinding(
+            registry_spec_sha256="a" * 64,
+            registry_generation=1,
+        )
+        current = [captured]
+        phase_lock = RLock()
+        resolved: list[ProviderRegistryBinding] = []
+        second_phase_calls: list[str] = []
+
+        def resolve() -> ProviderRegistryBinding:
+            resolved.append(current[0])
+            return current[0]
+
+        invocation = replace(
+            base_invocation,
+            provider_registry_binding=captured,
+            provider_registry_binding_resolver=resolve,
+            provider_registry_phase_guard=lambda: phase_lock,
+        )
+
+        with pytest.raises(
+            CapabilityDenied,
+            match="provider registry binding changed before protected dispatch",
+        ):
+            with runtime.protected_operations.start(
+                contract,
+                invocation,
+                provider=_Provider(),
+            ) as operation:
+                assert operation.call(
+                    ProviderPhase("first", information_flow=True),
+                    lambda: "first-result",
+                ) == "first-result"
+                current[0] = ProviderRegistryBinding(
+                    registry_spec_sha256="b" * 64,
+                    registry_generation=2,
+                )
+                operation.call(
+                    ProviderPhase("second", information_flow=True),
+                    lambda: second_phase_calls.append("called"),
+                )
+
+        assert resolved == [captured, current[0]]
+        assert second_phase_calls == []
+        restored = runtime.store.get_capability(capability.cap_id)
+        assert restored is not None
+        assert restored.uses_remaining == 0
+        effects = runtime.store.list_external_effects(pid=pid)
+        assert len(effects) == 1
+        assert effects[0].transaction_state == "unknown"
+        assert effects[0].effect_state == "finalized"
 
 
 @pytest.mark.parametrize(
@@ -582,7 +639,8 @@ def test_sdk_preserve_result_does_not_replay_after_settlement_failure(monkeypatc
 
 def test_sdk_async_phase_and_missing_complete_fail_closed() -> None:
     async def run() -> None:
-        with temporary_runtime() as runtime:
+        runtime = await Runtime.aopen("local")
+        try:
             _pid, _capability, contract, invocation = _setup(runtime)
             provider = _Provider()
 
@@ -599,6 +657,8 @@ def test_sdk_async_phase_and_missing_complete_fail_closed() -> None:
 
             effect = runtime.store.list_external_effects(pid=invocation.pid)[0]
             assert effect.transaction_state == "unknown"
+        finally:
+            await runtime.ashutdown()
 
     asyncio.run(run())
 
@@ -1189,7 +1249,8 @@ def test_sdk_resource_charge_failure_happens_after_effect_commit(monkeypatch) ->
 
 def test_sdk_async_cancellation_consumes_authority_and_records_unknown() -> None:
     async def run() -> None:
-        with temporary_runtime() as runtime:
+        runtime = await Runtime.aopen("local")
+        try:
             pid, capability, contract, invocation = _setup(runtime)
 
             async def cancelled() -> str:
@@ -1201,6 +1262,8 @@ def test_sdk_async_cancellation_consumes_authority_and_records_unknown() -> None
             assert runtime.store.get_capability(capability.cap_id).uses_remaining == 0
             effect = runtime.store.list_external_effects(pid=pid)[0]
             assert effect.transaction_state == "unknown"
+        finally:
+            await runtime.ashutdown()
 
     asyncio.run(run())
 

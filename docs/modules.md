@@ -56,6 +56,8 @@ provides:
   provider_hooks: []
   startup_hooks:
     - initialize_example
+  durable_object_release_finalizers:
+    - example.provider-resource-release:v1
 sha256: "<sha256 of example_module.py bytes, or the inferred package digest>"
 metadata:
   owner: local
@@ -99,6 +101,11 @@ def register_module(ctx):
     ctx.register_tool(MyTool())
     ctx.register_image(my_image)
     ctx.register_syscall("example.ping", ping_handler)
+    ctx.bind_durable_object_release_finalizer(
+        "example.provider-resource-release:v1",
+        prepare_release_intent,
+        finalize_release_intent,
+    )
     ctx.add_startup_hook(initialize_example)
 ```
 
@@ -109,7 +116,7 @@ module metadata, audit/event rows, and the in-memory tool/image/syscall/hook
 registries commit as one lifecycle transaction. Startup hooks run under the
 same registration-journal discipline: if a hook registers a runtime tool,
 image, syscall, provider hook, module-owned runtime/substrate attribute,
-shutdown finalizer, or Object release finalizer and then fails, its journal
+shutdown finalizer, recovery cleanup, or Object release finalizer and then fails, its journal
 undoes those owned changes in reverse order before the module row is recorded
 as failed. A hook receives an explicit `ModuleHookServices`-backed surface, not
 the concrete Runtime or another manager's private registry. Hook code may still
@@ -154,6 +161,25 @@ capabilities.
 `ctx.add_startup_hook(fn)` runs a synchronous hook after all startup module
 registrations have been applied.
 
+Inside a trusted startup hook,
+`runtime.bind_recovery_cleanup(fn)` registers an idempotent, process-local
+teardown callback for recovery-diagnostics handoff. This is deliberately
+separate from `bind_shutdown_finalizer`: ordinary shutdown callbacks are never
+implicitly recovery-safe and are not called by handoff. A recovery cleanup may
+stop workers and close transient host handles only; it must not read or mutate
+Object Memory, the runtime store, audit, or events. It returns `False` until
+cleanup has fully converged, which retains the registration and keeps the store
+open for an exact retry. Async callbacks require
+`await runtime.arelease_recovery_diagnostics()`.
+
+`ctx.bind_durable_object_release_finalizer(id, prepare, finalize)` registers a
+manifest-declared, restart-stable Object cleanup handler during buffered module
+application. Unlike a startup-hook registration, it is available before
+checkpoint publication recovery. `prepare` must be side-effect free and return
+a bounded JSON mapping; `finalize` is at-least-once and receives the persisted
+intent plus the same idempotency key on every retry. Handler ids are durable
+protocol identifiers: changing their meaning requires a new id.
+
 ## PTY Module
 
 `modules/pty/module.yaml` is the standard trusted module for interactive
@@ -182,6 +208,19 @@ The continuous reader is one runtime-internal `pty.ingest` child operation for
 the lifetime of the session. It drains and probes the provider handle only
 inside that SDK phase, records one information-flow effect when it stops, and
 does not infer causality from thread timing.
+During an explicit recovery-diagnostics handoff, the PTY module's separately
+tagged recovery cleanup stops the reader and resource monitor, closes the live
+provider handle directly, and waits for both workers without publishing close,
+audit, event, Object, or operation state. The durable PTY Object remains for
+the next Runtime's existing stale-session recovery. A close or join failure
+keeps the in-memory session registered and the store open so handoff can retry;
+the ordinary PTY shutdown finalizer is not used on this path.
+The raw handle close is guarded by an opaque lifecycle ContextVar lease that is
+present only while RuntimeLifecycle invokes the registered cleanup. Direct
+adapter calls fail before changing session state. The protected-operation
+static ratchet recognizes only a leading instance-host lease check followed by
+`handle.close()`; reads, writes, resizes, provider methods, late checks, and
+similarly named guards remain rejected.
 
 `pty_create(argv, cwd=None, cols=None, rows=None, startup_timeout_s=None,
 max_output_chars=None, name=None)` launches a local PTY through the shell

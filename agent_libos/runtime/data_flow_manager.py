@@ -23,6 +23,7 @@ from agent_libos.models import (
     DataSourceRef,
     EventType,
     FileLabelBinding,
+    ObjectLifecycleState,
     ObjectRight,
     SinkTrustLevel,
     SinkTrustRule,
@@ -32,6 +33,7 @@ from agent_libos.models import (
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
 from agent_libos.ports import DataReleaseApprovalPort
+from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, to_jsonable
 
@@ -150,30 +152,6 @@ class DataFlowManager:
         require_capability: bool = True,
     ) -> SinkTrustSpec:
         rule = self._coerce_rule(spec)
-        rule_base = rule.pattern[:-1] if rule.pattern.endswith("*") else rule.pattern
-        active_rules = tuple(self.store.list_sink_trust(active_only=True))
-        replacing_existing = any(item.pattern == rule.pattern for item in active_rules)
-        if (
-            not replacing_existing
-            and len(active_rules) >= self.config.data_flow.registry_list_limit
-        ):
-            raise ValidationError(
-                "active Sink trust registry reached configured limit="
-                f"{self.config.data_flow.registry_list_limit}"
-            )
-        for existing in active_rules:
-            if replace and existing.pattern == rule.pattern:
-                continue
-            existing_base = (
-                existing.pattern[:-1]
-                if existing.pattern.endswith("*")
-                else existing.pattern
-            )
-            if existing_base == rule_base:
-                raise ValidationError(
-                    "equal-priority overlapping Sink trust patterns are forbidden: "
-                    f"{existing.pattern!r} and {rule.pattern!r}"
-                )
         authority = None
         if require_capability:
             authority = self.capabilities.require(
@@ -188,33 +166,50 @@ class DataFlowManager:
                 },
                 consume=False,
             )
-        generation = int(self.store.get_sink_trust_generation()) + 1
-        record = SinkTrustSpec(
-            trust_id=new_id("sinktrust"),
-            pattern=rule.pattern,
-            trust_level=rule.trust_level,
-            max_sensitivity=rule.max_sensitivity,
-            tenants=rule.tenants,
-            principals=rule.principals,
-            identity_sha256=rule.identity_sha256,
-            generation=generation,
-            created_by=actor,
-            created_at=utc_now(),
-        )
-        with self.store.transaction():
-            if authority is not None:
-                authority = self.capabilities.reauthorize_decision(authority)
-            reservation = self.capabilities.reserve_decision_use(
-                authority,
-                used_by=actor,
-                reason="sink trust registry authority reserved",
+        with self.capabilities.authority_transaction(
+            [authority],
+            actor=actor,
+            operation="Sink trust register",
+        ) as current_decisions:
+            current_authority = current_decisions[0] if current_decisions else None
+            active_rules = tuple(self.store.list_sink_trust(active_only=True))
+            replacing_existing = any(item.pattern == rule.pattern for item in active_rules)
+            if (
+                not replacing_existing
+                and len(active_rules) >= self.config.data_flow.registry_list_limit
+            ):
+                raise ValidationError(
+                    "active Sink trust registry reached configured limit="
+                    f"{self.config.data_flow.registry_list_limit}"
+                )
+            rule_base = rule.pattern[:-1] if rule.pattern.endswith("*") else rule.pattern
+            for existing in active_rules:
+                if replace and existing.pattern == rule.pattern:
+                    continue
+                existing_base = (
+                    existing.pattern[:-1]
+                    if existing.pattern.endswith("*")
+                    else existing.pattern
+                )
+                if existing_base == rule_base:
+                    raise ValidationError(
+                        "equal-priority overlapping Sink trust patterns are forbidden: "
+                        f"{existing.pattern!r} and {rule.pattern!r}"
+                    )
+            generation = int(self.store.get_sink_trust_generation()) + 1
+            record = SinkTrustSpec(
+                trust_id=new_id("sinktrust"),
+                pattern=rule.pattern,
+                trust_level=rule.trust_level,
+                max_sensitivity=rule.max_sensitivity,
+                tenants=rule.tenants,
+                principals=rule.principals,
+                identity_sha256=rule.identity_sha256,
+                generation=generation,
+                created_by=actor,
+                created_at=utc_now(),
             )
             self.store.register_sink_trust(record, replace=replace)
-            self.capabilities.commit_reserved_use(
-                reservation,
-                committed_by=actor,
-                reason="sink trust registry authority committed",
-            )
             self.events.emit(
                 EventType.SINK_TRUST_REGISTERED,
                 source=actor,
@@ -234,8 +229,8 @@ class DataFlowManager:
                 action="data_flow.sink_trust.register",
                 target=rule.pattern,
                 capability_refs=(
-                    [authority.selected_capability_id]
-                    if authority is not None and authority.selected_capability_id
+                    [current_authority.selected_capability_id]
+                    if current_authority is not None and current_authority.selected_capability_id
                     else []
                 ),
                 decision={
@@ -260,9 +255,6 @@ class DataFlowManager:
         require_capability: bool = True,
     ) -> SinkTrustSpec:
         selected = str(pattern).strip()
-        active = self.store.inspect_sink_trust(selected)
-        if active is None:
-            raise ValidationError(f"active Sink trust record not found: {selected}")
         authority = None
         if require_capability:
             authority = self.capabilities.require(
@@ -272,16 +264,16 @@ class DataFlowManager:
                 {"operation": "unregister_sink_trust", "pattern": selected},
                 consume=False,
             )
-        generation = int(self.store.get_sink_trust_generation()) + 1
-        now = utc_now()
-        with self.store.transaction():
-            if authority is not None:
-                authority = self.capabilities.reauthorize_decision(authority)
-            reservation = self.capabilities.reserve_decision_use(
-                authority,
-                used_by=actor,
-                reason="sink trust unregister authority reserved",
-            )
+        with self.capabilities.authority_transaction(
+            [authority],
+            actor=actor,
+            operation="Sink trust unregister",
+        ):
+            active = self.store.inspect_sink_trust(selected)
+            if active is None:
+                raise ValidationError(f"active Sink trust record not found: {selected}")
+            generation = int(self.store.get_sink_trust_generation()) + 1
+            now = utc_now()
             removed = self.store.unregister_sink_trust(
                 selected,
                 generation=generation,
@@ -289,11 +281,6 @@ class DataFlowManager:
             )
             if not removed:
                 raise ValidationError(f"active Sink trust record changed concurrently: {selected}")
-            self.capabilities.commit_reserved_use(
-                reservation,
-                committed_by=actor,
-                reason="sink trust unregister authority committed",
-            )
             self.events.emit(
                 EventType.SINK_TRUST_UNREGISTERED,
                 source=actor,
@@ -839,7 +826,7 @@ class DataFlowManager:
 
         supervisor = self._blocking_work_supervisor
         if supervisor is None:
-            succeeded, value, returned_context = await asyncio.to_thread(invoke)
+            succeeded, value, returned_context = await run_blocking_once(invoke)
         else:
             succeeded, value, returned_context = await supervisor.run(invoke)
         self.observe_ingress(returned_context)
@@ -1192,18 +1179,13 @@ class DataFlowManager:
                 continue
             obj = self.objects.get_object(ref.oid)
             if obj is None:
-                rows = self.objects.select_table_rows(
-                    "objects",
-                    "oid = ? AND lifecycle_state IN (?, ?)",
-                    (ref.oid, "live", "released"),
-                )
-                if not rows:
+                state = self.objects.get_persisted_object_state(ref.oid)
+                if state is None:
                     return f"data-flow source Object disappeared: {ref.oid}"
-                row = rows[0]
                 if (
-                    row.get("lifecycle_state") != "released"
+                    state.lifecycle_state is not ObjectLifecycleState.RELEASED
                     or not allow_recovered_source_snapshots
-                    or not self.objects.is_recovered_object_payload(ref.oid)
+                    or not state.recovered_after_reopen
                 ):
                     return f"data-flow source Object is no longer live: {ref.oid}"
                 # Object payloads are intentionally runtime-local. A durable
@@ -1211,9 +1193,9 @@ class DataFlowManager:
                 # Host-written source snapshot and an explicitly recovery-marked
                 # released Object row. Ordinary same-runtime checks do not opt
                 # into this narrow resume path.
-                if int(row.get("version") or 0) != ref.version:
+                if state.version != ref.version:
                     return f"data-flow source Object changed before dispatch: {ref.oid}"
-                if self.objects.has_object_payload(ref.oid):
+                if state.payload_present:
                     return f"data-flow source Object payload is unavailable: {ref.oid}"
                 continue
             actual_hash = hashlib.sha256(dumps(to_jsonable(obj.payload)).encode("utf-8")).hexdigest()

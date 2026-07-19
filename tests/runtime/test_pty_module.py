@@ -2823,6 +2823,281 @@ class TestPtyModule:
                 if not runtime.lifecycle.closed:
                     runtime.close()
 
+    def test_recovery_handoff_abandons_pty_workers_without_durable_writes_and_reopens(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "pty-recovery-handoff.sqlite"
+            provider = FakePtyProvider(
+                initial_outputs=[],
+                session_pid=os.getpid(),
+            )
+            runtime = _open_pty_runtime(
+                temp_dir,
+                provider,
+                target=database,
+            )
+            adapter = _pty_adapter(runtime)
+            monitor_started = threading.Event()
+            finalizer_calls: list[str] = []
+            close_snapshots: list[tuple[Any, ...]] = []
+            reopened: Runtime | None = None
+            released = False
+
+            def quiet_monitor(
+                session: _PtyRuntimeSession,
+                _resource: str,
+            ) -> None:
+                monitor_started.set()
+                session.stop_event.wait(timeout=1.0)
+
+            def ordinary_finalizer() -> None:
+                finalizer_calls.append("ordinary")
+
+            monkeypatch.setattr(adapter, "_sample_and_charge", quiet_monitor)
+            runtime.bind_shutdown_finalizer(ordinary_finalizer)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="recovery handoff closes PTY transients",
+                )
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+                session = adapter._sessions[session_oid]
+                assert provider.sessions[0].read_started.wait(timeout=1.0)
+                assert monitor_started.wait(timeout=1.0)
+                assert session.reader_thread is not None
+                assert session.reader_thread.is_alive()
+                assert session.monitor_thread is not None
+                assert session.monitor_thread.is_alive()
+
+                with runtime.lifecycle.admit():
+                    runtime.lifecycle.mark_recovery_required(
+                        publication_id="pty-recovery-handoff",
+                    )
+                before = _durable_pty_snapshot(runtime)
+                original_close = runtime.store.close
+
+                def observed_close() -> None:
+                    close_snapshots.append(_durable_pty_snapshot(runtime))
+                    original_close()
+
+                monkeypatch.setattr(runtime.store, "close", observed_close)
+
+                outcome = runtime.release_recovery_diagnostics()
+                released = outcome["ok"] is True
+
+                assert released
+                assert outcome["recovery_diagnostics_released"] is True
+                assert provider.sessions[0].closed
+                assert not session.reader_thread.is_alive()
+                assert not session.monitor_thread.is_alive()
+                assert adapter._sessions == {}
+                assert close_snapshots == [before]
+                assert finalizer_calls == []
+
+                reopened = _open_pty_runtime(
+                    temp_dir,
+                    FakePtyProvider(initial_outputs=[]),
+                    target=database,
+                )
+                assert reopened.lifecycle.state == "open"
+                assert reopened.store.get_object(session_oid) is None
+            finally:
+                if not released:
+                    runtime.store.close()
+                if reopened is not None:
+                    reopened.close()
+
+    def test_pty_recovery_cleanup_rejects_direct_call_without_lifecycle_lease(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="reject direct PTY recovery cleanup",
+                )
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+                adapter = _pty_adapter(runtime)
+                session = adapter._sessions[session_oid]
+                assert provider.sessions[0].read_started.wait(timeout=1.0)
+                before = _durable_pty_snapshot(runtime)
+
+                with pytest.raises(
+                    RuntimeError,
+                    match="recovery cleanup lease",
+                ):
+                    adapter.release_recovery_diagnostics()
+
+                assert adapter._sessions[session_oid] is session
+                assert not session.recovery_abandoning
+                assert not session.stop_event.is_set()
+                assert not provider.sessions[0].closed
+                assert _durable_pty_snapshot(runtime) == before
+            finally:
+                runtime.close()
+
+    def test_recovery_handoff_keeps_failed_pty_cleanup_retryable_and_store_open(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "pty-recovery-handoff-retry.sqlite"
+            provider = FakePtyProvider(initial_outputs=[], close_failures=1)
+            runtime = _open_pty_runtime(
+                temp_dir,
+                provider,
+                target=database,
+            )
+            adapter = _pty_adapter(runtime)
+            close_snapshots: list[tuple[Any, ...]] = []
+            released = False
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="retry failed recovery PTY cleanup",
+                )
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+                session = adapter._sessions[session_oid]
+                assert provider.sessions[0].read_started.wait(timeout=1.0)
+
+                with runtime.lifecycle.admit():
+                    runtime.lifecycle.mark_recovery_required(
+                        publication_id="pty-recovery-handoff-retry",
+                    )
+                before = _durable_pty_snapshot(runtime)
+                original_close = runtime.store.close
+
+                def observed_close() -> None:
+                    close_snapshots.append(_durable_pty_snapshot(runtime))
+                    original_close()
+
+                monkeypatch.setattr(runtime.store, "close", observed_close)
+
+                first = runtime.release_recovery_diagnostics()
+
+                assert first["ok"] is False
+                assert runtime.lifecycle.state == "close_failed"
+                assert runtime.store.get_object(session_oid) is not None
+                assert adapter._sessions[session_oid] is session
+                assert not provider.sessions[0].closed
+                assert close_snapshots == []
+                assert _durable_pty_snapshot(runtime) == before
+
+                second = runtime.release_recovery_diagnostics()
+                released = second["ok"] is True
+
+                assert released
+                assert provider.sessions[0].closed
+                assert adapter._sessions == {}
+                assert close_snapshots == [before]
+            finally:
+                if not released:
+                    runtime.store.close()
+
+    def test_recovery_handoff_base_exception_keeps_pty_cleanup_retryable(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "pty-recovery-handoff-interrupt.sqlite"
+            provider = FakePtyProvider(initial_outputs=[])
+            runtime = _open_pty_runtime(
+                temp_dir,
+                provider,
+                target=database,
+            )
+            adapter = _pty_adapter(runtime)
+            close_called = threading.Event()
+            released = False
+            try:
+                pid = runtime.process.spawn(
+                    image="pty-agent:v0",
+                    goal="retry interrupted recovery PTY cleanup",
+                )
+                created = runtime.tools.call(
+                    pid,
+                    "pty_create",
+                    {"argv": ["git", "status"], "startup_timeout_s": 0},
+                )
+                assert created.ok, created.error
+                session_oid = created.payload["session_oid"]
+                session = adapter._sessions[session_oid]
+                assert provider.sessions[0].read_started.wait(timeout=1.0)
+                original_session_close = session.handle.close
+                close_attempts = 0
+
+                def interrupt_first_close(
+                    *,
+                    force: bool = True,
+                    timeout_s: float = 2.0,
+                ) -> int | None:
+                    nonlocal close_attempts
+                    close_attempts += 1
+                    if close_attempts == 1:
+                        raise KeyboardInterrupt("interrupt recovery PTY close")
+                    return original_session_close(
+                        force=force,
+                        timeout_s=timeout_s,
+                    )
+
+                monkeypatch.setattr(session.handle, "close", interrupt_first_close)
+                original_store_close = runtime.store.close
+
+                def observed_store_close() -> None:
+                    close_called.set()
+                    original_store_close()
+
+                monkeypatch.setattr(runtime.store, "close", observed_store_close)
+                with runtime.lifecycle.admit():
+                    runtime.lifecycle.mark_recovery_required(
+                        publication_id="pty-recovery-handoff-interrupt",
+                    )
+                before = _durable_pty_snapshot(runtime)
+
+                with pytest.raises(
+                    KeyboardInterrupt,
+                    match="interrupt recovery PTY close",
+                ):
+                    runtime.release_recovery_diagnostics()
+
+                assert runtime.lifecycle.state == "close_failed"
+                assert adapter._sessions[session_oid] is session
+                assert not close_called.is_set()
+                assert _durable_pty_snapshot(runtime) == before
+
+                retry = runtime.release_recovery_diagnostics()
+                released = retry["ok"] is True
+
+                assert released
+                assert provider.sessions[0].closed
+                assert adapter._sessions == {}
+                assert close_called.is_set()
+            finally:
+                if not released:
+                    runtime.store.close()
+
     def test_pty_reader_drops_old_output_when_buffer_limit_is_reached(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider(initial_outputs=[])
@@ -2854,6 +3129,7 @@ def _open_pty_runtime(
     provider: "FakePtyProvider",
     *,
     settings: dict[str, Any] | None = None,
+    target: str | Path = "local",
 ) -> Runtime:
     substrate = LocalResourceProviderSubstrate(root)
     substrate.pty = provider
@@ -2867,7 +3143,7 @@ def _open_pty_runtime(
     )
     manifest_sha = hashlib.sha256(manifest.read_text(encoding="utf-8").encode("utf-8")).hexdigest()
     runtime = Runtime.open(
-        "local",
+        target,
         substrate=substrate,
         config=AgentLibOSConfig(),
         module_manifests=(str(manifest),),
@@ -2902,6 +3178,16 @@ def _module_manifest() -> Path:
 
 def _pty_adapter(runtime: Runtime) -> Any:
     return runtime.module_state.get("_agent_libos_pty_adapter")
+
+
+def _durable_pty_snapshot(runtime: Runtime) -> tuple[Any, ...]:
+    return (
+        tuple(runtime.store.list_objects()),
+        tuple(runtime.store.list_audit()),
+        tuple(runtime.store.list_events()),
+        tuple(runtime.store.list_external_effects()),
+        tuple(runtime.store.list_operations()),
+    )
 
 
 def _grant_exact_pty_once(runtime: Runtime, pid: str, argv: list[str]) -> Any:
@@ -3154,8 +3440,10 @@ class FakePtySession:
         self.close_failures = close_failures
         self.pid = pid
         self.close_forces: list[bool] = []
+        self.read_started = threading.Event()
 
     def read(self, *, timeout_s: float = 0.0) -> str:
+        self.read_started.set()
         if self.outputs:
             return self.outputs.pop(0)
         if timeout_s > 0:

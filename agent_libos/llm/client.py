@@ -17,6 +17,7 @@ from agent_libos.llm.openai_schema import (
     openai_responses_tool_schema,
 )
 from agent_libos.models.exceptions import LibOSError
+from agent_libos.ports.blocking_work import run_blocking_once
 from agent_libos.utils.serde import to_jsonable
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -158,7 +159,12 @@ class LLMClient:
                 continue
             close = getattr(client, "close", None) or getattr(client, "aclose", None)
             if callable(close):
-                result = close()
+                if inspect.iscoroutinefunction(close) or inspect.iscoroutinefunction(
+                    getattr(close, "__call__", None)
+                ):
+                    result = close()
+                else:
+                    result = await run_blocking_once(close)
                 if inspect.isawaitable(result):
                     await result
             setattr(self, attr, None)

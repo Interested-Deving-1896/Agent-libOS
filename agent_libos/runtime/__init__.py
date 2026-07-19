@@ -1,4 +1,8 @@
-from agent_libos.runtime.builder import RuntimeBuilder
+from agent_libos.runtime.builder import (
+    RuntimeAssemblyCleanupKind,
+    RuntimeAssemblyCleanupRequired,
+    RuntimeBuilder,
+)
 from agent_libos.runtime.image_boot import ImageBootService
 from agent_libos.runtime.lifecycle import RuntimeLifecycle
 from agent_libos.runtime.process_launch import ProcessLaunchService
@@ -8,6 +12,8 @@ __all__ = [
     "ImageBootService",
     "ProcessLaunchService",
     "Runtime",
+    "RuntimeAssemblyCleanupKind",
+    "RuntimeAssemblyCleanupRequired",
     "RuntimeBuilder",
     "RuntimeLifecycle",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AbstractContextManager, nullcontext
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -18,6 +19,9 @@ from agent_libos.models import (
     EventPriority,
     EventType,
     ExternalEffectClassification,
+    ExternalEffectRecoveryQuery,
+    ExternalEffectRecoverySummary,
+    ExternalEffectRecord,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
     OperationKind,
@@ -27,6 +31,7 @@ from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.evidence.external_effects import (
     abandon_external_effect_intent,
     classify_external_effect,
+    iter_external_effect_recovery,
     mark_external_effect_dispatched,
     prepare_external_effect_intent,
     record_external_effect,
@@ -176,6 +181,44 @@ _DATA_FLOW_PAYLOAD_UNSET = object()
 
 
 @dataclass(frozen=True)
+class ProviderRegistryBinding:
+    """Immutable provider registry identity captured before authorization."""
+
+    registry_spec_sha256: str
+    registry_generation: int
+
+    @classmethod
+    def from_context(cls, value: Mapping[str, Any]) -> "ProviderRegistryBinding":
+        if not isinstance(value, Mapping):
+            raise ValueError("provider registry binding context must be a mapping")
+        return cls(
+            registry_spec_sha256=value.get("registry_spec_sha256"),
+            registry_generation=value.get("registry_generation"),
+        )
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.registry_spec_sha256, str)
+            or len(self.registry_spec_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.registry_spec_sha256
+            )
+        ):
+            raise ValueError("provider registry spec digest must be a lowercase SHA-256")
+        if (
+            isinstance(self.registry_generation, bool)
+            or not isinstance(self.registry_generation, int)
+            or self.registry_generation < 0
+        ):
+            raise ValueError("provider registry generation must be a non-negative integer")
+
+
+ProviderRegistryBindingResolver = Callable[[], ProviderRegistryBinding]
+ProviderRegistryPhaseGuard = Callable[[], AbstractContextManager[Any]]
+
+
+@dataclass(frozen=True)
 class ProtectedOperationInvocation:
     pid: str
     actor: str
@@ -190,6 +233,9 @@ class ProtectedOperationInvocation:
     resource_context: Mapping[str, Any] = field(default_factory=dict)
     prepare: Hook | None = None
     authority_revalidator: AuthorityRevalidator | None = None
+    provider_registry_binding: ProviderRegistryBinding | None = None
+    provider_registry_binding_resolver: ProviderRegistryBindingResolver | None = None
+    provider_registry_phase_guard: ProviderRegistryPhaseGuard | None = None
     restore_not_started: Hook | None = None
     failure_evidence: FailureEvidenceFactory | None = None
     failure_resource: ResourceSettlement | FailureResourceFactory | None = None
@@ -238,6 +284,7 @@ class ProtectedOperationSDK:
         events: Any,
         resources: Any | None,
         operations: Any,
+        require_recovery_lease: Callable[[], None],
         data_flow: Any | None = None,
     ) -> None:
         self.effects = effects
@@ -247,6 +294,7 @@ class ProtectedOperationSDK:
         self.events = events
         self.resources = resources
         self.operations = operations
+        self._require_recovery_lease = require_recovery_lease
         self.data_flow = data_flow
         self._contracts: dict[str, ProtectedOperationContract] = {}
         self._prepared_recovery_handlers: dict[str, PreparedRecoveryHandler] = {}
@@ -275,78 +323,101 @@ class ProtectedOperationSDK:
             raise ValidationError(f"prepared recovery handler conflict: {selected}")
         self._prepared_recovery_handlers[selected] = handler
 
-    def recover_prepared(self) -> list[str]:
+    def recover_prepared(self, *, page_size: int = 500) -> ExternalEffectRecoverySummary:
         """Restore local prepare state that never reached a provider phase."""
 
-        recovered: list[str] = []
-        for effect in self.effects.list_external_effects():
-            if effect.effect_state != "pending" or effect.transaction_state != "prepared":
+        self._require_recovery_lease()
+
+        recovered_sample: list[str] = []
+        recovered_total = 0
+        query = ExternalEffectRecoveryQuery(
+            transaction_states=("prepared",),
+            limit=page_size,
+        )
+        for effect in iter_external_effect_recovery(self.effects, query):
+            if not self._recover_prepared_effect(effect):
                 continue
-            protected = effect.provider_metadata.get("protected_operation")
-            if not isinstance(protected, Mapping):
+            recovered_total += 1
+            if len(recovered_sample) < page_size:
+                recovered_sample.append(effect.effect_id)
+        return ExternalEffectRecoverySummary(
+            total_count=recovered_total,
+            sample_effect_ids=tuple(recovered_sample),
+        )
+
+    def _recover_prepared_effect(self, effect: ExternalEffectRecord) -> bool:
+        protected = effect.provider_metadata.get("protected_operation")
+        if not isinstance(protected, Mapping):
+            return False
+        raw_reservations = protected.get("reservation_ids") or ()
+        if not isinstance(raw_reservations, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in raw_reservations
+        ):
+            raise ValidationError(
+                f"prepared protected operation has invalid reservation links: {effect.effect_id}"
+            )
+        contract_name = protected.get("contract_name")
+        actor = protected.get("actor")
+        if not isinstance(contract_name, str) or not contract_name:
+            raise ValidationError(
+                f"prepared protected operation has invalid contract identity: {effect.effect_id}"
+            )
+        if not isinstance(actor, str) or not actor:
+            raise ValidationError(
+                f"prepared protected operation has invalid actor identity: {effect.effect_id}"
+            )
+        expected_reservation_reason = (
+            f"protected operation reserved authority for {contract_name}"
+        )
+        for reservation_id in raw_reservations:
+            reservation = self.effects.get_capability_use_reservation(reservation_id)
+            if reservation is None or reservation.get("status") != "reserved":
                 continue
-            raw_reservations = protected.get("reservation_ids") or ()
-            if not isinstance(raw_reservations, (list, tuple)) or any(
-                not isinstance(item, str) or not item for item in raw_reservations
+            if (
+                reservation.get("reserved_by") != actor
+                or reservation.get("reason") != expected_reservation_reason
             ):
                 raise ValidationError(
-                    f"prepared protected operation has invalid reservation links: {effect.effect_id}"
+                    f"prepared protected operation reservation binding mismatch: {effect.effect_id}"
                 )
-            contract_name = protected.get("contract_name")
-            actor = protected.get("actor")
-            if not isinstance(contract_name, str) or not contract_name:
-                raise ValidationError(
-                    f"prepared protected operation has invalid contract identity: {effect.effect_id}"
+        handler = self._prepared_recovery_handler(effect.effect_id, protected)
+        with self.effects.transaction():
+            if handler is not None:
+                handler(effect)
+            for reservation_id in reversed(tuple(raw_reservations)):
+                self.capabilities.restore_reserved_use(
+                    reservation_id,
+                    restored_by="runtime.recovery",
+                    reason=(
+                        "protected operation recovered before provider dispatch: "
+                        f"{contract_name}"
+                    ),
                 )
-            if not isinstance(actor, str) or not actor:
-                raise ValidationError(
-                    f"prepared protected operation has invalid actor identity: {effect.effect_id}"
-                )
-            expected_reservation_reason = (
-                f"protected operation reserved authority for {contract_name}"
+            abandon_external_effect_intent(
+                self.effects,
+                effect.effect_id,
+                operations=self.operations,
             )
-            for reservation_id in raw_reservations:
-                reservation = self.effects.get_capability_use_reservation(reservation_id)
-                if reservation is None or reservation.get("status") != "reserved":
-                    continue
-                if (
-                    reservation.get("reserved_by") != actor
-                    or reservation.get("reason") != expected_reservation_reason
-                ):
-                    raise ValidationError(
-                        f"prepared protected operation reservation binding mismatch: {effect.effect_id}"
-                    )
-            recovery_name = protected.get("prepared_recovery")
-            handler = None
-            if recovery_name is not None:
-                if not isinstance(recovery_name, str) or not recovery_name:
-                    raise ValidationError(
-                        f"prepared protected operation has invalid recovery policy: {effect.effect_id}"
-                    )
-                handler = self._prepared_recovery_handlers.get(recovery_name)
-                if handler is None:
-                    raise ValidationError(
-                        f"prepared recovery handler is not registered: {recovery_name}"
-                    )
-            with self.effects.transaction():
-                if handler is not None:
-                    handler(effect)
-                for reservation_id in reversed(tuple(raw_reservations)):
-                    self.capabilities.restore_reserved_use(
-                        reservation_id,
-                        restored_by="runtime.recovery",
-                        reason=(
-                            "protected operation recovered before provider dispatch: "
-                            f"{contract_name}"
-                        ),
-                    )
-                abandon_external_effect_intent(
-                    self.effects,
-                    effect.effect_id,
-                    operations=self.operations,
-                )
-            recovered.append(effect.effect_id)
-        return recovered
+        return True
+
+    def _prepared_recovery_handler(
+        self,
+        effect_id: str,
+        protected: Mapping[str, Any],
+    ) -> PreparedRecoveryHandler | None:
+        recovery_name = protected.get("prepared_recovery")
+        if recovery_name is None:
+            return None
+        if not isinstance(recovery_name, str) or not recovery_name:
+            raise ValidationError(
+                f"prepared protected operation has invalid recovery policy: {effect_id}"
+            )
+        handler = self._prepared_recovery_handlers.get(recovery_name)
+        if handler is None:
+            raise ValidationError(
+                f"prepared recovery handler is not registered: {recovery_name}"
+            )
+        return handler
 
     def current_boundary(self) -> tuple[str, str, str] | None:
         current = _CURRENT_BOUNDARY.get()
@@ -497,21 +568,22 @@ class ProtectedOperation:
 
     def call(self, phase: ProviderPhase, function: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
         self._require_active()
-        self._dispatch(phase)
-        token = self._activate_boundary(phase)
-        try:
-            result = function(*args, **kwargs)
-        except ProviderEffectNotStarted as error:
-            self._handle_not_started(error, phase)
-            raise
-        except BaseException as error:
-            self._observe_data_flow_ingress(phase)
-            self._expect_settlement_evidence()
-            self._commit_reservations_best_effort()
-            self._finalize_unknown(error, phase.name)
-            raise
-        finally:
-            _CURRENT_BOUNDARY.reset(token)
+        with self._provider_registry_phase_scope():
+            self._dispatch(phase)
+            token = self._activate_boundary(phase)
+            try:
+                result = function(*args, **kwargs)
+            except ProviderEffectNotStarted as error:
+                self._handle_not_started(error, phase)
+                raise
+            except BaseException as error:
+                self._observe_data_flow_ingress(phase)
+                self._expect_settlement_evidence()
+                self._commit_reservations_best_effort()
+                self._finalize_unknown(error, phase.name)
+                raise
+            finally:
+                _CURRENT_BOUNDARY.reset(token)
         if isinstance(result, ProviderEffectNotStartedResult):
             self._handle_not_started(result.error, phase, outcome=result.outcome)
             return result  # type: ignore[return-value]
@@ -536,6 +608,10 @@ class ProtectedOperation:
         **kwargs: Any,
     ) -> T:
         self._require_active()
+        if self.invocation.provider_registry_phase_guard is not None:
+            raise ValidationError(
+                "registry-guarded provider phases must use synchronous call()"
+            )
         self._dispatch(phase)
         token = self._activate_boundary(phase)
         try:
@@ -650,6 +726,7 @@ class ProtectedOperation:
 
     def _prepare(self) -> None:
         self._validate_authority()
+        self._validate_provider_registry_binding_contract()
         self.sdk.authority_policy.assert_effect(
             self.invocation.pid,
             f"{self.contract.provider}.{self.contract.operation}",
@@ -849,6 +926,51 @@ class ProtectedOperation:
             self._validate_reauthorized_decision(prepared, decision)
             current.append(decision)
         self._authority_decisions = tuple(current)
+
+    def _validate_provider_registry_binding_contract(self) -> None:
+        captured = self.invocation.provider_registry_binding
+        resolver = self.invocation.provider_registry_binding_resolver
+        guard = self.invocation.provider_registry_phase_guard
+        supplied = (captured is not None, resolver is not None, guard is not None)
+        if any(supplied) and not all(supplied):
+            raise ValidationError(
+                "protected operation provider registry binding, resolver, and phase guard must be supplied together"
+            )
+        if captured is not None and not isinstance(captured, ProviderRegistryBinding):
+            raise ValidationError(
+                "protected operation provider registry binding has an invalid type"
+            )
+        if resolver is not None and not callable(resolver):
+            raise ValidationError(
+                "protected operation provider registry binding resolver must be callable"
+            )
+        if guard is not None and not callable(guard):
+            raise ValidationError(
+                "protected operation provider registry phase guard must be callable"
+            )
+
+    def _provider_registry_phase_scope(self) -> AbstractContextManager[Any]:
+        guard = self.invocation.provider_registry_phase_guard
+        return nullcontext() if guard is None else guard()
+
+    def _revalidate_provider_registry_binding(self) -> None:
+        captured = self.invocation.provider_registry_binding
+        resolver = self.invocation.provider_registry_binding_resolver
+        if captured is None:
+            return
+        if resolver is None:
+            raise ProtectedOperationProtocolError(
+                "protected operation provider registry binding resolver disappeared"
+            )
+        current = resolver()
+        if not isinstance(current, ProviderRegistryBinding):
+            raise ValidationError(
+                "protected operation provider registry binding resolver returned an invalid type"
+            )
+        if current != captured:
+            raise CapabilityDenied(
+                "provider registry binding changed before protected dispatch"
+            )
 
     def _validate_reauthorized_decision(
         self,
@@ -1111,6 +1233,7 @@ class ProtectedOperation:
         try:
             with self.sdk.effects.transaction():
                 self._revalidate_dispatch_authority()
+                self._revalidate_provider_registry_binding()
                 self._revalidate_data_sink_identity()
                 self._revalidate_data_flow(use_reserved_release=True)
                 mark_external_effect_dispatched(self.sdk.effects, self.effect_id)

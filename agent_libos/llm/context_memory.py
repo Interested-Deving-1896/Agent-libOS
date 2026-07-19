@@ -28,6 +28,8 @@ from agent_libos.models import (
     ObjectType,
     ResourceUsage,
     ViewMode,
+    process_outcome_to_mapping,
+    process_wait_state_to_mapping,
 )
 from agent_libos.memory.data_labels import (
     labels_for_explain,
@@ -565,6 +567,9 @@ class LLMContextMemory:
         process_signature = {
             "status": process.status.value,
             "status_message": process.status_message,
+            "wait_state": process_wait_state_to_mapping(process.wait_state),
+            "outcome": process_outcome_to_mapping(process.outcome),
+            "state_generation": process.state_generation,
             "checkpoint_head": process.checkpoint_head,
             "image_id": image.image_id,
             "working_directory": process.working_directory,
@@ -764,22 +769,27 @@ class LLMContextMemory:
         return obj.oid if obj is not None else None
 
     def _add_handle_to_view(self, pid: str, handle: ObjectHandle) -> None:
-        process = self._require_process(pid)
-        if process.memory_view is None:
-            process.memory_view = self._memory.create_view(pid, [handle], mode=ViewMode.MUTABLE)
-        elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
-            process.memory_view.roots.insert(0, handle)
-        else:
-            process.memory_view.roots = [
-                handle if existing.oid == handle.oid and "write" not in existing.rights else existing
-                for existing in process.memory_view.roots
-            ]
-        process.updated_at = utc_now()
-        self._processes.patch_process(
-            pid,
-            {"memory_view": process.memory_view, "updated_at": process.updated_at},
-            expected_revision=process.revision,
-        )
+        # Child resource usage is charged hierarchically and therefore mutates
+        # this process row even while its own quantum is running.  Serialize the
+        # read/modify/CAS sequence with those accounting writes; the repository
+        # still applies the ambient execution-token fence at ``patch_process``.
+        with self._processes.locked():
+            process = self._require_process(pid)
+            if process.memory_view is None:
+                process.memory_view = self._memory.create_view(pid, [handle], mode=ViewMode.MUTABLE)
+            elif all(existing.oid != handle.oid for existing in process.memory_view.roots):
+                process.memory_view.roots.insert(0, handle)
+            else:
+                process.memory_view.roots = [
+                    handle if existing.oid == handle.oid and "write" not in existing.rights else existing
+                    for existing in process.memory_view.roots
+                ]
+            process.updated_at = utc_now()
+            self._processes.patch_process(
+                pid,
+                {"memory_view": process.memory_view, "updated_at": process.updated_at},
+                expected_revision=process.revision,
+            )
 
     def _require_process(self, pid: str) -> AgentProcess:
         process = self._processes.get_process(pid)

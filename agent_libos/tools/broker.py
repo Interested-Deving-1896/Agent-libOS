@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import threading
 from collections.abc import Callable, Iterable
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -12,18 +13,27 @@ from agent_libos.human.manager import HumanObjectManager
 from agent_libos.llm.openai_schema import openai_chat_tool_schema
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
+    AgentObject,
     JIT_MULTIPLEXER_TOOL_NAME,
+    JITRehydrationSummary,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     ObjectOwnerKind,
     ObjectType,
     ToolCallResult,
+    ToolCandidate,
     ToolHandle,
     ToolSpec,
     ValidationResult,
 )
 from agent_libos.models.exceptions import NotFound, ValidationError
-from agent_libos.ports import AuditPort, DataFlowPort, EventPort, OperationPort
-from agent_libos.storage import RuntimeStore, UnitOfWork
+from agent_libos.ports import (
+    AuditPort,
+    DataFlowPort,
+    EventPort,
+    OperationPort,
+    RuntimePublicationReceiptRecorder,
+)
+from agent_libos.storage import UnitOfWork
 from agent_libos.tools.base import BaseAgentTool, SyncAgentTool
 from agent_libos.tools.execution import JITSyscallSession, ToolExecutionService
 from agent_libos.tools.jit import JITToolService
@@ -147,13 +157,12 @@ class ToolBroker:
 
     def __init__(
         self,
-        store: RuntimeStore,
+        unit_of_work: UnitOfWork,
         memory: ObjectMemoryManager,
         capabilities: CapabilityManager,
         human: HumanObjectManager,
         audit: AuditPort,
         events: EventPort,
-        unit_of_work: UnitOfWork,
         operations: OperationPort,
         data_flow: DataFlowPort,
         jit_session_factory: Callable[[str], JITSyscallSession],
@@ -167,7 +176,9 @@ class ToolBroker:
         lifecycle: Any | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
-        self.store = store
+        self.unit_of_work = unit_of_work
+        self.processes = unit_of_work.processes
+        self.objects = unit_of_work.objects
         self.extensions = unit_of_work.extensions
         self.memory = memory
         self.capabilities = capabilities
@@ -203,6 +214,9 @@ class ToolBroker:
             declared_permissions=_JIT_DECLARED_PERMISSIONS,
             resources=resources,
             images=images,
+            require_recovery_lease=(
+                lifecycle.require_recovery_lease if lifecycle is not None else None
+            ),
         )
         self.execution = ToolExecutionService(
             data_flow=data_flow,
@@ -238,6 +252,11 @@ class ToolBroker:
     def _registry_lifecycle_lock(self) -> threading.RLock:
         return self._registry_lifecycle_lock_value
 
+    def _mutation_admission(self) -> Any:
+        if self._lifecycle is None:
+            return nullcontext()
+        return self._lifecycle.admit()
+
     def has_side_effects(self, tool: ToolHandle | str) -> bool:
         """Inspect the declared side-effect policy through the public broker."""
 
@@ -249,14 +268,36 @@ class ToolBroker:
         registered_by: str = "runtime",
         scope: str = "static",
         ephemeral: bool = False,
+        publication_id: str | None = None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
     ) -> ToolHandle:
-        with self._registry_lifecycle_lock():
-            return self._register_tool_locked(
-                tool,
-                registered_by=registered_by,
-                scope=scope,
-                ephemeral=ephemeral,
-            )
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            if publication_id is None:
+                return self._register_tool_locked(
+                    tool,
+                    registered_by=registered_by,
+                    scope=scope,
+                    ephemeral=ephemeral,
+                )
+            handle: ToolHandle | None = None
+            try:
+                with self.unit_of_work.transaction():
+                    handle = self._register_tool_locked(
+                        tool,
+                        registered_by=registered_by,
+                        scope=scope,
+                        ephemeral=ephemeral,
+                    )
+                    self._record_publication_tool(
+                        publication_id,
+                        handle,
+                        receipt_recorder=receipt_recorder,
+                    )
+            except BaseException:
+                if handle is not None:
+                    self.registry.discard_loaded_registration(handle)
+                raise
+            return handle
 
     def _register_tool_locked(
         self,
@@ -278,7 +319,7 @@ class ToolBroker:
         *,
         registered_by: str | None = None,
     ) -> bool:
-        with self._registry_lifecycle_lock():
+        with self._mutation_admission(), self._registry_lifecycle_lock():
             return self._unregister_tool_locked(
                 tool,
                 registered_by=registered_by,
@@ -287,7 +328,7 @@ class ToolBroker:
     def discard_tool_registration(self, handle: ToolHandle) -> bool:
         """Remove a captured in-memory tool after a failed module rollback."""
 
-        with self._registry_lifecycle_lock():
+        with self._mutation_admission(), self._registry_lifecycle_lock():
             return self.registry.discard_loaded_registration(handle)
 
     def _unregister_tool_locked(
@@ -304,17 +345,36 @@ class ToolBroker:
         tools: builtins.list[ToolHandle | str],
         assigned_by: str = "tool_broker",
     ) -> dict[str, str]:
-        process = self.store.get_process(pid)
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            return self._configure_process_tools(pid, tools, assigned_by=assigned_by)
+
+    def _configure_process_tools(
+        self,
+        pid: str,
+        tools: builtins.list[ToolHandle | str],
+        *,
+        assigned_by: str,
+    ) -> dict[str, str]:
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
-        table: dict[str, str] = {}
+        resolved: dict[str, ToolHandle] = {}
         for tool in tools:
             handle = self.resolve(tool)
-            table[handle.name] = handle.tool_id
+            resolved[handle.name] = handle
+        self.jit.preflight_process_bindings(
+            pid,
+            resolved.values(),
+            assigned_by=assigned_by,
+        )
+        table = {
+            name: handle.tool_id
+            for name, handle in resolved.items()
+        }
         process.tool_table = table
         process.model_tool_table = dict(table)
         process.updated_at = utc_now()
-        self.store.patch_process(
+        self.processes.patch_process(
             pid,
             {
                 "tool_table": process.tool_table,
@@ -332,20 +392,21 @@ class ToolBroker:
         return table
 
     def grant_execute(self, pid: str, tool: ToolHandle | str, issued_by: str = "tool_broker") -> str:
-        handle = self.resolve(tool, pid=pid)
-        if not self.registry.process_has_tool(pid, handle):
-            raise ValidationError(
-                "tool execute capabilities are not a resource authority; configure process tools at creation time"
+        with self._mutation_admission():
+            handle = self.resolve(tool, pid=pid)
+            if not self.registry.process_has_tool(pid, handle):
+                raise ValidationError(
+                    "tool execute capabilities are not a resource authority; configure process tools at creation time"
+                )
+            self.audit.record(
+                actor=issued_by,
+                action="tool.execute_grant_ignored",
+                target=f"tool:{handle.tool_id}",
+                decision={
+                    "tool": handle.name,
+                    "reason": "tool calls are allowed by process tool table, not execute capability",
+                },
             )
-        self.audit.record(
-            actor=issued_by,
-            action="tool.execute_grant_ignored",
-            target=f"tool:{handle.tool_id}",
-            decision={
-                "tool": handle.name,
-                "reason": "tool calls are allowed by process tool table, not execute capability",
-            },
-        )
         return handle.tool_id
 
     def process_has_tool(self, pid: str, tool: ToolHandle | str) -> bool:
@@ -366,14 +427,39 @@ class ToolBroker:
         source_code: str,
         tests: builtins.list[dict[str, Any]] | None = None,
         requested_capabilities: builtins.list[dict[str, Any]] | None = None,
+        publication_id: str | None = None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
     ) -> str:
-        return self.jit.propose(
-            pid,
-            spec,
-            source_code,
-            tests=tests,
-            requested_capabilities=requested_capabilities,
-        )
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            if publication_id is None:
+                return self.jit.propose(
+                    pid,
+                    spec,
+                    source_code,
+                    tests=tests,
+                    requested_capabilities=requested_capabilities,
+                )
+            with self.unit_of_work.transaction(include_object_payloads=True):
+                candidate_id, descriptor_oid = self.jit.propose_with_descriptor(
+                    pid,
+                    spec,
+                    source_code,
+                    tests=tests,
+                    requested_capabilities=requested_capabilities,
+                )
+                self._record_publication_artifact(
+                    publication_id,
+                    {
+                        "artifact_id": f"candidate:{candidate_id}",
+                        "kind": "tool_candidate",
+                        "candidate_id": candidate_id,
+                        "descriptor_state": "object",
+                        "descriptor_oid": descriptor_oid,
+                        "pid": pid,
+                    },
+                    receipt_recorder=receipt_recorder,
+                )
+            return candidate_id
 
     def validate(
         self,
@@ -381,7 +467,8 @@ class ToolBroker:
         *,
         pid: str | None = None,
     ) -> ValidationResult:
-        return self.jit.validate(candidate_id, pid=pid)
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            return self.jit.validate(candidate_id, pid=pid)
 
     def register(
         self,
@@ -390,15 +477,39 @@ class ToolBroker:
         approver: str = "policy:local",
         scope: str = "ephemeral_process",
         replace_tool_id: str | None = None,
+        publication_id: str | None = None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
     ) -> ToolHandle:
-        with self._registry_lifecycle_lock():
-            return self._register_jit_locked(
-                pid,
-                candidate_id,
-                approver=approver,
-                scope=scope,
-                replace_tool_id=replace_tool_id,
-            )
+        with self._mutation_admission():
+            with self._registry_lifecycle_lock():
+                if publication_id is None:
+                    return self._register_jit_locked(
+                        pid,
+                        candidate_id,
+                        approver=approver,
+                        scope=scope,
+                        replace_tool_id=replace_tool_id,
+                    )
+                handle: ToolHandle | None = None
+                try:
+                    with self.unit_of_work.transaction():
+                        handle = self._register_jit_locked(
+                            pid,
+                            candidate_id,
+                            approver=approver,
+                            scope=scope,
+                            replace_tool_id=replace_tool_id,
+                        )
+                        self._record_publication_tool(
+                            publication_id,
+                            handle,
+                            receipt_recorder=receipt_recorder,
+                        )
+                except BaseException:
+                    if handle is not None:
+                        self.registry.forget_jit(handle.tool_id)
+                    raise
+                return handle
 
     def _register_jit_locked(
         self,
@@ -416,41 +527,79 @@ class ToolBroker:
             replace_tool_id=replace_tool_id,
         )
 
+    def _record_publication_tool(
+        self,
+        publication_id: str,
+        handle: ToolHandle,
+        *,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+    ) -> None:
+        self._record_publication_artifact(
+            publication_id,
+            {
+                "artifact_id": f"tool:{handle.tool_id}",
+                "kind": "tool",
+                "tool_id": handle.tool_id,
+                "name": handle.name,
+            },
+            receipt_recorder=receipt_recorder,
+        )
+
+    def _record_publication_artifact(
+        self,
+        publication_id: str,
+        artifact: dict[str, Any],
+        *,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None,
+    ) -> None:
+        recorder = (
+            receipt_recorder
+            if receipt_recorder is not None
+            else self.unit_of_work.publications
+        )
+        if not recorder.record_runtime_publication_artifact(
+            publication_id,
+            artifact,
+            expected_states={"planning", "applying"},
+        ):
+            raise ValidationError(
+                "runtime publication changed while recording tool artifact: "
+                f"{publication_id}"
+            )
+
     def discard_candidate(
         self,
         pid: str,
         candidate_id: str,
         *,
+        descriptor_oid: str | None = None,
+        exact_descriptor: bool = False,
         discarded_by: str = "tool_broker",
         reason: str = "candidate_abandoned",
     ) -> bool:
         """Delete an unpublished candidate and its Object Memory descriptor."""
 
-        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
-            candidate = self.store.get_tool_candidate(candidate_id)
+        with (
+            self._mutation_admission(),
+            self._registry_lifecycle_lock(),
+            self.memory.ownership_locked(),
+            self.unit_of_work.transaction(include_object_payloads=True),
+        ):
+            candidate = self.extensions.get_tool_candidate(candidate_id)
             if candidate is not None:
                 self.jit.require_candidate_owner(candidate, pid)
-                registered_tool_id = candidate.registered_tool_id
-                tool_exists = bool(
-                    registered_tool_id
-                    and any(row["tool_id"] == registered_tool_id for row in self.store.list_tools())
-                )
-                alias_exists = bool(
-                    registered_tool_id
-                    and any(
-                        registered_tool_id in process.tool_table.values()
-                        for process in self.store.list_processes()
-                    )
-                )
-                if tool_exists or alias_exists:
+                if self._candidate_has_registered_artifacts(
+                    pid,
+                    candidate,
+                    exact_lookup=exact_descriptor,
+                ):
                     raise ValidationError(f"cannot discard a registered tool candidate: {candidate_id}")
-            candidate_objects = [
-                obj
-                for obj in self.store.list_objects_owned_by(ObjectOwnerKind.PROCESS, pid)
-                if obj.type == ObjectType.TOOL_CANDIDATE
-                and isinstance(obj.payload, dict)
-                and obj.payload.get("candidate_id") == candidate_id
-            ]
+            candidate_objects = self._candidate_descriptor_objects(
+                pid,
+                candidate_id,
+                descriptor_oid=descriptor_oid,
+                exact_lookup=exact_descriptor,
+            )
             if candidate is None and not candidate_objects:
                 return False
             for obj in candidate_objects:
@@ -468,6 +617,87 @@ class ToolBroker:
                 decision={"pid": pid, "reason": reason},
             )
         return True
+
+    def _candidate_has_registered_artifacts(
+        self,
+        pid: str,
+        candidate: ToolCandidate,
+        *,
+        exact_lookup: bool,
+    ) -> bool:
+        registered_tool_id = candidate.registered_tool_id
+        if not registered_tool_id:
+            return False
+        if exact_lookup:
+            tool_exists = registered_tool_id in self.extensions.get_existing_tool_ids(
+                (registered_tool_id,)
+            )
+            process = self.processes.get_process(pid)
+            local_alias_exists = bool(
+                process is not None
+                and registered_tool_id
+                in {
+                    *process.tool_table.values(),
+                    *process.model_tool_table.values(),
+                }
+            )
+            outside_alias_exists = (
+                self.processes.tool_id_referenced_outside_process(
+                    registered_tool_id,
+                    excluding_pid=pid,
+                )
+            )
+            return tool_exists or local_alias_exists or outside_alias_exists
+        tool_exists = any(
+            row["tool_id"] == registered_tool_id
+            for row in self.extensions.list_tools()
+        )
+        alias_exists = any(
+            registered_tool_id
+            in {
+                *process.tool_table.values(),
+                *process.model_tool_table.values(),
+            }
+            for process in self.processes.list_processes()
+        )
+        return tool_exists or alias_exists
+
+    def _candidate_descriptor_objects(
+        self,
+        pid: str,
+        candidate_id: str,
+        *,
+        descriptor_oid: str | None,
+        exact_lookup: bool,
+    ) -> list[AgentObject]:
+        if not exact_lookup:
+            return [
+                obj
+                for obj in self.objects.list_objects_owned_by(
+                    ObjectOwnerKind.PROCESS,
+                    pid,
+                )
+                if obj.type == ObjectType.TOOL_CANDIDATE
+                and isinstance(obj.payload, dict)
+                and obj.payload.get("candidate_id") == candidate_id
+            ]
+        if descriptor_oid is None:
+            return []
+        obj = self.objects.get_object(descriptor_oid)
+        if obj is None:
+            return []
+        if (
+            obj.owner_kind != ObjectOwnerKind.PROCESS
+            or obj.owner_id != pid
+            or obj.type != ObjectType.TOOL_CANDIDATE
+            or not isinstance(obj.payload, dict)
+            or obj.payload.get("candidate_id") != candidate_id
+        ):
+            raise ValidationError(
+                "tool candidate descriptor receipt identity mismatch: "
+                f"{candidate_id} -> {descriptor_oid}"
+            )
+        return [obj]
 
     def call(
         self,
@@ -531,11 +761,19 @@ class ToolBroker:
 
     def visible_tools(self, pid: str) -> builtins.list[dict[str, Any]]:
         visible_ids = self._visible_tool_ids(pid)
-        return [row for row in self.store.list_tools() if row["tool_id"] in visible_ids]
+        return [
+            row
+            for row in self.extensions.list_tools()
+            if row["tool_id"] in visible_ids
+        ]
 
     def model_visible_tools(self, pid: str) -> builtins.list[dict[str, Any]]:
         visible_ids = self._model_visible_tool_ids(pid)
-        rows = [row for row in self.store.list_tools() if row["tool_id"] in visible_ids]
+        rows = [
+            row
+            for row in self.extensions.list_tools()
+            if row["tool_id"] in visible_ids
+        ]
         if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
             return rows
         static_rows = [
@@ -553,7 +791,7 @@ class ToolBroker:
         return [name for name in _LAZY_TOOL_CORE if name in allowed]
 
     def tool_groups(self, pid: str) -> list[dict[str, Any]]:
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         image = self._images.get(process.image_id)
@@ -583,7 +821,7 @@ class ToolBroker:
         configured = _TOOL_GROUPS.get(selected_group)
         if configured is None:
             raise ValidationError(f"unknown tool group: {selected_group}")
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         image = self._images.get(process.image_id)
@@ -621,7 +859,21 @@ class ToolBroker:
         *,
         assigned_by: str,
     ) -> dict[str, str]:
-        process = self.store.get_process(pid)
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            return self._configure_model_tool_projection(
+                pid,
+                tools,
+                assigned_by=assigned_by,
+            )
+
+    def _configure_model_tool_projection(
+        self,
+        pid: str,
+        tools: builtins.list[ToolHandle | str],
+        *,
+        assigned_by: str,
+    ) -> dict[str, str]:
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         table: dict[str, str] = {}
@@ -632,7 +884,7 @@ class ToolBroker:
             table[handle.name] = handle.tool_id
         process.model_tool_table = table
         process.updated_at = utc_now()
-        self.store.patch_process(
+        self.processes.patch_process(
             pid,
             {
                 "model_tool_table": process.model_tool_table,
@@ -660,7 +912,7 @@ class ToolBroker:
         }
 
     def model_loaded_skills(self, pid: str) -> dict[str, Any]:
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         hidden = self._hidden_jit_tool_names(pid)
@@ -705,7 +957,7 @@ class ToolBroker:
                 continue
             if multiplex_jit:
                 continue
-            spec = self.store.get_tool_spec(tool_id)
+            spec = self.extensions.get_tool_spec(tool_id)
             if spec is None:
                 continue
             schemas.append(openai_chat_tool_schema(spec.name, spec.description, spec.input_schema))
@@ -748,7 +1000,7 @@ class ToolBroker:
     def _is_visible_jit_name(self, pid: str, name: str) -> bool:
         if not name:
             return False
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         tool_id = process.tool_table.get(name)
@@ -757,7 +1009,7 @@ class ToolBroker:
     def _hidden_jit_tool_names(self, pid: str) -> set[str]:
         if self._jit_exposure_for_process(pid) != JIT_TOOL_EXPOSURE_MULTIPLEXED:
             return set()
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         return {
@@ -810,7 +1062,7 @@ class ToolBroker:
         handle = self.registry.handle(tool_id)
         if handle is not None:
             return (handle.name, tool_id)
-        spec = self.store.get_tool_spec(tool_id)
+        spec = self.extensions.get_tool_spec(tool_id)
         if spec is not None:
             return (spec.name, tool_id)
         return (tool_id, tool_id)
@@ -838,6 +1090,44 @@ class ToolBroker:
     def loaded_tool_handle(self, tool_id: str) -> ToolHandle | None:
         return self.registry.handle(tool_id)
 
+    def reconstruct_persisted_jit_handles(
+        self,
+        sources: dict[str, str],
+    ) -> dict[str, ToolHandle]:
+        """Rebuild trusted rollback handles from matching durable JIT rows."""
+
+        if not sources:
+            return {}
+        tool_rows = {
+            str(row["tool_id"]): row
+            for row in self.extensions.list_tools()
+        }
+        candidates = {
+            str(row.get("registered_tool_id") or ""): row
+            for row in self.extensions.list_registered_tool_candidate_rows()
+            if row.get("registered_tool_id")
+        }
+        handles: dict[str, ToolHandle] = {}
+        for tool_id, source in sources.items():
+            row = tool_rows.get(str(tool_id))
+            candidate = candidates.get(str(tool_id))
+            if (
+                row is None
+                or candidate is None
+                or not bool(row.get("ephemeral"))
+                or str(candidate.get("source_code") or "") != str(source)
+            ):
+                raise ValidationError(
+                    f"durable JIT rollback state is incomplete: {tool_id}"
+                )
+            handles[str(tool_id)] = ToolHandle(
+                tool_id=str(tool_id),
+                name=str(row["name"]),
+                capability_id=None,
+                scope=str(row["scope"]),
+            )
+        return handles
+
     def loaded_tool_handles(self) -> tuple[ToolHandle, ...]:
         return self.registry.loaded_handles()
 
@@ -858,10 +1148,12 @@ class ToolBroker:
         handles: dict[str, ToolHandle],
         sources: dict[str, str],
     ) -> None:
-        self.registry.restore_loaded_jit_state(handles, sources)
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            self.registry.restore_loaded_jit_state(handles, sources)
 
     def forget_loaded_jit(self, tool_id: str) -> None:
-        self.registry.forget_jit(tool_id)
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            self.registry.forget_jit(tool_id)
 
     def install_committed_jit(
         self,
@@ -872,27 +1164,66 @@ class ToolBroker:
         spec: ToolSpec,
         source_code: str,
         registered_by: str,
+        publication_id: str | None = None,
+        receipt_recorder: RuntimePublicationReceiptRecorder | None = None,
     ) -> ToolHandle:
-        return self.jit.install_committed(
-            pid,
-            name=name,
-            scope=scope,
-            spec=spec,
-            source_code=source_code,
-            registered_by=registered_by,
-        )
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            if publication_id is None:
+                handle, _candidate_id = self.jit.install_committed(
+                    pid,
+                    name=name,
+                    scope=scope,
+                    spec=spec,
+                    source_code=source_code,
+                    registered_by=registered_by,
+                )
+                return handle
+            handle: ToolHandle | None = None
+            try:
+                with self.unit_of_work.transaction():
+                    handle, candidate_id = self.jit.install_committed(
+                        pid,
+                        name=name,
+                        scope=scope,
+                        spec=spec,
+                        source_code=source_code,
+                        registered_by=registered_by,
+                    )
+                    self._record_publication_artifact(
+                        publication_id,
+                        {
+                            "artifact_id": f"candidate:{candidate_id}",
+                            "kind": "tool_candidate",
+                            "candidate_id": candidate_id,
+                            "descriptor_state": "not_created",
+                            "descriptor_oid": None,
+                            "pid": pid,
+                        },
+                        receipt_recorder=receipt_recorder,
+                    )
+                    self._record_publication_tool(
+                        publication_id,
+                        handle,
+                        receipt_recorder=receipt_recorder,
+                    )
+            except BaseException:
+                if handle is not None:
+                    self.registry.forget_jit(handle.tool_id)
+                raise
+            return handle
 
-    def rehydrate_registered_jit_tools(self) -> dict[str, list[dict[str, str]]]:
-        return self.jit.rehydrate_registered()
+    def rehydrate_registered_jit_tools(self) -> JITRehydrationSummary:
+        with self._mutation_admission(), self._registry_lifecycle_lock():
+            return self.jit.rehydrate_registered()
 
     def _visible_tool_ids(self, pid: str) -> set[str]:
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         return set(process.tool_table.values())
 
     def _model_visible_tool_ids(self, pid: str) -> set[str]:
-        process = self.store.get_process(pid)
+        process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
         return set(process.model_tool_table.values())

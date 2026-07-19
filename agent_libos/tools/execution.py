@@ -5,6 +5,7 @@ import inspect
 import threading
 import time
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -33,9 +34,15 @@ from agent_libos.models.exceptions import (
     HumanApprovalRequired,
     NotFound,
     ProcessMessageWaitRequired,
+    ProcessRevisionConflict,
     ProcessWaitRequired,
     ResourceLimitExceeded,
     ValidationError,
+)
+from agent_libos.process_execution import (
+    current_process_execution_token,
+    trusted_post_exec_completion_mutation,
+    trusted_terminal_process_mutation,
 )
 from agent_libos.ports import AuditPort, DataFlowPort, EventPort, OperationPort
 from agent_libos.storage.repositories import (
@@ -58,6 +65,10 @@ from agent_libos.tools.observability import ensure_json_size, sanitize_for_obser
 from agent_libos.tools.registry import ToolRegistry
 from agent_libos.tools.sandbox import SandboxBackend, SandboxExecutionResult
 from agent_libos.utils.ids import new_id
+from agent_libos.utils.public_errors import (
+    provider_error_envelope,
+    public_exception_message,
+)
 
 
 _TERMINAL_PROCESS_STATUSES = {
@@ -670,7 +681,7 @@ class ToolExecutionService:
         *,
         policy_decision: str,
     ) -> ToolCallResult:
-        error = str(exc)
+        error = public_exception_message(exc)
         observed = self._error_observation(error)
         result_handle = self._persist_exception_tool_failure(
             invocation,
@@ -794,18 +805,19 @@ class ToolExecutionService:
         ) as result_scope:
             flow = self._data_flow.current_context()
             parent_oids, durable_source_refs = self._data_flow.provenance_sources(flow)
-            result_handle = result_scope.create_object(
-                pid=invocation.pid,
-                object_type=ObjectType.TOOL_RESULT,
-                payload=output.result_payload,
-                metadata=self._tool_result_metadata(invocation.handle),
-                provenance=Provenance(
-                    created_from_action=f"tool.{invocation.handle.name}",
-                    parent_oids=list(parent_oids),
-                    source_refs=list(durable_source_refs),
-                ),
-                immutable=True,
-            )
+            with self._result_process_mutation_scope(invocation):
+                result_handle = result_scope.create_object(
+                    pid=invocation.pid,
+                    object_type=ObjectType.TOOL_RESULT,
+                    payload=output.result_payload,
+                    metadata=self._tool_result_metadata(invocation.handle),
+                    provenance=Provenance(
+                        created_from_action=f"tool.{invocation.handle.name}",
+                        parent_oids=list(parent_oids),
+                        source_refs=list(durable_source_refs),
+                    ),
+                    immutable=True,
+                )
             if output.jit_session is not None:
                 try:
                     await output.jit_session.apply_deferred_lifecycle(result_handle)
@@ -850,6 +862,78 @@ class ToolExecutionService:
             result_handle=result_handle,
             payload=output.payload,
             ok=True,
+        )
+
+    def _result_process_mutation_scope(self, invocation: _Invocation) -> Any:
+        if invocation.handle.name == "exec_process":
+            return self._post_exec_result_scope(invocation)
+        if invocation.handle.name != "process_exit":
+            return nullcontext()
+        process = self._processes.get_process(invocation.pid)
+        if process is None:
+            raise ProcessRevisionConflict(
+                f"process disappeared before terminal tool-result persistence: {invocation.pid}"
+            )
+        return trusted_terminal_process_mutation(
+            invocation.pid,
+            expected_revision=process.revision,
+            expected_generation=process.execution_generation,
+            allowed_statuses={ProcessStatus.EXITED},
+            execution_token=current_process_execution_token(),
+            reason="process_exit appends its terminal tool-result capability",
+        )
+
+    def _post_exec_result_scope(self, invocation: _Invocation) -> Any:
+        token = current_process_execution_token()
+        if token is None:
+            return nullcontext()
+        operation = self._operations.current()
+        if (
+            operation is None
+            or operation.name != "tool.exec_process"
+            or operation.actor != invocation.pid
+            or operation.pid != invocation.pid
+        ):
+            raise ProcessRevisionConflict(
+                f"committed exec has no exact ToolResult operation binding: {invocation.pid}"
+            )
+        publications = [
+            candidate
+            for candidate in self._evidence.list_operations(
+                root_operation_id=operation.root_operation_id
+            )
+            if candidate.parent_operation_id == operation.operation_id
+            and candidate.name == "process.exec"
+            and candidate.actor == invocation.pid
+            and candidate.pid == invocation.pid
+            and candidate.metadata.get("runtime_publication_kind") == "process_exec"
+            and candidate.metadata.get("runtime_publication_bound") is True
+        ]
+        if len(publications) != 1:
+            raise ProcessRevisionConflict(
+                f"committed exec ToolResult binding is not unique: {invocation.pid}"
+            )
+        publication_operation = publications[0]
+        publication_id = str(
+            publication_operation.metadata.get("runtime_publication_id") or ""
+        )
+        if not publication_id:
+            raise ProcessRevisionConflict(
+                f"committed exec publication id is missing: {invocation.pid}"
+            )
+        process = self._processes.get_process(invocation.pid)
+        if process is None:
+            raise ProcessRevisionConflict(
+                f"process disappeared before exec ToolResult persistence: {invocation.pid}"
+            )
+        return trusted_post_exec_completion_mutation(
+            invocation.pid,
+            publication_id=publication_id,
+            operation_id=publication_operation.operation_id,
+            expected_revision=process.revision,
+            expected_generation=process.execution_generation,
+            execution_token=token,
+            reason="exec_process appends its committed ToolResult capability",
         )
 
     def _lifecycle_error_result(
@@ -915,6 +999,9 @@ class ToolExecutionService:
         flow = self._data_flow.current_context()
         if flow == DataFlowContext():
             return None
+        process = self._processes.get_process(invocation.pid)
+        if process is None or process.status in _TERMINAL_PROCESS_STATUSES:
+            return None
         carrier_payload: dict[str, Any] = {
             "tool_id": invocation.handle.tool_id,
             "tool_name": invocation.handle.name,
@@ -936,26 +1023,32 @@ class ToolExecutionService:
                 "reason": str(exc),
                 "metadata": {"data_flow_context": flow.to_dict()},
             }
-        with self._memory.lifetime_scope(
-            actor=invocation.resource,
-            owner_kind=ObjectOwnerKind.PROCESS,
-            owner_id=invocation.pid,
-            reason="tool_failure_result",
-        ) as result_scope:
-            parent_oids, durable_source_refs = self._data_flow.provenance_sources(flow)
-            result_handle = result_scope.create_object(
-                pid=invocation.pid,
-                object_type=ObjectType.TOOL_RESULT,
-                payload=carrier_payload,
-                metadata=self._tool_result_metadata(invocation.handle),
-                provenance=Provenance(
-                    created_from_action=f"tool.{invocation.handle.name}.failure",
-                    parent_oids=list(parent_oids),
-                    source_refs=list(durable_source_refs),
-                ),
-                immutable=True,
-            )
-            result_scope.commit()
+        try:
+            with self._memory.lifetime_scope(
+                actor=invocation.resource,
+                owner_kind=ObjectOwnerKind.PROCESS,
+                owner_id=invocation.pid,
+                reason="tool_failure_result",
+            ) as result_scope:
+                parent_oids, durable_source_refs = self._data_flow.provenance_sources(flow)
+                result_handle = result_scope.create_object(
+                    pid=invocation.pid,
+                    object_type=ObjectType.TOOL_RESULT,
+                    payload=carrier_payload,
+                    metadata=self._tool_result_metadata(invocation.handle),
+                    provenance=Provenance(
+                        created_from_action=f"tool.{invocation.handle.name}.failure",
+                        parent_oids=list(parent_oids),
+                        source_refs=list(durable_source_refs),
+                    ),
+                    immutable=True,
+                )
+                result_scope.commit()
+        except ProcessRevisionConflict:
+            latest = self._processes.get_process(invocation.pid)
+            if latest is None or latest.status in _TERMINAL_PROCESS_STATUSES:
+                return None
+            raise
         return result_handle
 
     def _persist_exception_tool_failure(
@@ -966,14 +1059,31 @@ class ToolExecutionService:
         policy_decision: str,
         message: str | None = None,
     ) -> ObjectHandle | None:
+        public_error = provider_error_envelope(error)
+        error_payload: dict[str, Any] = {
+            "type": (
+                public_error["error_type"]
+                if public_error is not None
+                else type(error).__name__
+            ),
+            "message": (
+                public_error["message"]
+                if public_error is not None
+                else message if message is not None else str(error)
+            ),
+        }
+        if public_error is not None:
+            error_payload.update(
+                {
+                    key: public_error[key]
+                    for key in ("code", "error_type", "correlation_id")
+                }
+            )
         return self._persist_labeled_tool_failure(
             invocation,
             payload={
                 "ok": False,
-                "error": {
-                    "type": type(error).__name__,
-                    "message": message if message is not None else str(error),
-                },
+                "error": error_payload,
                 "policy_decision": policy_decision,
             },
         )

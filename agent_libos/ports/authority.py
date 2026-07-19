@@ -6,6 +6,7 @@ from typing import Any, Protocol
 from agent_libos.models import (
     AgentProcess,
     Capability,
+    CapabilityStatus,
     DataLabels,
     TaskAuthorityManifest,
 )
@@ -31,6 +32,16 @@ class CapabilityStorePort(Protocol):
         ...
 
     def update_capability(self, cap: Capability) -> None:
+        ...
+
+    def transition_capability_status(
+        self,
+        cap_id: str,
+        *,
+        expected_status: CapabilityStatus,
+        status: CapabilityStatus,
+        metadata: dict[str, Any],
+    ) -> Capability | None:
         ...
 
     def get_capability(self, cap_id: str) -> Capability | None:

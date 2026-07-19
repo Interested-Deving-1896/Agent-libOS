@@ -1,0 +1,201 @@
+# Evidence and LLM Payload Retention
+
+Agent libOS keeps evidence rows and their causal identity. Payload retention is
+a separate, explicit maintenance operation: it reduces selected terminal
+provider payloads without deleting `llm_calls`, `external_effects`, audit/event
+links, provider identities, effect identities, idempotency keys, timestamps, or
+canonical argument hashes.
+
+The implementation lives in
+`agent_libos.evidence.payload_retention.PayloadRetentionMaintenance`. Its
+default `PayloadRetentionPolicy()` is disabled. Runtime startup never runs
+retention implicitly.
+
+## Monotonic tiers
+
+Payloads move in one direction:
+
+```text
+full -> summary -> hash_only
+```
+
+- `full` is the value originally written by the provider boundary.
+- `summary` is a content-free envelope. It contains only schema version, JSON
+  kind, byte count, top-level item count where applicable, and the SHA-256 of
+  the original canonical JSON. It contains no preview, keys, scalar values, or
+  model-generated paraphrase.
+- `hash_only` retains only the envelope schema/tier and original SHA-256.
+
+The reducer preserves the original field hashes across both transitions and
+stores an aggregate LLM payload hash. A maintenance pass cannot upgrade a row
+or skip directly from `full` to `hash_only`.
+
+External-effect tier and original payload digest are stored as dedicated
+record-level provenance columns. Provider metadata and receipts never establish
+their own retention tier merely by resembling an internal envelope. New effect
+inserts and provider finalization accept only `full`; the retention CAS is the
+only store operation that can advance those provenance columns.
+
+For LLM calls the payload fields are messages, visible tools, response content,
+tool calls, reasoning, raw provider response, and provider error text. Call
+identity, process/image, purpose, provider/model/request/response ids, request
+options, usage, status, and timestamps remain intact. For external effects the
+provider metadata and provider receipt are reduced; ledger identity and
+classification remain intact.
+
+The LLM marker remains the authoritative payload provenance. Storage also
+persists its current tier as a checked indexing projection. Inserts derive that
+projection from the marker, retention compare-and-swap updates advance both in
+one statement, and row decoding fails closed if they disagree. This permits an
+exact cross-backend eligibility index without parsing provider-controlled JSON
+inside SQL.
+
+## Rows that are never reduced
+
+External effects are eligible only when both conditions hold:
+
+- `effect_state == finalized`; and
+- `transaction_state` is `committed`, `failed`, or `compensated`.
+
+`pending`, `prepared`, `authorized`, `approved`, `dispatched`, and `unknown`
+effects are never reduced. The service checks this before mutation, and the
+backend compare-and-swap must repeat the state check in the update statement so
+a reconciliation race cannot trim a newly nonterminal row.
+
+LLM calls are eligible only after `status` is `ok` or `error` and
+`completed_at` is durable. The following terminal records remain protected
+runtime dependencies until their executable semantics have a separate durable
+projection:
+
+- the unique latest OpenAI Responses call for a `(pid, purpose)` chain, when
+  that call is eligible to supply provider-side continuation state; and
+- a tool-call record carrying the `process_exit` payload used to recover a
+  missing context-compressor result.
+
+The second rule also protects a legacy, truncated tool-call observation whose
+contents cannot be proven safe to discard. This is intentionally conservative:
+retaining an old payload is preferable to breaking a live/pending continuation
+or silently losing recovery state.
+
+The head decision exactly matches runtime lookup ordering: all calls for the
+same `(pid, purpose)` participate, without filtering status first, and the
+greatest `(created_at, call_id)` under the backend's bytewise keyset collation is
+the head. Thus a newer pending or failed attempt prevents an older successful
+Responses call from being treated as resumable, and older eligible Responses
+rows can advance through the configured retention tiers. A row without a
+process id cannot be selected by the runtime lookup and is therefore not a
+chain head. The bounded storage query classifies heads with an indexed
+correlated seek; it does not issue one lookup per candidate. The retention CAS
+repeats the "a newer call exists" fence before reducing any Responses row
+classified as non-head.
+
+## Explicit maintenance API
+
+Runtime configuration is the Host-owned policy source. Retention is disabled
+unless it is explicitly enabled with a summary age; the hash-only age and page
+limits are optional:
+
+```yaml
+runtime:
+  payload_retention_enabled: true
+  payload_retention_summary_after_seconds: 2592000
+  payload_retention_hash_only_after_seconds: 7776000
+  payload_retention_page_size: 100
+  payload_retention_page_hard_limit: 1000
+```
+
+`RuntimeBuilder` derives one immutable policy from those exact settings and
+exposes lifecycle-gated maintenance at `runtime.payload_retention`. A caller
+submits one dataset per request:
+
+```python
+from agent_libos.evidence.payload_retention import (
+    PayloadRetentionKind,
+    PayloadRetentionRequest,
+)
+
+preview = runtime.payload_retention.run(
+    PayloadRetentionRequest(
+        kind=PayloadRetentionKind.LLM_CALL,
+        dry_run=True,
+    )
+)
+```
+
+The CLI performs one page at a time and defaults to preview. Mutation requires
+both enabled configuration and the explicit `--apply` flag:
+
+```console
+agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call
+agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention llm_call --apply
+agent-libos --config config.yaml --db .agent_libos.sqlite payload-retention external_effect --apply
+```
+
+Use the returned `next_cursor.created_at` and `next_cursor.record_id` as
+`--after-created-at` and `--after-record-id` for the next page. Startup only
+constructs the maintenance service; it never invokes a scan or mutation.
+
+Every call is bounded. A page is ordered by `(created_at, record_id)` and may
+return an opaque keyset cursor for the next call. A request cannot exceed the
+policy hard limit. `dry_run=True` performs the same eligibility decisions but
+does not update a payload.
+
+The SQL adapters push the coarse age cutoff, terminal-state predicate, and
+`full`/`summary` tier predicate into the keyset query. Consequently durable
+nonterminal and `hash_only` history does not consume a page and is not scanned
+again on every maintenance run. The service repeats all terminal, runtime
+dependency, timestamp, and monotonic-tier checks before planning a mutation;
+the optimization therefore narrows storage candidates without weakening the
+retention safety rules.
+
+Every disabled, dry-run, and applied request writes one
+`evidence.payload_retention.maintenance` audit summary. The summary contains
+only counts, policy ages, an SHA-256 of the candidate-id set, and an SHA-256 of
+the next cursor. Candidate ids and source payloads are not copied into audit.
+Applied updates and that audit row run under the same store transaction, so an
+audit failure rolls back the batch.
+
+## `persist_full_io` compatibility
+
+`llm.persist_full_io=true` remains the write-time choice for full LLM I/O.
+`persist_full_io=false` rows written by earlier releases contain bounded
+observation previews. The retention service recognizes those rows as the
+summary tier and can normalize them to the new content-free summary envelope;
+it never restores missing content. A legacy truncated tool-call preview remains
+protected when runtime-dependency safety cannot be proven.
+
+Retention is therefore an additional maximum-retention policy, not an override
+that can weaken `persist_full_io=false` or reconstruct redacted data. Operators
+should normally run and inspect a dry-run page before applying it.
+
+## Backend contract
+
+SQLite and PostgreSQL adapters implement the typed
+`PayloadRetentionStore` protocol:
+
+- keyset scans for LLM calls and external effects accept `older_than`, `after`,
+  and `limit` and return at most the requested limit;
+- each LLM page identifies every continuation-capable candidate that is the
+  actual latest call for its `(pid, purpose)` chain;
+- update methods compare the expected record-level tier and aggregate payload
+  hash;
+- the external-effect update also compares `effect_state` and
+  `transaction_state` and only accepts terminal values; and
+- all mutations use the caller's transaction, allowing the audit row and batch
+  to commit atomically.
+
+Both adapters create partial composite indexes over the terminal, non-
+`hash_only` population. Their leading `(created_at, stable_id)` keys satisfy
+the keyset order. Resumed pages express the lower bound as the SQL row-value
+comparison `(created_at, stable_id) > (?, ?)`, allowing the adapter to seek to
+the cursor instead of filtering the already-visited index prefix. The remaining
+predicate columns make the candidate lookup covering. SQLite selects the matching partial index explicitly;
+PostgreSQL receives the same query after its dialect removes that SQLite-only
+planner hint. The bounded candidate lookup then joins at most `limit + 1`
+primary-key rows to materialize complete records. No implementation may satisfy
+this contract by loading all historical rows into Python.
+
+LLM head classification uses
+`idx_llm_calls_provider_chain_head(pid, purpose, created_at, call_id)` for one
+correlated seek per bounded candidate. The same index backs the atomic update
+fence that rejects reducing a Responses head if no newer chain row exists.

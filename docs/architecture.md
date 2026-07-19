@@ -72,7 +72,10 @@ and visibility but never capabilities.
 Startup Runtime Modules are different from Skills. A module is trusted Python
 host code loaded before `Runtime.open()` returns. Modules extend the runtime
 composition root by registering tools, images, syscalls, provider hooks, and
-startup hooks. Because modules run in the host interpreter, they are part of
+startup hooks. They may also declare buffered durable Object-release handlers;
+those handlers are installed before startup publication recovery so persisted
+cleanup intents can be resumed without running general startup hooks early.
+Because modules run in the host interpreter, they are part of
 the runtime trusted computing base and are gated by manifest hash trust rather
 than by process capabilities.
 
@@ -85,7 +88,7 @@ payload-free decisions. See [Data Flow](data_flow.md).
 
 Explainable Operations overlays these managers without replacing their source
 records. A `ContextVar` carries the active causal operation through async calls
-and `asyncio.to_thread`; protected public boundaries create typed parent/child
+and the runtime-owned blocking-work bridges; protected public boundaries create typed parent/child
 rows, while audit, event, capability reservation, Human request, provider
 effect, resource charge, LLM call, and context materialization code attaches
 explicit evidence ids. Query code follows only those links. It does not infer
@@ -178,7 +181,64 @@ Resource/Process and Object Task notifications, lifecycle participants, and
 the checkpoint module-catalog/image-registry pair. Protected-operation recovery
 and Process/Image Boot use their named recovery/hook registries for the same
 reason. The builder then loads trusted extensions and cleans up a partially
-assembled host on failure.
+assembled host on failure. Async hosts must use `await Runtime.aopen()`; failed
+assembly cleanup runs on that caller loop and is shielded until teardown has
+drained. Sync open refuses an active event loop before it opens storage. Both
+sync and async builders allocate the host through `Runtime.allocate_unassembled`
+and then run the same explicit assembly pipeline; they never wrap an already
+live graph in a subclass constructor. A Runtime subclass that overrides
+`__init__` must therefore override `allocate_unassembled` and initialize its
+subclass-only fields there. The builder validates that contract before opening
+an owned store. Custom Runtime subclasses must be created through their
+`open`/`aopen` entrypoints or `RuntimeBuilder`; invoking a custom subclass
+constructor directly is outside this lifecycle contract.
+
+Before an async entrypoint offloads allocation or assembly, its event-loop
+caller atomically installs an identity-only `StoreAssemblyReservation`. New
+`locked()`, `transaction()`, and query scopes from every non-claimant fail fast
+while that reservation is installed; only the worker that claims the exact
+token may enter the store during assembly. Worker completion and every
+scheduling, cancellation, decision-error, and failure path compare-and-release
+that exact token. This closes the readiness-probe-to-worker handoff window in
+which an event-loop task could otherwise hold the thread-reentrant store lock
+while awaiting the worker that needed the same lock.
+
+If a component cannot stop, the raised exception group contains a public
+`RuntimeAssemblyCleanupRequired` leaf with the partial Runtime and store. The
+same typed handle is published when an async assembly reaches `OPEN` after its
+caller was cancelled but normal Runtime shutdown raises or returns an
+incomplete outcome. In that case `cleanup_kind` is
+`RuntimeAssemblyCleanupKind.OPEN_RUNTIME_SHUTDOWN`, and `release()` or
+`arelease()` retries normal Runtime shutdown rather than failed-assembly
+teardown. The caller retains explicit ownership and can extract and retry it
+without relying on garbage collection:
+
+```python
+from agent_libos.runtime import RuntimeAssemblyCleanupRequired
+
+try:
+    runtime = await Runtime.aopen("runtime.sqlite")
+except BaseException as error:
+    for handle in RuntimeAssemblyCleanupRequired.extract(error):
+        await handle.arelease()
+    raise
+```
+
+Synchronous callers use `handle.release()`. For
+`RuntimeAssemblyCleanupKind.FAILED_ASSEMBLY`, a handle from `Runtime.open()` or
+`Runtime.aopen()` closes the builder-owned store only after graph cleanup
+succeeds, while a handle from `from_store()` or `afrom_store()` leaves the
+supplied store caller-owned. An `OPEN_RUNTIME_SHUTDOWN` handle represents a
+Runtime that was fully opened but never delivered to its cancelled caller; its
+release API therefore runs ordinary Runtime shutdown, including normal store
+release. Before failed-assembly cleanup can unbind its lifecycle
+guard, an owned open atomically replaces that exact guard with a unique close
+reservation. Successor assembly is rejected while the reservation is pending,
+and the handle can close only through an exact compare-and-close operation;
+a stale handle therefore cannot close a successor Runtime. Async handle and
+failed-open close paths run blocking backend release off-loop, shield it through
+caller cancellation, and report cancellation only after the irreversible close
+outcome is known.
 `agent_libos.runtime.runtime.Runtime` is the stable host facade over that
 assembled graph. Its component fields are declared explicitly for static
 tooling, and the architecture check rejects composition-root assignments that
@@ -274,6 +334,33 @@ quantum or ObjectTask tool thread cannot be joined safely, shutdown reports the
 component that did not stop and leaves owned storage open so a live worker is
 not racing a closed runtime store connection. Host shutdown never marks AgentProcess
 records as exited.
+
+The final ordinary store close uses an exact nonblocking ownership claim. Async
+shutdown performs the blocking backend release off-loop and drains that
+irreversible step before propagating caller cancellation. Once ownership is
+released, the shared shutdown attempt is successful for concurrent followers;
+caller-local cancellation or control-flow diagnostics affect only the leader,
+and close warnings remain available through idempotent `shutdown()` readback.
+If the backend/session was already externally released, shutdown skips
+unavailable durable shutdown evidence but still tears down the in-memory graph,
+clears the exact guard, and terminalizes the lifecycle with a warning.
+
+If durable publication or terminalization instead installs a recovery-required
+fence, that fence is permanent for the current Runtime instance. Normal sync or
+async close remains fail closed and preserves the diagnostic store; it does not
+emit shutdown evidence, run user finalizers, or perform partial component
+teardown. After inspection, the owner must explicitly call
+`Runtime.release_recovery_diagnostics()` or await its async counterpart. This
+handoff is available only while genuinely fenced and quiescent, stops the
+transient worker/component graph without durable writes or ordinary finalizers,
+runs only explicitly registered recovery-safe cleanup, and atomically releases
+the store commit guard and backend lease. Async teardown runs loop-affine
+components on the caller loop. Failures or cancellation before ownership release
+reset the handoff for retry. An ownership-released outcome closes the old
+lifecycle even when it carries close warnings or overlaps caller cancellation;
+warnings remain readable and control-flow interruption is propagated. A fresh
+open of the same target then owns startup recovery; the fenced Runtime itself is
+never reopened.
 
 ## Tool Boundary
 

@@ -13,7 +13,13 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessStatus
-from scripts.llm_context_probe import last_tool_result, static_prefix
+
+if __package__:  # pragma: no branch - depends on module versus file execution
+    from scripts.llm_context_probe import last_tool_result, static_prefix
+    from scripts.runtime_assembly import aopen_runtime
+else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
+    from llm_context_probe import last_tool_result, static_prefix
+    from runtime_assembly import aopen_runtime
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
@@ -34,7 +40,7 @@ async def run_interleaved_clock_demo(
     timezone: str = _SCRIPT_DEFAULTS.clock_demo_timezone,
     echo: bool = True,
 ) -> dict[str, Any]:
-    runtime = Runtime.open(db)
+    runtime = await aopen_runtime(db)
     outputs: list[dict[str, Any]] = []
     output_lock = threading.Lock()
     client = InterleavingClockClient()
@@ -121,7 +127,7 @@ async def run_interleaved_clock_demo(
             raise RuntimeError(f"unexpected output order: {actual_labels}, expected {expected_labels}")
         return report
     finally:
-        runtime.shutdown(actor="script", reason="script.complete")
+        await runtime.ashutdown(actor="script", reason="script.complete")
 
 
 class InterleavingClockClient:

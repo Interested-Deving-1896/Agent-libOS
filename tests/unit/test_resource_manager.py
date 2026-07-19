@@ -7,6 +7,7 @@ import pytest
 from agent_libos import Runtime
 from agent_libos.models import (
     EventType,
+    KilledProcessOutcome,
     ObjectMetadata,
     ObjectType,
     ProcessStatus,
@@ -25,20 +26,24 @@ class TestResourceManager:
             initial_charge_records = {
                 record.record_id for record in runtime.audit.trace() if record.action == "resource.charge"
             }
-            original_update = runtime.store.update_process
+            original_patch = runtime.resources.store.patch_process
+            original_control_patch = runtime.resources.store.patch_process_control
             updated: list[str] = []
 
-            def fail_parent_update(process: object) -> None:
-                pid = getattr(process, "pid")
+            def record_child_patch(pid: str, *args: object, **kwargs: object) -> object:
                 updated.append(pid)
-                if pid == parent:
-                    raise RuntimeError("injected parent update failure")
-                original_update(process)
+                return original_patch(pid, *args, **kwargs)
 
-            runtime.store.update_process = fail_parent_update  # type: ignore[method-assign]
+            def fail_parent_patch(pid: str, *args: object, **kwargs: object) -> object:
+                updated.append(pid)
+                raise RuntimeError("injected parent update failure")
+
+            runtime.resources.store.patch_process = record_child_patch  # type: ignore[method-assign]
+            runtime.resources.store.patch_process_control = fail_parent_patch  # type: ignore[method-assign]
             with pytest.raises(RuntimeError, match="injected parent update failure"):
                 runtime.resources.charge(child, ResourceUsage(tool_calls=1), source="test")
-            runtime.store.update_process = original_update  # type: ignore[method-assign]
+            runtime.resources.store.patch_process = original_patch  # type: ignore[method-assign]
+            runtime.resources.store.patch_process_control = original_control_patch  # type: ignore[method-assign]
 
             assert updated == [child, parent]
             assert runtime.process.get(child).resource_usage.tool_calls == 0
@@ -109,8 +114,12 @@ class TestResourceManager:
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='independent killed cleanup phases')
             process = runtime.process.get(pid)
-            process.status = ProcessStatus.KILLED
-            runtime.store.update_process(process)
+            runtime.process_transitions.transition(
+                pid,
+                ProcessStatus.KILLED,
+                expected_revision=process.revision,
+                outcome=KilledProcessOutcome(code="test_fixture"),
+            )
             notified: list[str] = []
             runtime.process.bind_object_task_terminal_notifier(notified.append)
 

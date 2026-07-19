@@ -165,6 +165,9 @@ Start here, then read the deeper references as needed:
   replay diagnostics, append-only history, and external effects.
 - [docs/storage.md](docs/storage.md): transaction rollback/poison semantics,
   Object payload durability, schema recovery, and active-runtime leases.
+- [docs/evidence_payload_retention.md](docs/evidence_payload_retention.md):
+  explicit, auditable LLM/external-effect payload retention tiers and safety
+  exclusions.
 - [docs/configuration.md](docs/configuration.md): load precedence, field-level
   config inventory, secrets, and bounded-window defaults.
 - [docs/cli.md](docs/cli.md): stable CLI command reference and examples.
@@ -214,7 +217,7 @@ Skills, Images, and configuration through their normal explicit paths.
 Build and validate both release artifacts with:
 
 ```bash
-uv build --out-dir dist
+uv build --clear --out-dir dist
 uv run python scripts/check_release_artifacts.py dist
 ```
 
@@ -369,6 +372,12 @@ pipelines. Deployments that rely on this default should disclose that use in
 the user agreement because it may include sensitive prompt, tool, reasoning, and
 provider payload data; set `llm.persist_full_io: false` in the runtime config
 when a user or operator opts out of full LLM input/output retention.
+
+For deployments that keep full provider I/O initially, the optional payload
+retention maintenance API can later reduce eligible terminal rows through
+content-free summary and hash-only tiers. It is disabled by default, never runs
+during startup, and never trims live Responses-chain or process-result recovery
+payloads. See [Evidence and LLM Payload Retention](docs/evidence_payload_retention.md).
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite llm-calls --pid <pid>

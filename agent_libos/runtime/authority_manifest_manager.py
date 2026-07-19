@@ -7,7 +7,15 @@ from typing import Any, Iterable, Mapping
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
-from agent_libos.models import CapabilityRight, DataLabels, ResourceBudget, TaskAuthorityManifest
+from agent_libos.models import (
+    PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY,
+    PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION,
+    CapabilityRight,
+    DataLabels,
+    ResourceBudget,
+    TaskAuthorityManifest,
+    encode_permitted_effects_policy,
+)
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.storage import AuthorityRepository
 from agent_libos.utils.ids import new_id, utc_now
@@ -91,7 +99,7 @@ class AuthorityManifestManager:
         permitted_effects = self._effect_classes(
             payload["permitted_effects"]
             if "permitted_effects" in payload
-            else (parent.permitted_effects if parent is not None else [])
+            else (parent.permitted_effects if parent is not None else None)
         )
         parent_data_flow_policy = (
             self._normalize_data_flow_policy(parent.data_flow_policy)
@@ -147,11 +155,11 @@ class AuthorityManifestManager:
                 # not erase capabilities the Host deliberately grants later.
                 "explicit": supplied is not None,
                 "transition_ceiling": supplied is not None or bool(parent_is_ceiling),
+                PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY: PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION,
             },
             created_at=utc_now(),
         )
-        manifest = replace(manifest, manifest_hash=self._hash(manifest))
-        self.store.insert_authority_manifest(manifest)
+        manifest = self._insert_hashed_manifest(manifest)
         missing_required = self._missing_required_capabilities(manifest)
         self.audit.record(
             actor=manifest.issued_by,
@@ -233,7 +241,11 @@ class AuthorityManifestManager:
             goal_ref=goal_ref,
             authorized_capabilities=declared,
             required_capabilities=required,
-            permitted_effects=list(source.permitted_effects) if source is not None else [],
+            permitted_effects=(
+                list(source.permitted_effects)
+                if source is not None and source.permitted_effects is not None
+                else None
+            ),
             resource_budget=selected_budget,
             approval_policy=dict(source.approval_policy) if source is not None else {},
             data_flow_policy=dict(source.data_flow_policy) if source is not None else {},
@@ -251,11 +263,11 @@ class AuthorityManifestManager:
                 "transition_ceiling": source_is_ceiling,
                 "checkpoint_fork_source_pid": source_pid,
                 "checkpoint_fork_source_manifest_id": source.manifest_id if source is not None else None,
+                PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY: PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION,
             },
             created_at=now,
         )
-        manifest = replace(manifest, manifest_hash=self._hash(manifest))
-        self.store.insert_authority_manifest(manifest)
+        manifest = self._insert_hashed_manifest(manifest)
         missing_required = self._missing_required_capabilities(manifest)
         self.audit.record(
             actor=issued_by,
@@ -277,7 +289,26 @@ class AuthorityManifestManager:
         manifest = self.store.get_authority_manifest(manifest_id)
         if manifest is None:
             raise NotFound(f"authority manifest not found: {manifest_id}")
-        if self._hash(replace(manifest, manifest_hash="")) != manifest.manifest_hash:
+        unhashed = replace(manifest, manifest_hash="")
+        policy_schema_version = manifest.permitted_effects_policy_schema_version
+        provenance = manifest.metadata.get(PERMITTED_EFFECTS_POLICY_PROVENANCE_KEY)
+        if policy_schema_version == PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION:
+            valid = (
+                provenance == PERMITTED_EFFECTS_POLICY_SCHEMA_VERSION
+                and self._hash(unhashed) == manifest.manifest_hash
+            )
+        elif policy_schema_version == 1:
+            # Legacy rows predate the provenance marker and persisted the
+            # logical list directly. Their empty list meant unrestricted. The
+            # marker absence plus the decoded v1 storage shape is required;
+            # payload shape alone is never enough to select this fallback.
+            valid = (
+                provenance is None
+                and self._legacy_hash(unhashed) == manifest.manifest_hash
+            )
+        else:
+            valid = False
+        if not valid:
             raise ValidationError(f"authority manifest hash mismatch: {manifest_id}")
         return manifest
 
@@ -306,7 +337,7 @@ class AuthorityManifestManager:
 
     def assert_effect(self, pid: str, effect_class: str) -> None:
         manifest = self.get_for_process(pid)
-        if manifest is None or not manifest.permitted_effects:
+        if manifest is None or manifest.permitted_effects is None:
             return
         self._require_live(manifest)
         selected = str(effect_class).strip()
@@ -525,12 +556,17 @@ class AuthorityManifestManager:
                 label="derived child requestable capability",
             )
 
-    def _require_effects_attenuated(self, parent: list[str], child: list[str]) -> None:
-        # Empty retains the compatibility meaning "no additional effect
-        # ceiling", so it cannot be used beneath a non-empty parent ceiling.
-        if not parent:
+    def _require_effects_attenuated(
+        self,
+        parent: list[str] | None,
+        child: list[str] | None,
+    ) -> None:
+        # An unrestricted parent may be narrowed to any concrete ceiling,
+        # including deny-all. Every concrete parent rejects unrestricted
+        # children, and an empty parent can only derive another empty ceiling.
+        if parent is None:
             return
-        if not child or any(
+        if child is None or any(
             not any(self._effect_pattern_covers(parent_pattern, child_pattern) for parent_pattern in parent)
             for child_pattern in child
         ):
@@ -612,9 +648,9 @@ class AuthorityManifestManager:
         return selected
 
     @staticmethod
-    def _effect_classes(value: Any) -> list[str]:
+    def _effect_classes(value: Any) -> list[str] | None:
         if value is None:
-            return []
+            return None
         if not isinstance(value, list):
             raise ValidationError("permitted_effects must be a list")
         selected = sorted({str(item).strip() for item in value if str(item).strip()})
@@ -646,6 +682,32 @@ class AuthorityManifestManager:
             for key, value in manifest.__dict__.items()
             if key != "manifest_hash"
         }
+        payload["permitted_effects"] = encode_permitted_effects_policy(
+            manifest.permitted_effects
+        )
+        return hashlib.sha256(dumps(payload).encode("utf-8")).hexdigest()
+
+    def _insert_hashed_manifest(
+        self,
+        manifest: TaskAuthorityManifest,
+    ) -> TaskAuthorityManifest:
+        selected = replace(manifest, manifest_hash=self._hash(manifest))
+        self.store.insert_authority_manifest(selected)
+        return selected
+
+    @staticmethod
+    def _legacy_hash(manifest: TaskAuthorityManifest) -> str:
+        payload = {
+            key: value
+            for key, value in manifest.__dict__.items()
+            if key
+            not in {
+                "manifest_hash",
+                "permitted_effects_policy_schema_version",
+            }
+        }
+        if manifest.permitted_effects is None:
+            payload["permitted_effects"] = []
         return hashlib.sha256(dumps(payload).encode("utf-8")).hexdigest()
 
     @staticmethod

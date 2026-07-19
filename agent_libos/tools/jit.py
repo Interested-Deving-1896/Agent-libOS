@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import inspect
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from itertools import islice
 from typing import Any
 
 from jsonschema.exceptions import SchemaError as JsonSchemaSchemaError
@@ -12,11 +13,17 @@ from agent_libos.config import AgentLibOSConfig
 from agent_libos.memory.object_memory import ObjectMemoryManager
 from agent_libos.models import (
     JIT_MULTIPLEXER_TOOL_NAME,
+    JITRehydrationArtifact,
+    JITRehydrationRecord,
+    JITRehydrationSummary,
     JIT_TOOL_EXPOSURE_MULTIPLEXED,
     ObjectMetadata,
     ObjectType,
     OPENAI_TOOL_NAME_MAX_CHARS,
     ResourceUsage,
+    ProcessToolBindingCursor,
+    ProcessToolBindingPage,
+    ProcessToolBindingRecord,
     ToolCandidate,
     ToolCandidateStatus,
     ToolHandle,
@@ -54,6 +61,7 @@ class JITToolService:
         declared_permissions: Iterable[str],
         resources: Any | None,
         images: dict[str, Any],
+        require_recovery_lease: Callable[[], None] | None = None,
     ) -> None:
         self.unit_of_work = unit_of_work
         self.extensions = unit_of_work.extensions
@@ -66,6 +74,11 @@ class JITToolService:
         self.declared_permissions = frozenset(declared_permissions)
         self.resources = resources
         self.images = images
+        self._require_recovery_lease = (
+            require_recovery_lease
+            if require_recovery_lease is not None
+            else self._recovery_lease_not_configured
+        )
 
     def propose(
         self,
@@ -75,6 +88,23 @@ class JITToolService:
         tests: list[dict[str, Any]] | None = None,
         requested_capabilities: list[dict[str, Any]] | None = None,
     ) -> str:
+        candidate_id, _descriptor_oid = self.propose_with_descriptor(
+            pid,
+            spec,
+            source_code,
+            tests=tests,
+            requested_capabilities=requested_capabilities,
+        )
+        return candidate_id
+
+    def propose_with_descriptor(
+        self,
+        pid: str,
+        spec: ToolSpec | dict[str, Any],
+        source_code: str,
+        tests: list[dict[str, Any]] | None = None,
+        requested_capabilities: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, str]:
         raw_spec = spec if isinstance(spec, ToolSpec) else ToolSpec(**spec)
         tool_spec = conservative_jit_tool_spec(
             raw_spec,
@@ -136,7 +166,7 @@ class JITToolService:
                 output_refs=[candidate_object.oid],
                 decision={"name": tool_spec.name},
             )
-        return candidate.candidate_id
+        return candidate.candidate_id, candidate_object.oid
 
     def validate(
         self,
@@ -305,7 +335,7 @@ class JITToolService:
         spec: ToolSpec,
         source_code: str,
         registered_by: str,
-    ) -> ToolHandle:
+    ) -> tuple[ToolHandle, str]:
         """Install a JIT tool carried by a trusted checkpoint-commit artifact."""
 
         tool_id = new_id("tool")
@@ -343,87 +373,167 @@ class JITToolService:
         except BaseException:
             self.registry.forget_jit(tool_id)
             raise
-        return handle
+        return handle, candidate.candidate_id
 
-    def rehydrate_registered(self) -> dict[str, list[dict[str, str]]]:
-        """Restore valid process-local JIT implementations after store reopen."""
+    def rehydrate_registered(self) -> JITRehydrationSummary:
+        """Restore JIT bindings with bounded historical scans and diagnostics."""
 
-        ephemeral_tool_rows = {
-            str(row["tool_id"]): row
-            for row in self.extensions.list_tools()
-            if bool(row.get("ephemeral"))
-        }
-        if not ephemeral_tool_rows:
-            return {"restored": [], "pruned_stale": []}
-
-        candidates_by_tool_id = self._registered_candidates_by_tool_id()
-        restored: list[dict[str, str]] = []
-        pruned: list[dict[str, str]] = []
-        for process in self.processes.list_processes():
-            process_restored, process_pruned = self._rehydrate_process(
-                process,
-                ephemeral_tool_rows,
-                candidates_by_tool_id,
+        self._require_recovery_lease()
+        page_size = self.config.runtime.jit_rehydration_page_size
+        restored_total = 0
+        pruned_total = 0
+        restored_sample: list[JITRehydrationRecord] = []
+        pruned_sample: list[JITRehydrationRecord] = []
+        cursor: ProcessToolBindingCursor | None = None
+        while True:
+            page = self.processes.query_process_tool_bindings(
+                after=cursor,
+                limit=page_size,
             )
-            restored.extend(process_restored)
-            pruned.extend(process_pruned)
-
-        if restored or pruned:
-            self.audit.record(
-                actor="runtime",
-                action="runtime.jit.rehydrate",
-                target="tool:jits",
-                decision={"restored": restored, "pruned_stale": pruned},
+            self._validate_process_page(page, after=cursor, limit=page_size)
+            page_restored, page_pruned = self._rehydrate_binding_page(page.records)
+            restored_total += len(page_restored)
+            pruned_total += len(page_pruned)
+            self._extend_sample(
+                restored_sample,
+                page_restored,
+                limit=page_size,
             )
-        return {"restored": restored, "pruned_stale": pruned}
+            self._extend_sample(
+                pruned_sample,
+                page_pruned,
+                limit=page_size,
+            )
+            cursor = page.next_cursor
+            if cursor is None:
+                break
 
-    def _registered_candidates_by_tool_id(self) -> dict[str, dict[str, Any]]:
-        candidates: dict[str, dict[str, Any]] = {}
-        for row in self.extensions.list_registered_tool_candidate_rows():
-            tool_id = str(row.get("registered_tool_id") or "")
-            if tool_id:
-                candidates[tool_id] = row
-        return candidates
+        summary = JITRehydrationSummary(
+            restored_total=restored_total,
+            pruned_stale_total=pruned_total,
+            restored_sample=tuple(restored_sample),
+            pruned_stale_sample=tuple(pruned_sample),
+        )
+        self._record_rehydration_summary(summary)
+        return summary
 
-    def _rehydrate_process(
+    def preflight_process_bindings(
         self,
-        process: Any,
-        durable_tools: dict[str, dict[str, Any]],
-        candidates: dict[str, dict[str, Any]],
-    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-        restored: list[dict[str, str]] = []
-        pruned: list[dict[str, str]] = []
-        for name, raw_tool_id in list(process.tool_table.items()):
-            tool_id = str(raw_tool_id)
-            durable_tool = durable_tools.get(tool_id)
-            if durable_tool is None or self._is_loaded(tool_id):
-                continue
-            record = {"pid": process.pid, "tool_id": tool_id, "name": str(name)}
-            candidate = candidates.get(tool_id)
-            if self._publish_rehydrated_tool(
-                process.pid,
-                str(name),
-                tool_id,
-                durable_tool,
-                candidate,
-            ):
-                restored.append(record)
-                continue
-            process.tool_table.pop(name, None)
-            if process.model_tool_table.get(name) == tool_id:
-                process.model_tool_table.pop(name, None)
-            pruned.append(record)
-        if pruned:
-            process.updated_at = utc_now()
-            self.processes.patch_process(
-                process.pid,
-                {
-                    "tool_table": process.tool_table,
-                    "model_tool_table": process.model_tool_table,
-                    "updated_at": process.updated_at,
-                },
-                expected_revision=process.revision,
+        pid: str,
+        handles: Iterable[ToolHandle],
+        *,
+        assigned_by: str,
+    ) -> None:
+        """Reject process-local JIT aliases whose durable owner is not ``pid``.
+
+        Loaded registry state is sufficient to select JIT implementations, but
+        it is not an ownership authority.  The exact ephemeral tool and
+        registered-candidate rows remain the source of truth for process-local
+        binding decisions.
+        """
+
+        selected_handles = tuple(handles)
+        if not selected_handles:
+            return
+        artifacts_by_id: dict[str, JITRehydrationArtifact] = {}
+        hard_limit = self.config.runtime.jit_rehydration_page_hard_limit
+        ordered_ids = sorted({handle.tool_id for handle in selected_handles})
+        for offset in range(0, len(ordered_ids), hard_limit):
+            requested_ids = frozenset(
+                ordered_ids[offset : offset + hard_limit]
             )
+            artifacts = self.extensions.get_jit_rehydration_artifacts(
+                pid=pid,
+                tool_ids=requested_ids,
+            )
+            artifacts_by_id.update(
+                self._validated_artifact_map(
+                    artifacts,
+                    requested_ids=requested_ids,
+                )
+            )
+        rejected: list[ToolHandle] = []
+        for handle in selected_handles:
+            tool_id = handle.tool_id
+            artifact = artifacts_by_id.get(tool_id)
+            loaded_jit = self.registry.is_jit(tool_id)
+            loaded_static = self.registry.implementation(tool_id) is not None
+            candidate_backed = bool(
+                artifact is not None
+                and artifact.candidate_match_count > 0
+            )
+            if not loaded_jit and not candidate_backed:
+                if loaded_static or artifact is None or artifact.scope != "ephemeral_process":
+                    continue
+            if artifact is None and handle.scope != "ephemeral_process":
+                continue
+            if artifact is None or not self._artifact_matches_binding(
+                artifact,
+                pid=pid,
+                name=handle.name,
+            ):
+                rejected.append(handle)
+        if not rejected:
+            return
+        rejected_tools = [
+            {"name": handle.name, "tool_id": handle.tool_id}
+            for handle in sorted(rejected, key=lambda item: (item.name, item.tool_id))
+        ]
+        self.audit.record(
+            actor=assigned_by,
+            action="process.tools.configure_denied",
+            target=f"process:{pid}",
+            decision={
+                "reason": "process_local_jit_owner_mismatch",
+                "tools": rejected_tools,
+            },
+        )
+        raise ValidationError(
+            "process-local JIT tools may only be bound to their durable owner"
+        )
+
+    def _rehydrate_binding_page(
+        self,
+        records: tuple[ProcessToolBindingRecord, ...],
+    ) -> tuple[list[JITRehydrationRecord], list[JITRehydrationRecord]]:
+        requested_ids = frozenset(record.tool_id for record in records)
+        if not requested_ids:
+            return [], []
+        artifacts = self.extensions.get_jit_rehydration_artifacts_for_tool_ids(
+            requested_ids
+        )
+        artifacts_by_id = self._validated_artifact_map(
+            artifacts,
+            requested_ids=requested_ids,
+        )
+        if frozenset(artifacts_by_id) != requested_ids:
+            raise ValidationError(
+                "JIT binding recovery artifact page changed during recovery"
+            )
+        restored: list[JITRehydrationRecord] = []
+        pruned: list[JITRehydrationRecord] = []
+        stale_bindings: dict[str, dict[str, str]] = {}
+        for binding_record in records:
+            name = binding_record.tool_name
+            tool_id = binding_record.tool_id
+            artifact = artifacts_by_id[tool_id]
+            record = JITRehydrationRecord(
+                pid=binding_record.pid,
+                tool_id=tool_id,
+                name=name,
+            )
+            if not self._artifact_matches_binding(
+                artifact,
+                pid=binding_record.pid,
+                name=name,
+            ):
+                stale_bindings.setdefault(binding_record.pid, {})[name] = tool_id
+                pruned.append(record)
+            elif not self._is_loaded(tool_id):
+                self._publish_rehydrated_artifact(artifact)
+                restored.append(record)
+        for pid, bindings in stale_bindings.items():
+            self.processes.remove_process_tool_bindings(pid, bindings)
         return restored, pruned
 
     def _is_loaded(self, tool_id: str) -> bool:
@@ -432,32 +542,114 @@ class JITToolService:
             or self.registry.is_jit(tool_id)
         )
 
-    def _publish_rehydrated_tool(
-        self,
-        pid: str,
-        name: str,
-        tool_id: str,
-        durable_tool: dict[str, Any],
-        candidate: dict[str, Any] | None,
-    ) -> bool:
-        source = str(candidate.get("source_code") or "") if candidate else ""
-        if (
-            candidate is None
-            or str(candidate.get("pid") or "") != pid
-            or not source
-            or str(durable_tool.get("name") or "") != name
-        ):
-            return False
+    def _publish_rehydrated_artifact(self, artifact: JITRehydrationArtifact) -> None:
+        source = artifact.source_code
+        if source is None:
+            raise ValidationError("rehydratable JIT artifact is missing source code")
         self.registry.publish_jit(
             ToolHandle(
-                tool_id=tool_id,
-                name=name,
+                tool_id=artifact.tool_id,
+                name=artifact.name,
                 capability_id=None,
-                scope=str(durable_tool.get("scope") or "ephemeral_process"),
+                scope=artifact.scope,
             ),
             source,
         )
-        return True
+
+    @staticmethod
+    def _artifact_matches_binding(
+        artifact: JITRehydrationArtifact,
+        *,
+        pid: str,
+        name: str,
+    ) -> bool:
+        return (
+            artifact.name == name
+            and artifact.candidate_match_count == 1
+            and artifact.candidate_pid == pid
+            and bool(artifact.source_code)
+        )
+
+    @staticmethod
+    def _validated_artifact_map(
+        artifacts: Iterable[JITRehydrationArtifact],
+        *,
+        requested_ids: frozenset[str],
+    ) -> dict[str, JITRehydrationArtifact]:
+        selected: dict[str, JITRehydrationArtifact] = {}
+        for artifact in artifacts:
+            if not isinstance(artifact, JITRehydrationArtifact):
+                raise ValidationError("JIT rehydration returned an invalid artifact")
+            if artifact.tool_id not in requested_ids or artifact.tool_id in selected:
+                raise ValidationError(
+                    "JIT rehydration returned a duplicate or unexpected artifact"
+                )
+            selected[artifact.tool_id] = artifact
+        return selected
+
+    @staticmethod
+    def _validate_process_page(
+        page: ProcessToolBindingPage,
+        *,
+        after: ProcessToolBindingCursor | None,
+        limit: int,
+    ) -> None:
+        if not isinstance(page, ProcessToolBindingPage) or len(page.records) > limit:
+            raise ValidationError("process tool binding recovery returned an invalid page")
+        previous = after
+        for process in page.records:
+            if not isinstance(process, ProcessToolBindingRecord):
+                raise ValidationError(
+                    "process tool binding recovery returned an invalid record"
+                )
+            current = ProcessToolBindingCursor(
+                process.pid,
+                process.tool_name,
+            )
+            if previous is not None and current <= previous:
+                raise ValidationError(
+                    "process tool binding recovery page is not strictly ordered"
+                )
+            previous = current
+        if page.next_cursor is not None:
+            if previous is None or page.next_cursor != previous:
+                raise ValidationError(
+                    "process tool binding recovery returned an invalid next cursor"
+                )
+
+    @staticmethod
+    def _extend_sample(
+        selected: list[JITRehydrationRecord],
+        records: Iterable[JITRehydrationRecord],
+        *,
+        limit: int,
+    ) -> None:
+        remaining = limit - len(selected)
+        if remaining > 0:
+            selected.extend(islice(records, remaining))
+
+    def _record_rehydration_summary(self, summary: JITRehydrationSummary) -> None:
+        if summary.restored_total == 0 and summary.pruned_stale_total == 0:
+            return
+        self.audit.record(
+            actor="runtime",
+            action="runtime.jit.rehydrate",
+            target="tool:jits",
+            decision={
+                "restored_total": summary.restored_total,
+                "pruned_stale_total": summary.pruned_stale_total,
+                "restored": [item.to_mapping() for item in summary.restored_sample],
+                "pruned_stale": [
+                    item.to_mapping() for item in summary.pruned_stale_sample
+                ],
+                "restored_truncated": summary.restored_truncated,
+                "pruned_stale_truncated": summary.pruned_stale_truncated,
+            },
+        )
+
+    @staticmethod
+    def _recovery_lease_not_configured() -> None:
+        raise RuntimeError("JIT rehydration requires a configured recovery lease")
 
     def get_candidate(self, candidate_id: str) -> ToolCandidate:
         candidate = self.extensions.get_tool_candidate(candidate_id)

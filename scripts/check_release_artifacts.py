@@ -162,8 +162,10 @@ def _validate_wheel(wheel_path: Path, version: str) -> None:
             raise ValueError(f"wheel project name is {metadata['Name']!r}, expected {PROJECT_NAME!r}")
         if metadata["Version"] != version:
             raise ValueError(f"wheel version is {metadata['Version']!r}, expected {version!r}")
-        if metadata["Requires-Python"] != ">=3.11":
-            raise ValueError("wheel Requires-Python must remain >=3.11")
+        if metadata["Requires-Python"] != "<3.15,>=3.11":
+            raise ValueError(
+                "wheel Requires-Python must remain >=3.11,<3.15"
+            )
         entry_points = archive.read(entry_points_path).decode("utf-8")
         expected_entries = {
             "agent-libos = agent_libos.api.cli:cli",
@@ -208,8 +210,10 @@ def _validate_sdist(sdist_path: Path, version: str) -> None:
         metadata = BytesParser(policy=policy.default).parsebytes(metadata_file.read())
         if metadata["Name"] != PROJECT_NAME or metadata["Version"] != version:
             raise ValueError("sdist PKG-INFO does not match the release name and version")
-        if metadata["Requires-Python"] != ">=3.11":
-            raise ValueError("sdist Requires-Python must remain >=3.11")
+        if metadata["Requires-Python"] != "<3.15,>=3.11":
+            raise ValueError(
+                "sdist Requires-Python must remain >=3.11,<3.15"
+            )
     missing = sorted(SDIST_REQUIRED_FILES - relative_files)
     if missing:
         raise ValueError(f"sdist is missing repository release files: {missing}")

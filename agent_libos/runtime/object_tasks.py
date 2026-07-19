@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import math
 import threading
 import time
@@ -24,10 +25,15 @@ from agent_libos.models import (
     ObjectTaskNotification,
     ObjectTaskNotificationStatus,
     ObjectTaskOwnerWatch,
+    ObjectTaskRecoveryCursor,
+    ObjectTaskRecoveryKind,
+    ObjectTaskRecoverySummary,
     ObjectTaskStatus,
     ProcessMessageKind,
     ProcessStatus,
     RelationType,
+    ToolHandle,
+    ToolProcessWait,
 )
 from agent_libos.models.exceptions import (
     CapabilityDenied,
@@ -38,6 +44,7 @@ from agent_libos.models.exceptions import (
     ProcessWaitRequired,
     ValidationError,
 )
+from agent_libos.process_execution import trusted_process_control_mutation
 from agent_libos.runtime.object_task_notifications import (
     ObjectTaskNotificationService,
 )
@@ -80,6 +87,29 @@ class _NotifyResultGrantPublicationFailed(RuntimeError):
     pass
 
 
+class _ObjectTaskLifecycleShutdownHandle:
+    """Opaque teardown-only view retained by RuntimeLifecycle."""
+
+    __slots__ = ("__release_recovery_diagnostics", "__shutdown")
+
+    def __init__(
+        self,
+        *,
+        shutdown: Callable[[], bool],
+        release_recovery_diagnostics: Callable[[], bool],
+    ) -> None:
+        self.__shutdown = shutdown
+        self.__release_recovery_diagnostics = release_recovery_diagnostics
+
+    def shutdown(self) -> bool:
+        return self.__shutdown()
+
+    def release_recovery_diagnostics(self) -> bool:
+        """Abandon transient workers without publishing durable cancellation."""
+
+        return self.__release_recovery_diagnostics()
+
+
 class ObjectTaskManager:
     """Background Object-bound tool tasks.
 
@@ -106,6 +136,8 @@ class ObjectTaskManager:
         add_handle_to_process_view: Callable[[str, ObjectHandle], None],
         config: AgentLibOSConfig | None = None,
         *,
+        admission: Any,
+        require_recovery_lease: Callable[[], None],
         autostart: bool = True,
     ) -> None:
         self._records = tasks
@@ -121,6 +153,8 @@ class ObjectTaskManager:
         self._authority_manifests = authority_manifests
         self._human = human
         self._add_handle_to_process_view = add_handle_to_process_view
+        self._admission = admission
+        self._require_recovery_lease = require_recovery_lease
         self.config = config or DEFAULT_CONFIG
         self._lock = threading.RLock()
         self._notifications = ObjectTaskNotificationService(
@@ -161,7 +195,9 @@ class ObjectTaskManager:
         self._pending_args: dict[str, dict[str, Any]] = {}
         self._closing = False
         self._closed = False
+        self.__lifecycle_shutdown_capability = object()
         self._recovered = False
+        self._recovery_summary = ObjectTaskRecoverySummary()
         self._started = False
         if autostart:
             try:
@@ -171,14 +207,16 @@ class ObjectTaskManager:
                 self._cleanup_failed_initialization()
                 raise
 
-    def recover(self) -> None:
+    def recover(self) -> ObjectTaskRecoverySummary:
+        self._require_recovery_lease()
         with self._lock:
             if self._recovered:
-                return
+                return self._recovery_summary
             if self._started:
                 raise RuntimeError("object task recovery must precede worker startup")
-            self._recover_persisted_tasks()
+            self._recovery_summary = self._recover_persisted_tasks()
             self._recovered = True
+            return self._recovery_summary
 
     def start_worker(self) -> None:
         with self._lock:
@@ -193,34 +231,165 @@ class ObjectTaskManager:
         if not self._loop_ready.wait(timeout=1.0):
             raise RuntimeError("object task event loop did not start")
 
-    def _recover_persisted_tasks(self) -> None:
-        active_before_reopen = self._records.list_object_tasks(
-            include_terminal=False
+    def _recover_persisted_tasks(self) -> ObjectTaskRecoverySummary:
+        page_size = self.config.runtime.object_task_recovery_page_size
+        abandoned_total, abandoned_sample = self._recover_active_tasks(page_size)
+        unavailable_total, unavailable_sample = self._recover_missing_results(
+            page_size
         )
-        abandoned = self._records.mark_object_tasks_abandoned(
-            "runtime reopened before object task completed"
+        notification_total, notification_sample = self._retry_notifications(
+            page_size
         )
-        if abandoned:
-            abandoned_ids = set(abandoned)
-            for task in active_before_reopen:
-                if task.task_id in abandoned_ids and task.runner_pid is not None:
-                    self._state.terminalize_runner(
-                        str(task.runner_pid),
-                        reason="object task abandoned after runtime reopen",
-                    )
-                if task.task_id in abandoned_ids:
-                    abandoned_task = self._records.get_object_task(task.task_id)
-                    if abandoned_task is not None:
-                        self._state.cleanup_owner_pin_after_terminal(abandoned_task)
-            self._audit.record(
-                actor="object_task",
-                action="object_task.abandon_recovered",
-                target="object_tasks",
-                decision={"task_ids": abandoned},
+        return ObjectTaskRecoverySummary(
+            abandoned_total=abandoned_total,
+            result_unavailable_total=unavailable_total,
+            notification_retried_total=notification_total,
+            abandoned_sample=tuple(abandoned_sample),
+            result_unavailable_sample=tuple(unavailable_sample),
+            notification_retried_sample=tuple(notification_sample),
+        )
+
+    def _recover_active_tasks(self, page_size: int) -> tuple[int, list[str]]:
+        total = 0
+        sample: list[str] = []
+        cursor: ObjectTaskRecoveryCursor | None = None
+        reason = "runtime reopened before object task completed"
+        while True:
+            page = self._records.query_object_task_recovery(
+                kind=ObjectTaskRecoveryKind.ACTIVE,
+                after=cursor,
+                limit=page_size,
             )
-        self._reconcile_missing_terminal_results_after_reopen()
-        for task in self._records.list_object_tasks(include_terminal=True):
-            self._notifications.retry_terminal(task)
+            for task in page.records:
+                now = utc_now()
+                with self._records.transaction():
+                    updated = self._records.abandon_object_task_after_reopen(
+                        task.task_id,
+                        expected_status=task.status,
+                        reason=reason,
+                        updated_at=now,
+                    )
+                    if updated is None:
+                        continue
+                    if updated.runner_pid is not None:
+                        self._state.terminalize_runner(
+                            str(updated.runner_pid),
+                            reason="object task abandoned after runtime reopen",
+                        )
+                    self._state.cleanup_owner_pin_after_terminal(updated)
+                total += 1
+                self._append_recovery_sample(sample, updated.task_id, page_size)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        self._record_recovery_summary(
+            action="object_task.abandon_recovered",
+            total=total,
+            sample=sample,
+        )
+        return total, sample
+
+    def _recover_missing_results(self, page_size: int) -> tuple[int, list[str]]:
+        total = 0
+        sample: list[str] = []
+        cursor: ObjectTaskRecoveryCursor | None = None
+        while True:
+            page = self._records.query_object_task_recovery(
+                kind=ObjectTaskRecoveryKind.MISSING_RESULT,
+                after=cursor,
+                limit=page_size,
+            )
+            for task in page.records:
+                if self._recover_missing_result(task) is None:
+                    continue
+                total += 1
+                self._append_recovery_sample(sample, task.task_id, page_size)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        self._record_recovery_summary(
+            action="object_task.result_unavailable_recovered",
+            total=total,
+            sample=sample,
+        )
+        return total, sample
+
+    def _recover_missing_result(self, task: ObjectTask) -> ObjectTask | None:
+        result_oid = str(task.result_oid)
+        if self._objects.get_object(result_oid) is not None:
+            return None
+        now = utc_now()
+        wait = {
+            **task.wait,
+            "result_unavailable_after_reopen": True,
+            "result_unavailable_at": now,
+            "previous_status": task.status.value,
+            "previous_result_oid": result_oid,
+            "previous_error": task.error,
+        }
+        return self._records.mark_object_task_result_unavailable_after_reopen(
+            task.task_id,
+            expected_result_oid=result_oid,
+            wait=wait,
+            error=(
+                "result unavailable after runtime reopen: runtime-only Object "
+                "payload was not reconstructable"
+            ),
+            updated_at=now,
+        )
+
+    def _retry_notifications(self, page_size: int) -> tuple[int, list[str]]:
+        total = 0
+        sample: list[str] = []
+        cursor: ObjectTaskRecoveryCursor | None = None
+        while True:
+            page = self._records.query_object_task_recovery(
+                kind=ObjectTaskRecoveryKind.NOTIFICATION,
+                after=cursor,
+                limit=page_size,
+            )
+            for task in page.records:
+                self._notifications.retry_terminal(task)
+                total += 1
+                self._append_recovery_sample(sample, task.task_id, page_size)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+        self._record_recovery_summary(
+            action="object_task.notification_retried_recovered",
+            total=total,
+            sample=sample,
+        )
+        return total, sample
+
+    def _record_recovery_summary(
+        self,
+        *,
+        action: str,
+        total: int,
+        sample: list[str],
+    ) -> None:
+        if total == 0:
+            return
+        self._audit.record(
+            actor="object_task",
+            action=action,
+            target="object_tasks",
+            decision={
+                "task_ids": list(sample),
+                "total_count": total,
+                "truncated": total > len(sample),
+            },
+        )
+
+    @staticmethod
+    def _append_recovery_sample(
+        sample: list[str],
+        task_id: str,
+        limit: int,
+    ) -> None:
+        if len(sample) < limit:
+            sample.append(str(task_id))
 
     def _cleanup_failed_initialization(self) -> None:
         self._closing = True
@@ -233,52 +402,6 @@ class ObjectTaskManager:
         self._executor.shutdown(wait=False, cancel_futures=True)
         if not self._loop.is_running() and not self._loop.is_closed():
             self._loop.close()
-
-    def _reconcile_missing_terminal_results_after_reopen(self) -> list[str]:
-        """Clear success references whose runtime-only Object payload is gone.
-
-        A normal persistent-store reopen releases live Object rows whose payload
-        cache cannot be reconstructed.  Terminal ObjectTask rows are durable
-        history, so leaving their old ``result_oid`` attached would falsely
-        advertise a live result.  Preserve the old claim in wait metadata and
-        publish an explicit terminal status instead.
-        """
-
-        unavailable: list[str] = []
-        now = utc_now()
-        with self._records.transaction():
-            for task in self._records.list_object_tasks(include_terminal=True):
-                if task.status != ObjectTaskStatus.SUCCEEDED or task.result_oid is None:
-                    continue
-                result_oid = str(task.result_oid)
-                if self._objects.get_object(result_oid) is not None:
-                    continue
-                wait = {
-                    **task.wait,
-                    "result_unavailable_after_reopen": True,
-                    "result_unavailable_at": now,
-                    "previous_status": task.status.value,
-                    "previous_result_oid": result_oid,
-                    "previous_error": task.error,
-                }
-                updated = replace(
-                    task,
-                    status=ObjectTaskStatus.RESULT_UNAVAILABLE_AFTER_REOPEN,
-                    result_oid=None,
-                    error="result unavailable after runtime reopen: runtime-only Object payload was not reconstructable",
-                    wait=wait,
-                    updated_at=now,
-                )
-                self._records.update_object_task(updated)
-                unavailable.append(str(task.task_id))
-            if unavailable:
-                self._audit.record(
-                    actor="object_task",
-                    action="object_task.result_unavailable_recovered",
-                    target="object_tasks",
-                    decision={"task_ids": sorted(unavailable)},
-                )
-        return sorted(unavailable)
 
     def start(
         self,
@@ -322,14 +445,9 @@ class ObjectTaskManager:
                 goal={"type": "object_task", "task_id": task_id, "owner_oid": owner.oid, "tool": tool_name},
                 inherit_capabilities=[dict(spec) if isinstance(spec, dict) else spec.__dict__ for spec in (inherit_capabilities or [])],
                 initial_status=ProcessStatus.WAITING_TOOL,
+                initial_wait_state=ToolProcessWait(operation_id=task_id),
             )
-            self._tools.configure_process_tools(runner_pid, [handle], assigned_by=f"object_task:{task_id}")
-            self._capabilities.handle_for_object(
-                runner_pid,
-                owner.oid,
-                {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value},
-                issued_by=f"object_task:{task_id}",
-            )
+            self._bootstrap_runner(runner_pid, handle, owner.oid, task_id)
 
             now = utc_now()
             task = ObjectTask(
@@ -380,40 +498,7 @@ class ObjectTaskManager:
         try:
             # Persist start observability before making the coroutine runnable;
             # otherwise a fast task can record RUNNING/COMPLETED before STARTED.
-            with self._records.transaction():
-                self._events.emit(
-                    EventType.OBJECT_TASK_STARTED,
-                    source=pid,
-                    target=owner.oid,
-                    payload={"task_id": task_id, "runner_pid": runner_pid, "tool": tool_name},
-                )
-                self._audit.record(
-                    actor=pid,
-                    action="object_task.start",
-                    target=f"object:{owner.oid}",
-                    input_refs=[owner.oid],
-                    decision={
-                        "task_id": task_id,
-                        "runner_pid": runner_pid,
-                        "tool": tool_name,
-                        "args": sanitize_for_observability(task_args),
-                        "notify_pid": selected_notify_pid,
-                        "notify_kind": selected_kind.value,
-                    },
-                )
-                if selected_owner_watch.enabled:
-                    self._audit.record(
-                        actor=pid,
-                        action="object_task.owner_watch.register",
-                        target=f"object_task:{task_id}",
-                        input_refs=[owner.oid],
-                        decision={
-                            "owner_oid": owner.oid,
-                            "events": selected_owner_watch.events,
-                            "kind": selected_owner_watch.kind,
-                            "channel": selected_owner_watch.channel,
-                        },
-                    )
+            self._record_start_observability(task, owner, task_args)
         except Exception as exc:
             self._abort_unscheduled_task(task_id, runner_pid, f"object task start observability failed: {exc}")
             raise
@@ -429,6 +514,80 @@ class ObjectTaskManager:
             self._abort_unscheduled_task(task_id, runner_pid, f"object task scheduling failed: {exc}")
             raise
         return task
+
+    def _bootstrap_runner(
+        self,
+        runner_pid: str,
+        handle: ToolHandle,
+        owner_oid: str,
+        task_id: str,
+    ) -> None:
+        # ObjectTask runners are Host-managed children.  When start() is called
+        # from a scheduler quantum, the creator's execution token is still
+        # bound, so these bootstrap writes are intentionally cross-PID.  Keep
+        # that exception confined to this new runner and its exact pre-run
+        # state; ordinary worker writes remain bound to the creator PID.
+        with trusted_process_control_mutation(
+            runner_pid,
+            allowed_statuses={ProcessStatus.WAITING_TOOL},
+            reason="object_task.start bootstraps its waiting runner",
+        ):
+            self._tools.configure_process_tools(
+                runner_pid,
+                [handle],
+                assigned_by=f"object_task:{task_id}",
+            )
+            self._capabilities.handle_for_object(
+                runner_pid,
+                owner_oid,
+                {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value},
+                issued_by=f"object_task:{task_id}",
+            )
+
+    def _record_start_observability(
+        self,
+        task: ObjectTask,
+        owner: ObjectHandle,
+        task_args: dict[str, Any],
+    ) -> None:
+        with self._records.transaction():
+            self._events.emit(
+                EventType.OBJECT_TASK_STARTED,
+                source=task.creator_pid,
+                target=owner.oid,
+                payload={
+                    "task_id": task.task_id,
+                    "runner_pid": task.runner_pid,
+                    "tool": task.tool,
+                },
+            )
+            self._audit.record(
+                actor=task.creator_pid,
+                action="object_task.start",
+                target=f"object:{owner.oid}",
+                input_refs=[owner.oid],
+                decision={
+                    "task_id": task.task_id,
+                    "runner_pid": task.runner_pid,
+                    "tool": task.tool,
+                    "args": sanitize_for_observability(task_args),
+                    "notify_pid": task.notification.recipient_pid,
+                    "notify_kind": task.notification.kind,
+                },
+            )
+            if task.owner_watch.enabled:
+                self._audit.record(
+                    actor=task.creator_pid,
+                    action="object_task.owner_watch.register",
+                    target=f"object_task:{task.task_id}",
+                    input_refs=[owner.oid],
+                    decision={
+                        "owner_oid": owner.oid,
+                        "events": task.owner_watch.events,
+                        "kind": task.owner_watch.kind,
+                        "channel": task.owner_watch.channel,
+                    },
+                )
 
     def watch_owner(
         self,
@@ -619,6 +778,110 @@ class ObjectTaskManager:
         return notified
 
     def shutdown(self) -> bool:
+        """Stop this manager as an admitted public control mutation."""
+
+        return self._shutdown()
+
+    def _issue_lifecycle_shutdown_handle(self) -> object:
+        """Return the opaque handle used by RuntimeLifecycle teardown."""
+
+        capability = self.__lifecycle_shutdown_capability
+        return _ObjectTaskLifecycleShutdownHandle(
+            shutdown=lambda: self._shutdown_for_lifecycle(capability),
+            release_recovery_diagnostics=(
+                lambda: self._abandon_for_recovery(capability)
+            ),
+        )
+
+    def _shutdown_for_lifecycle(self, capability: object) -> bool:
+        if capability is not self.__lifecycle_shutdown_capability:
+            raise RuntimeError("invalid ObjectTask lifecycle shutdown capability")
+        return self._shutdown()
+
+    def _abandon_for_recovery(self, capability: object) -> bool:
+        """Stop transient execution after a drained persistent recovery fence.
+
+        RuntimeLifecycle owns the opaque capability and verifies both the
+        monotonic recovery fence and admission drain before reaching this
+        method.  Unlike ordinary shutdown, this path must preserve every
+        durable task, runner, audit, and event row for recovery diagnostics.
+        """
+
+        if capability is not self.__lifecycle_shutdown_capability:
+            raise RuntimeError("invalid ObjectTask lifecycle shutdown capability")
+        return self._abandon_transient_workers()
+
+    def _abandon_transient_workers(self) -> bool:
+        """Quiesce in-memory worker state without writing durable evidence."""
+
+        with self._lock:
+            if self._closed:
+                return True
+            # A running coroutine owns a lifecycle admission for its entire
+            # publication/error path.  Recovery release must wait for that
+            # lease to drain; never cancel an admitted run out from under it.
+            if self._active_runs:
+                return False
+            self._closing = True
+            started = self._started
+            futures = tuple(self._futures.values())
+
+        if not started:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            if not self._loop.is_closed():
+                self._loop.close()
+        else:
+            # Linearize on the loop after every pre-existing scheduling
+            # callback. _closing prevents new submissions while the lifecycle
+            # recovery fence prevents a queued coroutine from entering its
+            # admitted execution body. If an admitted run is still alive, do
+            # not cancel or stop anything: the lifecycle can retry after drain.
+            stop_decided = threading.Event()
+            stop_allowed = False
+
+            def stop_if_quiescent() -> None:
+                nonlocal stop_allowed
+                with self._lock:
+                    stop_allowed = not self._active_runs
+                if stop_allowed:
+                    self._loop.stop()
+                stop_decided.set()
+
+            try:
+                self._loop.call_soon_threadsafe(stop_if_quiescent)
+            except RuntimeError:
+                if self._thread.is_alive():
+                    return False
+            if self._thread.is_alive() and not stop_decided.wait(
+                timeout=self.config.object_tasks.shutdown_join_timeout_s
+            ):
+                return False
+            if not stop_allowed and self._thread.is_alive():
+                return False
+            self._thread.join(
+                timeout=self.config.object_tasks.shutdown_join_timeout_s
+            )
+            if self._thread.is_alive():
+                return False
+
+            # _run_loop cancels and gathers every pending asyncio Task after
+            # stop, then drains the owned default executor before closing the
+            # loop. The bridge futures must therefore also be terminal here.
+            if any(not future.done() for future in futures):
+                return False
+
+        with self._lock:
+            # No durable cleanup belongs on this path.  Drop only process-local
+            # scheduling inputs and bookkeeping after the worker is gone.
+            if self._active_runs:
+                return False
+            self._futures.clear()
+            self._grant_result_to_notify.clear()
+            self._pending_args.clear()
+            self._closed = True
+        return True
+
+    def _shutdown(self) -> bool:
         if self._closed:
             return True
         with self._lock:
@@ -675,7 +938,13 @@ class ObjectTaskManager:
         with self._lock:
             self._active_runs.add(task_id)
         try:
-            await self._execute_task(task_id)
+            # Scheduling deliberately starts from a clean Context so the
+            # caller's short-lived admission cannot escape into this worker.
+            # Acquire one fresh lease for the complete background execution,
+            # including error handling and terminal notification publication.
+            # Nested Tool/Process/DataFlow guards inherit this lease.
+            with self._admission.admit():
+                await self._execute_task(task_id)
         finally:
             self._finish_active_run(task_id)
 
@@ -708,31 +977,7 @@ class ObjectTaskManager:
             if result.ok:
                 result_oid = result.result_handle.oid if result.result_handle is not None else None
                 if result_oid is not None:
-                    self._memory.transfer_owner(
-                        ObjectOwnerKind.PROCESS,
-                        str(task.runner_pid),
-                        ObjectOwnerKind.OBJECT_TASK,
-                        task_id,
-                        [result_oid],
-                        actor=f"object_task:{task_id}",
-                        reason="object_task_result",
-                    )
-                    creator_handle = self._capabilities.handle_for_object(
-                        task.creator_pid,
-                        result_oid,
-                        {ObjectRight.READ.value, ObjectRight.MATERIALIZE.value, ObjectRight.LINK.value},
-                        issued_by=f"object_task:{task_id}",
-                    )
-                    self._add_handle_to_process_view(task.creator_pid, creator_handle)
-                    self._memory.link_objects_trusted(
-                        f"object_task:{task_id}",
-                        task.owner_oid,
-                        RelationType.PRODUCED,
-                        creator_handle.oid,
-                        metadata={"task_id": task_id, "tool": task.tool},
-                        reason="object_task_result",
-                    )
-                    pending_notify_grant = self._prepare_notify_result_grant(
+                    pending_notify_grant = self._publish_success_result(
                         task,
                         result_oid,
                     )
@@ -794,6 +1039,47 @@ class ObjectTaskManager:
                 reason="object task notify-result publication did not settle",
             )
 
+    def _publish_success_result(
+        self,
+        task: ObjectTask,
+        result_oid: str,
+    ) -> _PendingNotifyResultGrant | None:
+        task_id = task.task_id
+        self._memory.transfer_owner(
+            ObjectOwnerKind.PROCESS,
+            str(task.runner_pid),
+            ObjectOwnerKind.OBJECT_TASK,
+            task_id,
+            [result_oid],
+            actor=f"object_task:{task_id}",
+            reason="object_task_result",
+        )
+        creator = self._records.get_process(task.creator_pid)
+        if (
+            creator is not None
+            and creator.status not in self._process.TERMINAL_STATUSES
+        ):
+            creator_handle = self._capabilities.handle_for_object(
+                task.creator_pid,
+                result_oid,
+                {
+                    ObjectRight.READ.value,
+                    ObjectRight.MATERIALIZE.value,
+                    ObjectRight.LINK.value,
+                },
+                issued_by=f"object_task:{task_id}",
+            )
+            self._add_handle_to_process_view(task.creator_pid, creator_handle)
+        self._memory.link_objects_trusted(
+            f"object_task:{task_id}",
+            task.owner_oid,
+            RelationType.PRODUCED,
+            result_oid,
+            metadata={"task_id": task_id, "tool": task.tool},
+            reason="object_task_result",
+        )
+        return self._prepare_notify_result_grant(task, result_oid)
+
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
         self._loop.set_default_executor(self._executor)
@@ -804,8 +1090,9 @@ class ObjectTaskManager:
             task.cancel()
         if pending:
             self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-        # Sync tools run via asyncio.to_thread(), so the object-task loop must
-        # drain its default executor before Runtime closes the shared store.
+        # The object-task event loop owns this explicitly installed executor;
+        # drain it before Runtime closes the shared store, including work that
+        # a coroutine dependency may have submitted through the loop default.
         self._loop.run_until_complete(self._loop.shutdown_default_executor())
         self._loop.close()
 
@@ -814,7 +1101,17 @@ class ObjectTaskManager:
             raise RuntimeError("object task manager is shutting down")
         if not self._started:
             raise RuntimeError("object task worker has not started")
-        future = asyncio.run_coroutine_threadsafe(self._run_task(task_id), self._loop)
+        # run_coroutine_threadsafe copies the submitting thread's ContextVars.
+        # A task is submitted from a caller admission scope but outlives that
+        # scope, so inheriting its lease races the caller marking it inactive.
+        # Start background work from a clean context; public mutations inside
+        # the coroutine then acquire their own lifecycle admission lease.
+        future = contextvars.Context().run(
+            lambda: asyncio.run_coroutine_threadsafe(
+                self._run_task(task_id),
+                self._loop,
+            )
+        )
         self._futures[task_id] = future
         future.add_done_callback(lambda _future, task_id=task_id: self._forget_future(task_id))
         return future

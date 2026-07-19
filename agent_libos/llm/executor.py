@@ -30,6 +30,7 @@ from agent_libos.llm.pending import (
 )
 from agent_libos.llm.actions import LLMActionService, auto_wait_message_action
 from agent_libos.llm.provider_service import LLMProviderService
+from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.ports import (
     AuditPort,
     AuthorityManifestPort,
@@ -49,6 +50,7 @@ from agent_libos.models import (
     ExternalEffectClassification,
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
+    FailedProcessOutcome,
     HumanRequestStatus,
     LLMCallRecord,
     ObjectHandle,
@@ -160,6 +162,9 @@ class LLMProcessExecutor:
         self._authority = unit_of_work.authority
         self._evidence = unit_of_work.evidence
         self._process = process
+        self._process_transitions = getattr(process, "transitions", None)
+        if self._process_transitions is None:
+            self._process_transitions = ProcessTransitionService(self._processes)
         self._operations = operations
         self._data_flow = data_flow
         self._tools = tools
@@ -359,15 +364,7 @@ class LLMProcessExecutor:
             return {"ok": False, "resource_limit_exceeded": True, "error": str(exc)}
         flow_context = self._data_flow.context_from_materialization(pid, context)
         if events:
-            current = self._process.get(pid)
-            if current.event_cursor != events[-1].event_id:
-                current.event_cursor = events[-1].event_id
-                current.updated_at = utc_now()
-                self._processes.patch_process(
-                    pid,
-                    {"event_cursor": current.event_cursor, "updated_at": current.updated_at},
-                    expected_revision=current.revision,
-                )
+            self._advance_event_cursor(pid, events[-1].event_id)
         messages = [
             {"role": "system", "content": build_system_prompt(image)},
             {
@@ -457,6 +454,26 @@ class LLMProcessExecutor:
             return {"ok": False, "error": str(exc)}
         finally:
             self._data_flow.reset(flow_token)
+
+    def _advance_event_cursor(self, pid: str, event_id: str) -> None:
+        """Advance one worker's cursor without racing cross-process accounting.
+
+        A child resource charge also updates each ancestor's process row.  Keep
+        the cursor re-read and field-level CAS in the repository lock domain so
+        that unrelated hierarchical accounting cannot invalidate the revision
+        between those two operations.  ``patch_process`` still enforces the
+        ambient execution-token fence before this worker may mutate the row.
+        """
+
+        with self._processes.locked():
+            current = self._process.get(pid)
+            if current.event_cursor == event_id:
+                return
+            self._processes.patch_process(
+                pid,
+                {"event_cursor": event_id, "updated_at": utc_now()},
+                expected_revision=current.revision,
+            )
 
     def _completed_action_result(
         self,
@@ -1335,13 +1352,15 @@ class LLMProcessExecutor:
                             ProcessStatus.FAILED,
                             ProcessStatus.KILLED,
                         }:
-                            current.status = ProcessStatus.FAILED
-                            current.status_message = message
-                            current.updated_at = utc_now()
-                            self._processes.transition_process(
+                            self._process_transitions.transition(
                                 pid,
                                 ProcessStatus.FAILED,
                                 expected_revision=current.revision,
+                                expected_status=current.status,
+                                expected_state_generation=current.state_generation,
+                                outcome=FailedProcessOutcome(
+                                    code="pending_action_resume_interrupted"
+                                ),
                                 status_message=message,
                             )
                 except Exception as fallback_exc:

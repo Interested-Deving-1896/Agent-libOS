@@ -8,12 +8,20 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.api.cli import cli as cli_entrypoint
 from agent_libos.api.cli import main as cli_main
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import CapabilityRight, ObjectMetadata, ObjectType, ProcessMessageKind, ProcessStatus
+from agent_libos.models import (
+    CapabilityRight,
+    ObjectMetadata,
+    ObjectType,
+    ProcessMessageKind,
+    ProcessStatus,
+    process_outcome_to_mapping,
+)
 from agent_libos.substrate import LocalResourceProviderSubstrate
 
 
@@ -35,6 +43,90 @@ def _create_store_with_schema_version(db: Path, version: int) -> None:
 
 
 class TestCLIBuiltinCommand:
+
+    def test_cli_processes_preserves_typed_wait_and_outcome_discriminators(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        waiting_pid = runtime.process.spawn(goal="typed waiting state")
+        runtime.process.pause(waiting_pid, "review")
+        terminal_pid = runtime.process.spawn(goal="typed terminal outcome")
+        runtime.process.exit(terminal_pid, message="done")
+        monkeypatch.setattr("agent_libos.api.cli.Runtime.open", lambda *args, **kwargs: runtime)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            cli_entrypoint(["processes"])
+
+        processes = {
+            process["pid"]: process
+            for process in json.loads(stdout.getvalue())
+        }
+        assert stderr.getvalue() == ""
+        assert processes[waiting_pid]["wait_state"] == {
+            "schema_version": 1,
+            "kind": "paused",
+            "reason_oid": processes[waiting_pid]["wait_state"]["reason_oid"],
+        }
+        assert processes[waiting_pid]["outcome"] is None
+        assert processes[terminal_pid]["wait_state"] is None
+        assert processes[terminal_pid]["outcome"] == {
+            "schema_version": 1,
+            "kind": "exited",
+            "result_oid": processes[terminal_pid]["outcome"]["result_oid"],
+        }
+        assert processes[terminal_pid]["outcome"]["result_oid"]
+
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        (
+            (["--limit", "0"], "payload retention request limit must be positive"),
+            (
+                ["--after-created-at", "", "--after-record-id", "record-1"],
+                "payload retention cursor created_at must not be empty",
+            ),
+            (["--limit", "3"], "payload retention request limit exceeds hard limit 2"),
+        ),
+    )
+    def test_cli_payload_retention_value_errors_use_structured_error_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        arguments: list[str],
+        message: str,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            runtime=replace(
+                DEFAULT_CONFIG.runtime,
+                payload_retention_enabled=True,
+                payload_retention_summary_after_seconds=0,
+                payload_retention_page_size=1,
+                payload_retention_page_hard_limit=2,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        monkeypatch.setattr("agent_libos.api.cli.Runtime.open", lambda *args, **kwargs: runtime)
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+            pytest.raises(SystemExit) as raised,
+        ):
+            cli_entrypoint(["payload-retention", "llm_call", *arguments])
+
+        assert raised.value.code == 1
+        assert stderr.getvalue() == ""
+        assert json.loads(stdout.getvalue()) == {
+            "schema_version": 1,
+            "error": {
+                "type": "ValidationError",
+                "message": message,
+            },
+        }
 
     def test_cli_runtime_not_found_uses_structured_error_and_exit_one(
         self,
@@ -319,6 +411,54 @@ class TestCLIBuiltinCommand:
                 assert (process.status_message or '').startswith('result_oid:')
             finally:
                 runtime.close()
+
+    def test_cli_exit_message_returns_the_durable_typed_outcome(self) -> None:
+        for failed in (False, True):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                db = root / 'runtime.sqlite'
+                with _temporary_cwd(root):
+                    spawn = _run_cli_json(
+                        [
+                            '--db',
+                            str(db),
+                            'spawn',
+                            '--image',
+                            'base-agent:v0',
+                            '--goal',
+                            'finish with a message',
+                        ]
+                    )
+                    arguments = [
+                        '--db',
+                        str(db),
+                        'exit',
+                        spawn['pid'],
+                        '--message',
+                        'done',
+                    ]
+                    if failed:
+                        arguments.append('--failed')
+                    result = _run_cli_json(arguments)
+                runtime = Runtime.open(
+                    db,
+                    substrate=LocalResourceProviderSubstrate(root),
+                )
+                try:
+                    process = runtime.process.get(spawn['pid'])
+                    expected_outcome = process_outcome_to_mapping(process.outcome)
+                    assert result['status'] == (
+                        ProcessStatus.FAILED.value
+                        if failed
+                        else ProcessStatus.EXITED.value
+                    )
+                    assert result['wait_state'] is None
+                    assert result['outcome'] == expected_outcome
+                    assert result['state_generation'] == process.state_generation
+                    assert result['result_oid'] == expected_outcome['result_oid']
+                    assert result['result_oid'] is not None
+                finally:
+                    runtime.close()
 
     def test_cli_exec_loads_image_package_from_first_arg_and_uses_second_arg_as_goal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

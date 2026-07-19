@@ -16,8 +16,8 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import NotFound, ValidationError
 from agent_libos.ports import AuditPort
 from agent_libos.runtime.image_artifact import ImageArtifactLoader
-from agent_libos.storage import RuntimeStore
-from agent_libos.storage.repositories import ProcessRepository
+from agent_libos.models.snapshot import SnapshotRows
+from agent_libos.storage import UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps, loads
 
@@ -35,8 +35,7 @@ class CheckpointImageInstaller:
         self,
         *,
         loader: ImageArtifactLoader,
-        store: RuntimeStore,
-        processes: ProcessRepository,
+        unit_of_work: UnitOfWork,
         memory: ObjectMemoryManager,
         capabilities: CapabilityManager,
         authority_manifests: AuthorityManifestManager,
@@ -45,8 +44,11 @@ class CheckpointImageInstaller:
         audit: AuditPort,
     ) -> None:
         self._loader = loader
-        self._store = store
-        self._processes = processes
+        self._unit_of_work = unit_of_work
+        self._snapshots = unit_of_work.snapshots
+        self._processes = unit_of_work.processes
+        self._objects = unit_of_work.objects
+        self._publications = unit_of_work.publications
         self._memory = memory
         self._capabilities = capabilities
         self._authority_manifests = authority_manifests
@@ -63,7 +65,13 @@ class CheckpointImageInstaller:
             {"modules": artifact.get("modules", [])}
         )
 
-    def install(self, pid: str, image: AgentImage) -> None:
+    def install(
+        self,
+        pid: str,
+        image: AgentImage,
+        *,
+        publication_id: str | None = None,
+    ) -> None:
         artifact = self._loader.load(
             image,
             expected_kind="checkpoint_commit",
@@ -71,10 +79,19 @@ class CheckpointImageInstaller:
         self._checkpoint.require_snapshot_modules(
             {"modules": artifact.get("modules", [])}
         )
-        remapped = self._remap_for_process(pid, artifact)
+        remapped = self._remap_for_process(
+            pid,
+            artifact,
+            publication_id=publication_id,
+        )
         self._assert_data_flow(pid, remapped)
+        self._record_capability_intents(publication_id, remapped["capabilities"])
         self._insert_memory_rows(remapped)
-        tool_table = self._restore_tool_table(pid, artifact)
+        tool_table = self._restore_tool_table(
+            pid,
+            artifact,
+            publication_id=publication_id,
+        )
         process = self._require_process(pid)
         process.working_directory = str(
             artifact.get("working_directory")
@@ -86,7 +103,12 @@ class CheckpointImageInstaller:
             tool_table,
         )
         process.tool_table = tool_table
-        self._merge_memory_view(process, artifact, remapped)
+        self._merge_memory_view(
+            process,
+            artifact,
+            remapped,
+            publication_id=publication_id,
+        )
         process.updated_at = utc_now()
         self._processes.patch_process(
             pid,
@@ -109,6 +131,7 @@ class CheckpointImageInstaller:
                 "source_checkpoint_id": artifact.get("source_checkpoint_id"),
                 "objects": len(remapped["object_payloads"]),
                 "tools": sorted(tool_table),
+                "publication_id": publication_id,
             },
         )
 
@@ -116,6 +139,8 @@ class CheckpointImageInstaller:
         self,
         pid: str,
         artifact: dict[str, Any],
+        *,
+        publication_id: str | None = None,
     ) -> dict[str, Any]:
         source_pid = str(artifact["source_pid"])
         old_oids = list(artifact.get("object_oids", []))
@@ -166,6 +191,7 @@ class CheckpointImageInstaller:
                     namespace_map,
                     capability_map,
                     now,
+                    publication_id=publication_id,
                 )
                 for row in capability_rows
                 if row["subject"] == source_pid
@@ -194,7 +220,7 @@ class CheckpointImageInstaller:
             # this process, preserving current memory during exec.
             existing = None
             if name != old_oid:
-                existing = self._store.get_object_by_name(name, namespace)
+                existing = self._objects.get_object_by_name(name, namespace)
             if existing is None:
                 oid_map[old_oid] = new_id("obj")
                 continue
@@ -270,7 +296,7 @@ class CheckpointImageInstaller:
             for oid in provenance.get("parent_oids", [])
         ]
         item["provenance_json"] = dumps(provenance)
-        item["payload_json"] = dumps(self._store.payload_marker(present=False))
+        item["payload_json"] = dumps(self._objects.payload_marker(present=False))
         item["created_at"] = now
         item["updated_at"] = now
         return item
@@ -296,6 +322,8 @@ class CheckpointImageInstaller:
         namespace_map: dict[str, str],
         capability_map: dict[str, str],
         now: str,
+        *,
+        publication_id: str | None = None,
     ) -> dict[str, Any]:
         item = dict(row)
         item["cap_id"] = capability_map[item["cap_id"]]
@@ -318,31 +346,53 @@ class CheckpointImageInstaller:
             item["resource"] = f"object_namespace:{namespace_map[namespace]}"
         item["issued_by"] = f"image.commit:{item['issued_by']}"
         item["issued_at"] = now
+        metadata = loads(item.get("metadata_json"), {})
+        if publication_id is not None:
+            metadata["runtime_publication_id"] = publication_id
+            metadata["runtime_publication_kind"] = "checkpoint_commit_capability"
+        item["metadata_json"] = dumps(metadata)
         return item
 
+    def _record_capability_intents(
+        self,
+        publication_id: str | None,
+        capabilities: list[dict[str, Any]],
+    ) -> None:
+        """Persist exact compensation identities before inserting authority."""
+
+        if publication_id is None:
+            return
+        for capability in capabilities:
+            cap_id = str(capability["cap_id"])
+            if not self._publications.record_runtime_publication_artifact(
+                publication_id,
+                {
+                    "artifact_id": f"capability:{cap_id}",
+                    "kind": "capability",
+                    "capability_id": cap_id,
+                    "resource": str(capability["resource"]),
+                    "status": "intent",
+                },
+                expected_states={"planning", "applying"},
+            ):
+                raise ValidationError(
+                    "runtime publication changed before checkpoint capability install: "
+                    f"{publication_id}"
+                )
+
     def _insert_memory_rows(self, remapped: dict[str, Any]) -> None:
-        with self._store.transaction(include_object_payloads=True) as cursor:
-            for row in remapped["object_namespaces"]:
-                exists = cursor.execute(
-                    "SELECT 1 FROM object_namespaces WHERE namespace = ?",
-                    (row["namespace"],),
-                ).fetchone()
-                if exists is None:
-                    self._store.insert_table_row("object_namespaces", row)
-            for row in remapped["objects"]:
-                item = dict(row)
-                oid = str(item["oid"])
-                if oid in remapped["object_payloads"]:
-                    item["payload_json"] = dumps(remapped["object_payloads"][oid])
-                self._store.insert_table_row("objects", item)
-                if oid in remapped["object_payloads"]:
-                    self._store.set_object_payload(
-                        oid,
-                        deepcopy(remapped["object_payloads"][oid]),
-                    )
-            for table in ("object_links", "capabilities"):
-                for row in remapped[table]:
-                    self._store.insert_table_row(table, row)
+        row_mapping = {table: [] for table in SnapshotRows.TABLES}
+        for table in (
+            "object_namespaces",
+            "objects",
+            "object_links",
+            "capabilities",
+        ):
+            row_mapping[table] = list(remapped[table])
+        self._snapshots.install_checkpoint_image_rows(
+            SnapshotRows.from_mapping(row_mapping),
+            object_payloads=remapped["object_payloads"],
+        )
 
     def _assert_data_flow(self, pid: str, remapped: dict[str, Any]) -> None:
         for row in remapped["objects"]:
@@ -364,6 +414,8 @@ class CheckpointImageInstaller:
         self,
         pid: str,
         artifact: dict[str, Any],
+        *,
+        publication_id: str | None = None,
     ) -> dict[str, str]:
         tool_rows = {
             row["tool_id"]: row
@@ -379,6 +431,7 @@ class CheckpointImageInstaller:
                     old_tool_id,
                     tool_rows,
                     jit_sources,
+                    publication_id=publication_id,
                 )
             else:
                 handle = self._tools.resolve(name)
@@ -393,6 +446,8 @@ class CheckpointImageInstaller:
         old_tool_id: str,
         tool_rows: dict[str, dict[str, Any]],
         jit_sources: dict[str, str],
+        *,
+        publication_id: str | None = None,
     ) -> Any:
         row = tool_rows.get(old_tool_id)
         if row is None:
@@ -403,7 +458,12 @@ class CheckpointImageInstaller:
             scope=str(row["scope"]),
             spec=ToolSpec(**loads(row["spec_json"], {})),
             source_code=str(jit_sources[old_tool_id]),
-            registered_by=f"image.commit:{pid}",
+            registered_by=(
+                f"publication:{publication_id}"
+                if publication_id is not None
+                else f"image.commit:{pid}"
+            ),
+            publication_id=publication_id,
         )
 
     @staticmethod
@@ -435,6 +495,8 @@ class CheckpointImageInstaller:
         process: Any,
         artifact: dict[str, Any],
         remapped: dict[str, Any],
+        *,
+        publication_id: str | None = None,
     ) -> None:
         source = loads(
             artifact.get("source_process", {}).get("memory_view_json"),
@@ -447,7 +509,12 @@ class CheckpointImageInstaller:
             if process.memory_view is not None
             else []
         )
-        roots = self._remap_memory_roots(process, source, remapped)
+        roots = self._remap_memory_roots(
+            process,
+            source,
+            remapped,
+            publication_id=publication_id,
+        )
         for handle in existing_roots:
             if all(item.oid != handle.oid for item in roots):
                 roots.append(handle)
@@ -465,6 +532,8 @@ class CheckpointImageInstaller:
         process: Any,
         source: dict[str, Any],
         remapped: dict[str, Any],
+        *,
+        publication_id: str | None = None,
     ) -> list[ObjectHandle]:
         roots: list[ObjectHandle] = []
         capability_map = remapped["capability_map"]
@@ -477,13 +546,31 @@ class CheckpointImageInstaller:
             rights = set(root.get("rights", []))
             new_capability = capability_map.get(root.get("capability_id"))
             if new_capability is None:
-                handle = self._capabilities.handle_for_object(
-                    subject=process.pid,
-                    oid=new_oid,
-                    rights=rights,
-                    issued_by="image.commit",
-                )
-                new_capability = handle.capability_id
+                with self._unit_of_work.transaction():
+                    handle = self._capabilities.handle_for_object(
+                        subject=process.pid,
+                        oid=new_oid,
+                        rights=rights,
+                        issued_by="image.commit",
+                        metadata=(
+                            {
+                                "runtime_publication_id": publication_id,
+                                "runtime_publication_kind": "checkpoint_commit_handle",
+                            }
+                            if publication_id is not None
+                            else None
+                        ),
+                    )
+                    new_capability = handle.capability_id
+                    self._record_capability_intents(
+                        publication_id,
+                        [
+                            {
+                                "cap_id": new_capability,
+                                "resource": f"object:{new_oid}",
+                            }
+                        ],
+                    )
             roots.append(
                 ObjectHandle(
                     oid=new_oid,

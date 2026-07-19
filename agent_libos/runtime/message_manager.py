@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from typing import TYPE_CHECKING, Any, Iterable
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
@@ -10,15 +9,19 @@ from agent_libos.models import (
     DataLabels,
     EventPriority,
     EventType,
+    MessageProcessWait,
     ObjectMetadata,
     ProcessMessage,
     ProcessMessageKind,
     ProcessMessageStatus,
     ProcessStatus,
+    ProcessWaitState,
+    legacy_status_message,
 )
 from agent_libos.models.exceptions import NotFound, ProcessError, ProcessMessageWaitRequired, ValidationError
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.storage import ProcessRepository
 from agent_libos.tools.observability import ensure_json_size
 from agent_libos.utils.ids import new_id, utc_now
@@ -31,7 +34,6 @@ class ProcessMessageManager:
     """Per-process message queues with explicit read/ack semantics."""
 
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
-    WAIT_STATUS_PREFIX = "waiting_message:"
 
     def __init__(
         self,
@@ -41,6 +43,7 @@ class ProcessMessageManager:
         authority_policy: Any,
         *,
         process_manager: ProcessManager,
+        transitions: ProcessTransitionService | None = None,
         config: AgentLibOSConfig | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
@@ -50,6 +53,7 @@ class ProcessMessageManager:
         self.authority_policy = authority_policy
         self._object_tasks: Any | None = None
         self._process_manager = process_manager
+        self._transitions = transitions or ProcessTransitionService(store)
 
     def bind_object_tasks(self, object_tasks: Any) -> None:
         self._object_tasks = object_tasks
@@ -317,14 +321,14 @@ class ProcessMessageManager:
             if messages or not block:
                 return messages
             process = self._require_process(pid)
-            process.status = ProcessStatus.WAITING_EVENT
-            process.status_message = self._wait_status_message(filters)
-            process.updated_at = utc_now()
-            self.store.transition_process(
+            wait_state = self._message_wait_state(filters)
+            self._transitions.transition(
                 pid,
                 ProcessStatus.WAITING_EVENT,
                 expected_revision=process.revision,
-                status_message=process.status_message,
+                expected_status=process.status,
+                expected_state_generation=process.state_generation,
+                wait_state=wait_state,
             )
             self.audit.record(
                 actor=pid,
@@ -448,19 +452,14 @@ class ProcessMessageManager:
         process = self.store.get_process(message.recipient_pid)
         if process is None or process.status != ProcessStatus.WAITING_EVENT:
             return
-        filters = self._filters_from_wait_status(process.status_message)
-        if filters is None or not self._message_matches(message, filters):
+        wait_state = process.wait_state
+        if not isinstance(wait_state, MessageProcessWait):
             return
-        process.status = ProcessStatus.RUNNABLE
-        process.status_message = None
-        process.updated_at = utc_now()
-        self.store.transition_process(
-            process.pid,
-            ProcessStatus.RUNNABLE,
-            expected_revision=process.revision,
-            expected_status=ProcessStatus.WAITING_EVENT,
-            status_message=None,
-        )
+        filters = wait_state.filters
+        if not self._message_matches(message, filters):
+            return
+        token = self._transitions.wait_token(process)
+        self._transitions.wake(token)
         self.audit.record(
             actor="process.message",
             action="process.message.wait_wake",
@@ -510,33 +509,28 @@ class ProcessMessageManager:
         ensure_json_size(filters, self.config.tools.message_filter_json_max_bytes, "process message filters")
         return filters
 
-    def _wait_status_message(self, filters: dict[str, Any]) -> str:
-        status = f"{self.WAIT_STATUS_PREFIX}{json.dumps(filters, sort_keys=True)}"
-        if len(status) > self.config.tools.message_wait_status_max_chars:
+    def _message_wait_state(self, filters: dict[str, Any]) -> MessageProcessWait:
+        wait_state = MessageProcessWait(filters=filters)
+        compatibility_message = legacy_status_message(wait_state, None)
+        if (
+            compatibility_message is not None
+            and len(compatibility_message) > self.config.tools.message_wait_status_max_chars
+        ):
             raise ValidationError(
                 f"process message wait status exceeds {self.config.tools.message_wait_status_max_chars} chars"
             )
-        return status
-
-    def _filters_from_wait_status(self, status_message: str | None) -> dict[str, Any] | None:
-        if not status_message or not status_message.startswith(self.WAIT_STATUS_PREFIX):
-            return None
-        try:
-            decoded = json.loads(status_message[len(self.WAIT_STATUS_PREFIX) :])
-        except json.JSONDecodeError:
-            return None
-        return decoded if isinstance(decoded, dict) else None
+        return wait_state
 
     def has_matching_unread_wait(
         self,
         pid: str,
-        status_message: str | None,
+        wait_state: ProcessWaitState | None,
     ) -> bool:
         """Return whether a persisted message wait already has an unread match."""
 
-        filters = self._filters_from_wait_status(status_message)
-        if filters is None:
+        if not isinstance(wait_state, MessageProcessWait):
             return False
+        filters = wait_state.filters
         return bool(
             self.unread(
                 pid,

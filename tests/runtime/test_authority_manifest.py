@@ -6,7 +6,11 @@ import pytest
 
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models import CapabilityRight
+from agent_libos.models import (
+    CapabilityRight,
+    encode_permitted_effects_policy,
+    upcast_permitted_effects_policy,
+)
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 
 
@@ -19,9 +23,49 @@ def test_image_requirements_are_declared_but_not_granted_by_default() -> None:
         assert manifest is not None
         assert manifest.metadata["launch_authority_mode"] == "manifest_required"
         assert manifest.authorized_capabilities == []
+        assert manifest.permitted_effects is None
         assert manifest.required_capabilities
         assert not runtime.capability.check(pid, DEFAULT_CONFIG.runtime.default_human_resource, "write")
         assert runtime.authority_manifests.summary_for_process(pid)["missing_required_capabilities"]
+    finally:
+        runtime.close()
+
+
+def test_permitted_effects_policy_v2_distinguishes_unrestricted_and_deny_all() -> None:
+    assert encode_permitted_effects_policy(None) == {
+        "schema_version": 2,
+        "effects": None,
+    }
+    assert encode_permitted_effects_policy([]) == {
+        "schema_version": 2,
+        "effects": [],
+    }
+    assert upcast_permitted_effects_policy([]) is None
+    assert upcast_permitted_effects_policy(["jsonrpc.*"]) == ["jsonrpc.*"]
+    assert upcast_permitted_effects_policy(
+        {"schema_version": 2, "effects": []}
+    ) == []
+
+
+def test_explicit_empty_effect_ceiling_denies_all_while_omission_is_unrestricted() -> None:
+    runtime = Runtime.open("local")
+    try:
+        unrestricted = runtime.process.spawn(
+            goal="unrestricted effect compatibility",
+            authority_manifest={},
+        )
+        deny_all = runtime.process.spawn(
+            goal="deny every provider effect",
+            authority_manifest={"permitted_effects": []},
+        )
+
+        assert runtime.authority_manifests.get_for_process(unrestricted).permitted_effects is None
+        assert runtime.authority_manifests.get_for_process(deny_all).permitted_effects == []
+        runtime.authority_manifests.assert_effect(unrestricted, "jsonrpc.call")
+        with pytest.raises(CapabilityDenied, match="does not permit effect class"):
+            runtime.authority_manifests.assert_effect(deny_all, "jsonrpc.call")
+        with pytest.raises(CapabilityDenied, match="does not permit effect class"):
+            runtime.authority_manifests.assert_effect(deny_all, "human.write")
     finally:
         runtime.close()
 
@@ -276,6 +320,20 @@ def test_child_manifest_cannot_widen_parent_policy_ceilings() -> None:
         }
         assert child_manifest.expires_at == "2030-01-01T00:00:00Z"
 
+        deny_all_child = runtime.process.spawn_child(
+            parent,
+            "deny all effects",
+            capabilities=[child_spec],
+            authority_manifest={
+                "authorized_capabilities": [child_spec],
+                "permitted_effects": [],
+            },
+        )
+        assert (
+            runtime.authority_manifests.get_for_process(deny_all_child).permitted_effects
+            == []
+        )
+
         with pytest.raises(CapabilityDenied, match="effect ceiling"):
             runtime.process.spawn_child(
                 parent,
@@ -284,6 +342,16 @@ def test_child_manifest_cannot_widen_parent_policy_ceilings() -> None:
                 authority_manifest={
                     "authorized_capabilities": [child_spec],
                     "permitted_effects": ["jsonrpc.*"],
+                },
+            )
+        with pytest.raises(CapabilityDenied, match="effect ceiling"):
+            runtime.process.spawn_child(
+                parent,
+                "remove effect ceiling",
+                capabilities=[child_spec],
+                authority_manifest={
+                    "authorized_capabilities": [child_spec],
+                    "permitted_effects": None,
                 },
             )
         with pytest.raises(CapabilityDenied, match="requestable capability"):

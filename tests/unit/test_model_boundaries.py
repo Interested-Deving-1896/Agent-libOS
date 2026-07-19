@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +22,45 @@ def test_store_reports_invalid_persisted_process_status_with_context() -> None:
             runtime.store.get_process(pid)
     finally:
         runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "status_message"),
+    [
+        ("waiting_event", "waiting for pid_forged"),
+        ("exited", "result_oid:obj_forged"),
+    ],
+)
+def test_frozen_v3_rejects_typed_null_process_control_state_after_reopen(
+    tmp_path: Path,
+    status: str,
+    status_message: str,
+) -> None:
+    database = tmp_path / f"typed-null-{status}.db"
+    runtime = Runtime.open(database)
+    pid = runtime.process.spawn(
+        image="base-agent:v0",
+        goal="corrupt typed process state must fail closed",
+    )
+    runtime.close()
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE processes
+               SET status = ?, status_message = ?,
+                   wait_state_json = 'null', outcome_json = 'null'
+             WHERE pid = ?
+            """,
+            (status, status_message, pid),
+        )
+
+    reopened = Runtime.open(database)
+    try:
+        with pytest.raises(ValidationError, match=f"invalid persisted process {pid}"):
+            reopened.store.get_process(pid)
+    finally:
+        reopened.close()
 
 
 def test_image_registry_rejects_invalid_persisted_image_manifest() -> None:

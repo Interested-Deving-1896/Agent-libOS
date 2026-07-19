@@ -7,7 +7,9 @@ import math
 import os
 import re
 import socket
+import threading
 import time
+from functools import partial
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -35,11 +37,18 @@ from agent_libos.models import (
     JsonRpcTransportResult,
     ResourceUsage,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    NotFound,
+    ProviderHostError,
+    ValidationError,
+)
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import JsonRpcProvider, ProviderEffectNotStarted
 from agent_libos.sdk import (
+    ProviderRegistryBinding,
     ProtectedOperationEvidence,
     ProtectedOperationInvocation,
     ProtectedOperationSDK,
@@ -60,6 +69,22 @@ _FORBIDDEN_JSONRPC_HOSTS = {"metadata.google.internal"}
 _CALL_RIGHTS = {CapabilityRight.READ.value, CapabilityRight.WRITE.value, CapabilityRight.EXECUTE.value}
 _ALLOWED_HEADER_PREFIXES = {"", "Bearer ", "Token ", "Basic "}
 _ALLOWED_HEADER_SUFFIXES = {""}
+_PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
+
+
+def _mark_provider_result_returned(error: ProviderHostError) -> ProviderHostError:
+    """Mark a public provider error as occurring after a result was returned."""
+
+    object.__setattr__(error, _PROVIDER_RESULT_RETURNED_ATTR, True)
+    return error
+
+
+def _provider_result_was_returned(error: BaseException) -> bool:
+    try:
+        attributes = object.__getattribute__(error, "__dict__")
+    except Exception:
+        return False
+    return attributes.get(_PROVIDER_RESULT_RETURNED_ATTR) is True
 
 
 class JsonRpcPrimitive:
@@ -89,6 +114,7 @@ class JsonRpcPrimitive:
         self.human = human
         self.provider = provider
         self.resources = resources
+        self._registry_phase_lock = threading.RLock()
 
     def endpoint_resource(self, endpoint_id: str) -> str:
         return f"jsonrpc_endpoint:{endpoint_id}"
@@ -116,23 +142,17 @@ class JsonRpcPrimitive:
                 consume=False,
             )
         now = utc_now()
-        with self.unit_of_work.transaction():
+        with self._registry_phase_lock, self.capabilities.authority_transaction(
+            [authority_decision],
+            actor=actor,
+            operation="JSON-RPC endpoint registry",
+        ):
             existing = self.extensions.get_jsonrpc_endpoint(spec.endpoint_id)
             if existing is not None and not replace:
                 raise ValidationError(f"JSON-RPC endpoint already exists: {spec.endpoint_id}")
-            authority_reservation = self.capabilities.reserve_decision_use(
-                authority_decision,
-                used_by=actor,
-                reason="one-time JSON-RPC endpoint registry authority reserved",
-            )
             self.extensions.upsert_jsonrpc_endpoint(spec, registered_by=actor, created_at=now)
             if existing is not None:
                 self._disable_replaced_endpoint_method_capabilities(spec.endpoint_id, actor=actor)
-            self.capabilities.commit_reserved_use(
-                authority_reservation,
-                committed_by=actor,
-                reason="one-time JSON-RPC endpoint registry authority committed",
-            )
             self.events.emit(
                 EventType.EXTERNAL_WRITE,
                 source=actor,
@@ -240,20 +260,14 @@ class JsonRpcPrimitive:
                 CapabilityRight.ADMIN,
                 consume=False,
             )
-        with self.unit_of_work.transaction():
+        with self._registry_phase_lock, self.capabilities.authority_transaction(
+            [authority_decision],
+            actor=actor,
+            operation="JSON-RPC endpoint unregister",
+        ):
             self._load_endpoint(endpoint_id)
-            authority_reservation = self.capabilities.reserve_decision_use(
-                authority_decision,
-                used_by=actor,
-                reason="one-time JSON-RPC endpoint unregister authority reserved",
-            )
             self._disable_replaced_endpoint_method_capabilities(endpoint_id, actor=actor)
             self.extensions.delete_jsonrpc_endpoint(endpoint_id)
-            self.capabilities.commit_reserved_use(
-                authority_reservation,
-                committed_by=actor,
-                reason="one-time JSON-RPC endpoint unregister authority committed",
-            )
             self.events.emit(
                 EventType.EXTERNAL_WRITE,
                 source=actor,
@@ -277,21 +291,46 @@ class JsonRpcPrimitive:
         *,
         source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> JsonRpcCallResult:
-        resource = self.method_resource(endpoint_id, method_id)
-        self._validate_json_value(params, "params")
-        visibility_context = self._visibility_operation_context(pid, endpoint_id, method_id, params)
-        self._authorize_call_visibility(
+        try:
+            return self._call(
+                pid,
+                endpoint_id,
+                method_id,
+                params,
+                source_oids=source_oids,
+            )
+        except ProviderEffectNotStarted as error:
+            raise ProviderHostError(
+                code="jsonrpc_provider_not_started",
+                error_type=type(error).__name__,
+                correlation_id=new_id("corr"),
+            ) from None
+
+    def _call(
+        self,
+        pid: str,
+        endpoint_id: str,
+        method_id: str,
+        params: Any = None,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None = None,
+    ) -> JsonRpcCallResult:
+        resource, spec, method, registry_binding = self._resolve_call_target(
             pid,
-            resource,
-            visibility_context,
+            endpoint_id,
+            method_id,
+            params,
             source_oids=source_oids,
         )
-        spec, _metadata = self._load_endpoint(endpoint_id)
-        method = spec.method_by_id(method_id)
-        if method is None:
-            raise NotFound(f"JSON-RPC method not found: {endpoint_id}/{method_id}")
         request_id = new_id("jrpc")
-        operation_context = self._operation_context(pid, spec, method, params, request_id=request_id)
+        operation_context = self._operation_context(
+            pid,
+            spec,
+            method,
+            params,
+            request_id=request_id,
+            registry_binding=registry_binding,
+        )
         self._validate_params_against_schema(method, params)
         flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
         sink = DataSink(
@@ -325,14 +364,21 @@ class JsonRpcPrimitive:
                 "sandbox_profile": self._profile_json(profile),
             }
         )
-        request_body = self._request_body(method, params, request_id)
-        if len(request_body) > spec.max_request_bytes:
-            raise ValidationError(f"JSON-RPC request exceeds max_request_bytes={spec.max_request_bytes}")
+        request_body = self._bounded_request_body(spec, method, params, request_id)
         resource_context = {
             "endpoint_id": endpoint_id,
             "method_id": method_id,
             "request_bytes": len(request_body),
         }
+        resource_progress: dict[str, int | None] = {"response_bytes": None}
+        failure_resource = partial(
+            self._provider_result_failure_resource,
+            request_bytes=len(request_body),
+            max_response_bytes=spec.max_response_bytes,
+            resource_context=resource_context,
+            resource_progress=resource_progress,
+        )
+
         effect_context = self._effect_context(spec, method, operation_context, request_bytes=len(request_body))
         invocation = ProtectedOperationInvocation(
             pid=pid,
@@ -344,9 +390,9 @@ class JsonRpcPrimitive:
             preflight_usage=ResourceUsage(jsonrpc_request_bytes=len(request_body)),
             resource_source="primitive.jsonrpc.call",
             resource_context=resource_context,
-            failure_evidence=lambda error, phase: self._protected_failure_evidence(
-                pid, resource, method, operation_context, error, phase
-            ),
+            **self._protected_registry_guard(registry_binding, endpoint_id),
+            failure_resource=failure_resource,
+            failure_evidence=lambda error, phase: self._protected_failure_evidence(pid, resource, method, operation_context, error, phase),
             data_sink=sink,
             data_flow_context=flow_context,
             data_flow_ingress_context=self._data_flow().unclassified_ingress_context(
@@ -364,38 +410,21 @@ class JsonRpcPrimitive:
                 spec,
             )
             started = time.monotonic()
-
-            def invoke_transport() -> JsonRpcTransportResult:
-                try:
-                    return self.provider.call(
-                        spec,
-                        method,
-                        request_body,
-                        timeout_s=spec.timeout_s,
-                        max_response_bytes=spec.max_response_bytes,
-                        resolved_addresses=resolved_addresses,
-                    )
-                except ProviderEffectNotStarted:
-                    raise
-                except Exception as exc:
-                    return JsonRpcTransportResult(
-                        status_code=None,
-                        body=b"",
-                        elapsed_s=time.monotonic() - started,
-                        response_bytes=0,
-                        error="provider transport failed",
-                        error_type=type(exc).__name__,
-                        correlation_id=new_id("corr"),
-                    )
-
             transport = protected.call(
                 ProviderPhase(
                     "transport_not_started_after_dns",
                     state_mutation=bool(method.state_mutation or method.right != CapabilityRight.READ.value),
                     information_flow=True,
                 ),
-                invoke_transport,
+                self._invoke_transport_provider,
+                spec,
+                method,
+                request_body,
+                resolved_addresses=resolved_addresses,
+                started=started,
             )
+            transport = self._validated_transport_result(transport)
+            resource_progress["response_bytes"] = transport.response_bytes
             classification_override = None
             if transport.error is not None:
                 classification_override = ExternalEffectClassification(
@@ -438,6 +467,60 @@ class JsonRpcPrimitive:
                 ),
             )
             return completed
+
+    def _resolve_call_target(
+        self,
+        pid: str,
+        endpoint_id: str,
+        method_id: str,
+        params: Any,
+        *,
+        source_oids: list[str] | tuple[str, ...] | None,
+    ) -> tuple[
+        str,
+        JsonRpcEndpointSpec,
+        JsonRpcMethodSpec,
+        dict[str, Any],
+    ]:
+        resource = self.method_resource(endpoint_id, method_id)
+        self._validate_json_value(params, "params")
+        visibility_context = self._visibility_operation_context(
+            pid,
+            endpoint_id,
+            method_id,
+            params,
+        )
+        self._authorize_call_visibility(
+            pid,
+            resource,
+            visibility_context,
+            source_oids=source_oids,
+        )
+        spec, _metadata = self._load_endpoint(endpoint_id)
+        method = spec.method_by_id(method_id)
+        if method is None:
+            raise NotFound(f"JSON-RPC method not found: {endpoint_id}/{method_id}")
+        return (
+            resource,
+            spec,
+            method,
+            self._registry_binding_for_endpoint_spec(spec),
+        )
+
+    def _bounded_request_body(
+        self,
+        spec: JsonRpcEndpointSpec,
+        method: JsonRpcMethodSpec,
+        params: Any,
+        request_id: str,
+    ) -> bytes:
+        request_body = self._request_body(method, params, request_id)
+        if len(request_body) > spec.max_request_bytes:
+            raise ValidationError(
+                "JSON-RPC request exceeds "
+                f"max_request_bytes={spec.max_request_bytes}"
+            )
+        return request_body
 
     async def acall(
         self,
@@ -648,16 +731,40 @@ class JsonRpcPrimitive:
         *,
         source_oids: list[str] | tuple[str, ...] | None = None,
     ) -> None:
+        bound_context: dict[str, Any] | None = None
         for right in (CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.EXECUTE):
-            decision = self.capabilities.authorize(pid, resource, right, {**context, "right": str(right)})
+            selected_context = {**context, "right": str(right)}
+            decision = self.capabilities.authorize(pid, resource, right, selected_context)
             if decision.allowed:
                 return
-            if decision.policy == CapabilityManager.ASK_EACH_TIME:
+            # Preserve the no-oracle boundary for callers with no matching
+            # authority. Only an ASK policy or an existing constrained grant
+            # may resolve the metadata-free registry binding needed by an
+            # exact approval.
+            if not (
+                decision.policy == CapabilityManager.ASK_EACH_TIME
+                or decision.matched_capability_ids
+            ):
+                continue
+            if bound_context is None:
+                bound_context = {
+                    **context,
+                    **self._registry_binding_context(str(context["endpoint_id"])),
+                }
+            rebound = self.capabilities.authorize(
+                pid,
+                resource,
+                right,
+                {**bound_context, "right": str(right)},
+            )
+            if rebound.allowed:
+                return
+            if rebound.policy == CapabilityManager.ASK_EACH_TIME:
                 self._request_visibility_approval(
                     pid,
                     resource,
                     str(right),
-                    context,
+                    bound_context,
                     source_oids=source_oids,
                 )
         raise CapabilityDenied(f"{pid} lacks JSON-RPC call authority on {resource}")
@@ -712,6 +819,73 @@ class JsonRpcPrimitive:
             payload["params"] = params
         return dumps(payload).encode("utf-8")
 
+    def _invoke_transport_provider(
+        self,
+        endpoint: JsonRpcEndpointSpec,
+        method: JsonRpcMethodSpec,
+        request_body: bytes,
+        *,
+        resolved_addresses: tuple[str, ...],
+        started: float,
+    ) -> JsonRpcTransportResult:
+        try:
+            raw_result = self.provider.call(
+                endpoint,
+                method,
+                request_body,
+                timeout_s=endpoint.timeout_s,
+                max_response_bytes=endpoint.max_response_bytes,
+                resolved_addresses=resolved_addresses,
+            )
+        except ProviderEffectNotStarted:
+            raise
+        except Exception as error:
+            return JsonRpcTransportResult(
+                status_code=None,
+                body=b"",
+                elapsed_s=time.monotonic() - started,
+                response_bytes=0,
+                error="provider transport failed",
+                error_type=type(error).__name__,
+                correlation_id=new_id("corr"),
+            )
+        return self._validated_transport_result(raw_result)
+
+    @staticmethod
+    def _provider_result_failure_resource(
+        error: BaseException,
+        phase: str,
+        *,
+        request_bytes: int,
+        max_response_bytes: int,
+        resource_context: dict[str, Any],
+        resource_progress: dict[str, int | None],
+    ) -> ResourceSettlement | None:
+        if not _provider_result_was_returned(error):
+            return None
+        known_response_bytes = resource_progress["response_bytes"]
+        unknown_response_bytes = (
+            max_response_bytes if known_response_bytes is None else 0
+        )
+        return ResourceSettlement(
+            usage=ResourceUsage(
+                jsonrpc_request_bytes=request_bytes,
+                jsonrpc_response_bytes=(
+                    known_response_bytes
+                    if known_response_bytes is not None
+                    else max_response_bytes
+                ),
+            ),
+            source="primitive.jsonrpc.call",
+            context={
+                **resource_context,
+                "failure_phase": phase,
+                "response_bytes": known_response_bytes or 0,
+                "unknown_response_bytes": unknown_response_bytes,
+                "provider_result_returned": True,
+            },
+        )
+
     def _call_result_from_transport(
         self,
         endpoint: JsonRpcEndpointSpec,
@@ -719,6 +893,7 @@ class JsonRpcPrimitive:
         request_id: str,
         transport: JsonRpcTransportResult,
     ) -> JsonRpcCallResult:
+        transport = self._validated_transport_result(transport)
         if transport.error and transport.status_code is None:
             return JsonRpcCallResult(
                 endpoint_id=endpoint.endpoint_id,
@@ -756,9 +931,29 @@ class JsonRpcPrimitive:
                 extra={"body_observation": self._body_observation(transport.body)},
             )
         try:
-            envelope = json.loads(transport.body.decode("utf-8"))
-        except Exception as exc:
-            return self._failure(endpoint, method, request_id, JsonRpcCallStatus.INVALID_RESPONSE, transport, str(exc))
+            envelope = json.loads(
+                transport.body.decode("utf-8"),
+                parse_constant=lambda _value: (_ for _ in ()).throw(
+                    ValueError("non-finite JSON number")
+                ),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return self._failure(
+                endpoint,
+                method,
+                request_id,
+                JsonRpcCallStatus.INVALID_RESPONSE,
+                transport,
+                "response body is not valid UTF-8 JSON",
+            )
+        except Exception as error:
+            raise _mark_provider_result_returned(
+                ProviderHostError(
+                    code="jsonrpc_provider_error",
+                    error_type=type(error).__name__,
+                    correlation_id=new_id("corr"),
+                )
+            ) from None
         if not isinstance(envelope, dict):
             return self._failure(endpoint, method, request_id, JsonRpcCallStatus.INVALID_RESPONSE, transport, "response is not a JSON object")
         if envelope.get("jsonrpc") != "2.0":
@@ -803,6 +998,66 @@ class JsonRpcPrimitive:
             duration_s=transport.elapsed_s,
         )
 
+    @staticmethod
+    def _validated_transport_result(result: Any) -> JsonRpcTransportResult:
+        """Decode all provider-owned transport fields before public handling."""
+
+        try:
+            if not isinstance(result, JsonRpcTransportResult):
+                raise TypeError("JSON-RPC provider returned an invalid transport result")
+            status_code = result.status_code
+            body = result.body
+            elapsed_s = result.elapsed_s
+            response_bytes = result.response_bytes
+            too_large = result.too_large
+            error = result.error
+            error_type = result.error_type
+            correlation_id = result.correlation_id
+            if status_code is not None and type(status_code) is not int:
+                raise TypeError("JSON-RPC provider status_code is invalid")
+            if type(body) is not bytes:
+                raise TypeError("JSON-RPC provider body is invalid")
+            if (
+                type(elapsed_s) not in {int, float}
+                or not math.isfinite(elapsed_s)
+                or elapsed_s < 0
+            ):
+                raise TypeError("JSON-RPC provider elapsed_s is invalid")
+            if type(response_bytes) is not int or response_bytes < 0:
+                raise TypeError("JSON-RPC provider response_bytes is invalid")
+            if type(too_large) is not bool:
+                raise TypeError("JSON-RPC provider too_large is invalid")
+            for field_name, selected in (
+                ("error", error),
+                ("error_type", error_type),
+                ("correlation_id", correlation_id),
+            ):
+                if selected is not None and type(selected) is not str:
+                    raise TypeError(
+                        f"JSON-RPC provider {field_name} is invalid"
+                    )
+            return JsonRpcTransportResult(
+                status_code=status_code,
+                body=bytes(body),
+                elapsed_s=float(elapsed_s),
+                response_bytes=response_bytes,
+                too_large=too_large,
+                error=error,
+                error_type=error_type,
+                correlation_id=correlation_id,
+            )
+        except ProviderHostError as error:
+            _mark_provider_result_returned(error)
+            raise
+        except Exception as error:
+            raise _mark_provider_result_returned(
+                ProviderHostError(
+                    code="jsonrpc_provider_error",
+                    error_type=type(error).__name__,
+                    correlation_id=new_id("corr"),
+                )
+            ) from None
+
     def _failure(
         self,
         endpoint: JsonRpcEndpointSpec,
@@ -835,6 +1090,7 @@ class JsonRpcPrimitive:
         params: Any,
         *,
         request_id: str,
+        registry_binding: dict[str, Any],
     ) -> dict[str, Any]:
         params_json = dumps(params)
         params_observation = sanitize_for_observability(
@@ -851,6 +1107,7 @@ class JsonRpcPrimitive:
             "rpc_method": method.rpc_method,
             "right": method.right,
             "request_id": request_id,
+            **registry_binding,
             "params_sha256": hashlib.sha256(params_json.encode("utf-8")).hexdigest(),
             "params_preview": params_observation["preview"],
             "params_observation": params_observation,
@@ -879,11 +1136,64 @@ class JsonRpcPrimitive:
                     "conditions": {
                         "endpoint_id": context["endpoint_id"],
                         "method_id": context["method_id"],
+                        "registry_spec_sha256": context["registry_spec_sha256"],
+                        "registry_generation": context["registry_generation"],
                         "params_sha256": context["params_sha256"],
                     },
                     "description": "one-shot human approval for exact JSON-RPC call payload",
                 }
             ]
+        }
+
+    @staticmethod
+    def _endpoint_spec_sha256(endpoint: JsonRpcEndpointSpec) -> str:
+        return hashlib.sha256(dumps(endpoint).encode("utf-8")).hexdigest()
+
+    def _registry_binding_context(self, endpoint_id: str) -> dict[str, Any]:
+        binding = self.extensions.get_jsonrpc_registry_binding(endpoint_id)
+        if not isinstance(binding, dict):
+            raise ValidationError("JSON-RPC registry binding must be an object")
+        generation = binding.get("registry_generation")
+        digest = binding.get("registry_spec_sha256")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation < 0
+        ):
+            raise ValidationError("JSON-RPC registry generation is invalid")
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValidationError("JSON-RPC registry spec digest is invalid")
+        return {
+            "registry_spec_sha256": digest,
+            "registry_generation": generation,
+        }
+
+    def _registry_binding_for_endpoint_spec(
+        self,
+        endpoint: JsonRpcEndpointSpec,
+    ) -> dict[str, Any]:
+        binding = self._registry_binding_context(endpoint.endpoint_id)
+        if binding["registry_spec_sha256"] != self._endpoint_spec_sha256(endpoint):
+            raise CapabilityDenied(
+                "JSON-RPC endpoint registry changed before call authorization"
+            )
+        return binding
+
+    def _protected_registry_guard(
+        self,
+        binding: dict[str, Any],
+        endpoint_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "provider_registry_binding": ProviderRegistryBinding.from_context(binding),
+            "provider_registry_binding_resolver": lambda: ProviderRegistryBinding.from_context(
+                self._registry_binding_context(endpoint_id)
+            ),
+            "provider_registry_phase_guard": lambda: self._registry_phase_lock,
         }
 
     def _effect_context(
@@ -911,8 +1221,13 @@ class JsonRpcPrimitive:
 
     def _coerce_endpoint(self, value: JsonRpcEndpointSpec | dict[str, Any]) -> JsonRpcEndpointSpec:
         if isinstance(value, JsonRpcEndpointSpec):
-            self._validate_endpoint(value)
-            return value
+            # Typed callers still run through the same canonical coercion as
+            # mapping/YAML callers.  Python does not enforce dataclass
+            # annotations at runtime, so a valid ``timeout_s=1`` would
+            # otherwise persist as JSON integer ``1`` and decode as float
+            # ``1.0``.  Registry digests must not depend on that incidental
+            # construction spelling.
+            value = to_jsonable(value)
         if not isinstance(value, dict):
             raise ValidationError("JSON-RPC endpoint must be a mapping")
         unknown = sorted(set(value) - {

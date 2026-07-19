@@ -26,6 +26,7 @@ from agent_libos.models import (
     McpProviderTool,
     McpHttpTransportSpec,
     McpServerSpec,
+    McpStdioTransportSpec,
     McpToolSpec,
     McpToolListResult,
     ObjectMetadata,
@@ -34,7 +35,7 @@ from agent_libos.models import (
     SinkTrustLevel,
     SinkTrustRule,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ResourceLimitExceeded, ValidationError
+from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ProviderHostError, ResourceLimitExceeded, ValidationError
 from agent_libos.substrate import ProviderEffectNotStarted
 from agent_libos.substrate import LocalResourceProviderSubstrate, SdkMcpProvider
 import agent_libos.sdk.protected_operations as protected_operations
@@ -258,6 +259,57 @@ class TestMcpPrimitive:
             assert reservation["settled_usage"].mcp_request_bytes > 0
             effect = runtime.store.list_external_effects(pid=pid)[0]
             assert effect.provider_metadata["outcome"] == "deadline_exhausted_before_call"
+        finally:
+            runtime.close()
+
+    def test_deadline_exhausted_during_dispatch_setup_never_calls_provider(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(goal="MCP setup deadline")
+            manifest = _stdio_manifest("setup-deadline").replace(
+                "timeout_s: 5",
+                "timeout_s: 0.01",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                manifest,
+                actor="cli",
+                require_capability=False,
+            )
+            authority = runtime.capability.grant_once(
+                pid,
+                "mcp:setup-deadline:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+
+            def slow_snapshot(**_kwargs: Any) -> None:
+                time.sleep(0.03)
+                return None
+
+            monkeypatch.setattr(
+                runtime.mcp,
+                "_stdio_snapshot_for_dispatch",
+                slow_snapshot,
+            )
+
+            with pytest.raises(ProviderHostError, match="mcp_provider_not_started"):
+                runtime.mcp.call_tool(
+                    pid,
+                    "setup-deadline",
+                    "echo",
+                    {"text": "hello"},
+                )
+
+            assert provider.list_calls == []
+            assert provider.call_args == []
+            persisted = runtime.store.get_capability(authority.cap_id)
+            assert persisted is not None and persisted.uses_remaining == 1
         finally:
             runtime.close()
 
@@ -750,6 +802,62 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    def test_conflicting_typed_and_mapping_transport_specs_fail_before_registry_write(
+        self,
+    ) -> None:
+        runtime = Runtime.open('local')
+        tool = McpToolSpec(
+            tool_id='echo',
+            mcp_name='demo.echo',
+            right='read',
+            rollback_class='no_rollback_required',
+            state_mutation=False,
+            information_flow=True,
+        )
+        typed = McpServerSpec(
+            schema_version=1,
+            server_id='conflicting-typed-transport',
+            transport='stdio',
+            tools=[tool],
+            timeout_s=1,
+            max_request_bytes=65_536,
+            max_response_bytes=1_048_576,
+            stdio=McpStdioTransportSpec(
+                command='python3',
+                args=['-m', 'demo_server'],
+            ),
+            http=McpHttpTransportSpec(
+                url='https://mcp.example.test/tools',
+            ),
+        )
+        mapping = {
+            **to_jsonable(typed),
+            'server_id': 'conflicting-mapping-transport',
+        }
+        try:
+            for value in (typed, mapping):
+                server_id = (
+                    value.server_id
+                    if isinstance(value, McpServerSpec)
+                    else str(value['server_id'])
+                )
+                binding_before = runtime.store.get_mcp_registry_binding(server_id)
+
+                with pytest.raises(
+                    ValidationError,
+                    match='stdio server cannot include http configuration',
+                ):
+                    runtime.mcp.register_server(
+                        value,
+                        actor='test',
+                        require_capability=False,
+                    )
+
+                assert runtime.store.get_mcp_server(server_id) is None
+                assert runtime.store.get_mcp_registry_binding(server_id) == binding_before
+        finally:
+            runtime.close()
+
     def test_registry_register_sink_failure_restores_composite_finite_authority(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -912,6 +1020,64 @@ class TestMcpPrimitive:
             assert runtime.store.get_mcp_server(server_id) is None
             persisted = runtime.store.get_capability(authority.cap_id)
             assert persisted is not None and not persisted.active and persisted.uses_remaining == 0
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize('operation', ['register', 'unregister'])
+    def test_registry_reauthorizes_unlimited_authority_before_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        operation: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(
+                image='base-agent:v0',
+                goal=f'MCP registry authority race {operation}',
+            )
+            server_id = f'reauthorization-{operation}'
+            manifest = _http_manifest(
+                server_id,
+                'https://safe.example.test/mcp',
+            )
+            if operation == 'unregister':
+                runtime.mcp.register_server_from_yaml_text(
+                    manifest,
+                    actor='test.host',
+                    require_capability=False,
+                )
+            authority = runtime.capability.grant(
+                actor,
+                runtime.mcp.server_resource(server_id),
+                [
+                    CapabilityRight.WRITE
+                    if operation == 'register'
+                    else CapabilityRight.ADMIN
+                ],
+                issued_by='test.host',
+            )
+            original_require = runtime.capability.require
+
+            def revoke_after_outer_authorization(*args: Any, **kwargs: Any):
+                decision = original_require(*args, **kwargs)
+                runtime.capability.revoke(
+                    authority.cap_id,
+                    revoked_by='test.host',
+                    reason='MCP registry revocation race regression',
+                    require_authority=False,
+                )
+                return decision
+
+            monkeypatch.setattr(runtime.capability, 'require', revoke_after_outer_authorization)
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                if operation == 'register':
+                    runtime.mcp.register_server_from_yaml_text(manifest, actor=actor)
+                else:
+                    runtime.mcp.unregister_server(server_id, actor=actor)
+
+            persisted = runtime.store.get_mcp_server(server_id)
+            assert (persisted is None) is (operation == 'register')
         finally:
             runtime.close()
 
@@ -1132,7 +1298,7 @@ class TestMcpPrimitive:
                 )
                 _grant_stdio_spawn(runtime, pid)
 
-            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+            with pytest.raises(ProviderHostError, match='mcp_provider_not_started') as raised:
                 if entry_point == 'refresh':
                     runtime.mcp.list_tools(
                         server_id,
@@ -1143,6 +1309,7 @@ class TestMcpPrimitive:
                 else:
                     runtime.mcp.call_tool(pid, server_id, 'echo', {'text': 'hello'})
 
+            assert 'before list transport' not in str(raised.value)
             assert provider.list_calls == [server_id]
             assert provider.call_args == []
             assert runtime.store.list_external_effects(pid=pid) == []
@@ -1229,6 +1396,15 @@ class TestMcpPrimitive:
             assert effect.state_mutation
             assert effect.provider_metadata['outcome'] == 'unknown_provider_exception'
             assert 'mcp-provider-secret' not in str(effect.provider_metadata)
+            process = runtime.process.get(pid)
+            assert process.resource_usage.mcp_response_bytes == (
+                128 + runtime.config.mcp.max_response_bytes
+            )
+            reservation = runtime.store.list_resource_usage_reservations(pid=pid)[0]
+            assert reservation['status'] == 'settled'
+            assert reservation['settled_usage'].mcp_response_bytes == (
+                128 + runtime.config.mcp.max_response_bytes
+            )
         finally:
             runtime.close()
 
@@ -1334,6 +1510,107 @@ class TestMcpPrimitive:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize(
+        "provider_mode",
+        [
+            "live_result_tools",
+            "refresh_response_bytes",
+            "legacy_call_content",
+            "validated_call_content",
+        ],
+    )
+    def test_malformed_provider_result_is_sanitized_before_field_access(
+        self,
+        provider_mode: str,
+    ) -> None:
+        secret = f"MCP_MALFORMED_RESULT_SECRET_{provider_mode}"
+        runtime = Runtime.open("local")
+        provider: Any
+        if provider_mode == "validated_call_content":
+            provider = _MalformedValidatedMcpProvider(secret)
+        else:
+            provider = _MalformedLegacyMcpProvider(provider_mode, secret)
+        runtime.mcp.provider = provider
+        server_id = f"malformed-{provider_mode.replace('_', '-')}"
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal=f"sanitize malformed MCP result {provider_mode}",
+            )
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(server_id),
+                actor="cli",
+                require_capability=False,
+            )
+            if provider_mode == "refresh_response_bytes":
+                runtime.capability.grant(
+                    pid,
+                    f"mcp_server:{server_id}",
+                    [CapabilityRight.READ, CapabilityRight.EXECUTE],
+                    issued_by="test",
+                )
+            else:
+                runtime.capability.grant(
+                    pid,
+                    f"mcp:{server_id}:echo",
+                    [CapabilityRight.READ],
+                    issued_by="test",
+                )
+            _grant_stdio_spawn(runtime, pid)
+
+            with pytest.raises(ProviderHostError) as caught:
+                if provider_mode == "refresh_response_bytes":
+                    runtime.mcp.list_tools(
+                        server_id,
+                        actor=pid,
+                        refresh=True,
+                    )
+                else:
+                    runtime.mcp.call_tool(
+                        pid,
+                        server_id,
+                        "echo",
+                        {"text": "hello"},
+                    )
+
+            observed = dumps(
+                {
+                    "exception": caught.value.to_dict(),
+                    "exception_text": str(caught.value),
+                    "audit": runtime.audit.trace(),
+                    "events": runtime.events.list(),
+                    "effects": runtime.store.list_external_effects(pid=pid),
+                }
+            )
+            assert caught.value.code == "mcp_provider_error"
+            assert caught.value.error_type == "RuntimeError"
+            assert caught.value.correlation_id
+            assert secret not in observed
+            max_response_bytes = runtime.config.mcp.max_response_bytes
+            expected_response_bytes = {
+                "live_result_tools": max_response_bytes,
+                "refresh_response_bytes": max_response_bytes,
+                "legacy_call_content": 128 + max_response_bytes,
+                "validated_call_content": max_response_bytes * 2,
+            }[provider_mode]
+            process = runtime.process.get(pid)
+            assert (
+                process.resource_usage.mcp_response_bytes
+                == expected_response_bytes
+            )
+            effect = next(
+                item
+                for item in runtime.store.list_external_effects(pid=pid)
+                if item.provider == "mcp"
+            )
+            assert effect.transaction_state != "abandoned"
+            assert effect.provider_metadata.get("outcome") not in {
+                "validate_and_call_not_started",
+                "call_tool_not_started_after_live_validation",
+            }
+        finally:
+            runtime.close()
+
     def test_stdio_live_validation_not_started_restores_all_finite_authority(self) -> None:
         runtime = Runtime.open('local')
         provider = _NotStartedListMcpProvider()
@@ -1364,8 +1641,9 @@ class TestMcpPrimitive:
                 issued_by='test',
             )
 
-            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+            with pytest.raises(ProviderHostError, match='mcp_provider_not_started') as raised:
                 runtime.mcp.call_tool(pid, 'composite-restore', 'echo', {'text': 'hello'})
+            assert 'before list transport' not in str(raised.value)
 
             for cap in (main, spawn, stdio):
                 persisted = runtime.store.get_capability(cap.cap_id)
@@ -1431,7 +1709,7 @@ class TestMcpPrimitive:
             )
             _grant_stdio_spawn(runtime, pid)
 
-            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+            with pytest.raises(ProviderHostError, match='mcp_provider_not_started'):
                 runtime.mcp.list_tools('refresh-dedup', actor=pid, refresh=True)
             restored = runtime.store.get_capability(cap.cap_id)
             assert restored is not None and restored.uses_remaining == 1
@@ -1469,8 +1747,9 @@ class TestMcpPrimitive:
                 lambda _spec: (_ for _ in ()).throw(ProviderEffectNotStarted('resolution did not start')),
             )
 
-            with pytest.raises(ProviderEffectNotStarted, match='resolution did not start'):
+            with pytest.raises(ProviderHostError, match='mcp_provider_not_started') as raised:
                 runtime.mcp.call_tool(pid, 'resolution-not-started', 'echo', {'text': 'hello'})
+            assert 'resolution did not start' not in str(raised.value)
 
             persisted = runtime.store.get_capability(cap.cap_id)
             assert persisted is not None and persisted.uses_remaining == 1
@@ -1504,8 +1783,9 @@ class TestMcpPrimitive:
                 issued_by='test',
             )
 
-            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+            with pytest.raises(ProviderHostError, match='mcp_provider_not_started') as raised:
                 runtime.mcp.call_tool(pid, 'post-dns-not-started', 'echo', {'text': 'hello'})
+            assert 'before list transport' not in str(raised.value)
 
             persisted = runtime.store.get_capability(cap.cap_id)
             assert persisted is not None and persisted.uses_remaining == 0
@@ -1540,8 +1820,9 @@ class TestMcpPrimitive:
                 issued_by='test',
             )
 
-            with pytest.raises(ProviderEffectNotStarted, match='before list transport'):
+            with pytest.raises(ProviderHostError, match='mcp_provider_not_started') as raised:
                 runtime.mcp.call_tool(pid, 'local-not-started', 'echo', {'text': 'hello'})
+            assert 'before list transport' not in str(raised.value)
 
             persisted = runtime.store.get_capability(cap.cap_id)
             assert persisted is not None and persisted.uses_remaining == 1
@@ -1690,6 +1971,13 @@ class TestMcpPrimitive:
                 raise AssertionError("MCP server manifest should stay hidden before capability gate")
 
             monkeypatch.setattr(runtime.store, "get_mcp_server", fail_if_manifest_loaded)
+            monkeypatch.setattr(
+                runtime.store,
+                "get_mcp_registry_binding",
+                lambda _server_id: (_ for _ in ()).throw(
+                    AssertionError("registry binding should stay hidden without matching authority")
+                ),
+            )
 
             with pytest.raises(CapabilityDenied, match="MCP call authority"):
                 runtime.mcp.call_tool(pid, "secret-server", "hidden-tool", {"text": "hello"})
@@ -1715,6 +2003,106 @@ class TestMcpPrimitive:
 
             with pytest.raises(HumanApprovalRequired):
                 runtime.mcp.call_tool(pid, "secret-server", "hidden-tool", {"text": "hello"})
+        finally:
+            runtime.close()
+
+    def test_human_mcp_approval_cannot_authorize_a_later_first_registration(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        provider = _RecordingMcpProvider()
+        runtime.mcp.provider = provider
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="future mcp approval")
+            resource = "mcp:future-approval:echo"
+            runtime.capability.set_permission_policy(
+                pid,
+                resource,
+                [CapabilityRight.READ],
+                runtime.capability.ASK_EACH_TIME,
+                issued_by="test",
+            )
+
+            with pytest.raises(HumanApprovalRequired):
+                runtime.mcp.call_tool(
+                    pid,
+                    "future-approval",
+                    "echo",
+                    {"text": "hello"},
+                )
+            first = runtime.human.pending()[0]
+            first_context = first.payload["context"]
+            first_conditions = first.payload["requested_once_capability"]["constraints"][
+                AUTHORITY_RULES_KEY
+            ][0]["conditions"]
+            assert len(first_context["registry_spec_sha256"]) == 64
+            assert first_conditions["registry_spec_sha256"] == first_context["registry_spec_sha256"]
+            assert first_conditions["registry_generation"] == first_context["registry_generation"]
+            runtime.human.drain_terminal_queue(auto_approve=True)
+
+            runtime.mcp.register_server(
+                {
+                    "schema_version": 1,
+                    "server_id": "future-approval",
+                    "transport": "streamable_http",
+                    "http": {
+                        "url": "https://safe.example.test/mcp",
+                        "headers": {},
+                    },
+                    "tools": [
+                        {
+                            "tool_id": "echo",
+                            "mcp_name": "demo.echo",
+                            "right": "read",
+                            "rollback_class": "no_rollback_required",
+                            "state_mutation": False,
+                            "information_flow": True,
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"text": {"type": "string"}},
+                                "additionalProperties": False,
+                            },
+                        }
+                    ],
+                    "timeout_s": 5,
+                    "max_request_bytes": 65_536,
+                    "max_response_bytes": 1_048_576,
+                },
+                actor="cli",
+                require_capability=False,
+            )
+
+            with pytest.raises(HumanApprovalRequired):
+                runtime.mcp.call_tool(
+                    pid,
+                    "future-approval",
+                    "echo",
+                    {"text": "hello"},
+                )
+            second = runtime.human.pending()[0]
+            second_context = second.payload["context"]
+            assert second_context["registry_generation"] > first_context["registry_generation"]
+            assert second_context["registry_spec_sha256"] != first_context["registry_spec_sha256"]
+            assert provider.list_calls == []
+            assert provider.call_args == []
+
+            runtime.human.drain_terminal_queue(auto_approve=True)
+            monkeypatch.setattr(
+                runtime.mcp,
+                "_validate_runtime_resolution",
+                lambda _spec: ("93.184.216.34",),
+            )
+            result = runtime.mcp.call_tool(
+                pid,
+                "future-approval",
+                "echo",
+                {"text": "hello"},
+            )
+            assert result.ok
+            assert provider.call_args == [
+                ("future-approval", "echo", {"text": "hello"})
+            ]
         finally:
             runtime.close()
 
@@ -1782,6 +2170,8 @@ class TestMcpPrimitive:
             assert effect.target == "mcp:demo:echo"
             assert effect.provider_metadata["result"]["ok"] is False
             assert effect.provider_metadata["result"]["status"] == "invalid_response"
+            process = runtime.process.get(pid)
+            assert process.resource_usage.mcp_response_bytes == 128
         finally:
             runtime.close()
 
@@ -1816,6 +2206,7 @@ class TestMcpPrimitive:
 
                 assert "MCP_PROVIDER_ERROR_SENTINEL" not in str(raised.value)
                 assert getattr(raised.value, 'code', None) == 'mcp_provider_error'
+                assert getattr(raised.value, 'error_type', None) == 'RuntimeError'
                 assert getattr(raised.value, 'correlation_id', None)
                 assert returned.labels.origin == "derived"
                 assert returned.labels.trust_level.value == "untrusted"
@@ -1823,8 +2214,242 @@ class TestMcpPrimitive:
 
             assert provider.list_calls == ["validation-error"]
             assert provider.call_args == []
+            process = runtime.process.get(pid)
+            assert process.resource_usage.mcp_response_bytes == runtime.config.mcp.max_response_bytes
+            reservation = runtime.store.list_resource_usage_reservations(pid=pid)[0]
+            assert reservation['status'] == 'settled'
+            assert reservation['settled_usage'].mcp_response_bytes == runtime.config.mcp.max_response_bytes
             effect = [item for item in runtime.store.list_external_effects(pid=pid) if item.provider == "mcp"][0]
             assert effect.provider_metadata["result"]["status"] == "invalid_response"
+            assert effect.provider_metadata["result"]["error"] == raised.value.to_dict()
+            assert "MCP_PROVIDER_ERROR_SENTINEL" not in dumps(effect.provider_metadata)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize("provider_kind", ["raised", "malformed"])
+    def test_static_tool_preserves_public_provider_error_envelope_in_durable_failure(
+        self,
+        provider_kind: str,
+    ) -> None:
+        secret = f"STATIC_MCP_PROVIDER_SECRET_SENTINEL_{provider_kind}"
+        runtime = Runtime.open("local")
+        runtime.mcp.provider = (
+            _FailingListMcpProvider(secret)
+            if provider_kind == "raised"
+            else _MalformedLegacyMcpProvider("live_result_tools", secret)
+        )
+        try:
+            pid = runtime.process.spawn(image="base-agent:v0", goal="static MCP envelope")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("static-envelope"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp_server:static-envelope",
+                [CapabilityRight.READ, CapabilityRight.EXECUTE],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+            runtime.tools.configure_process_tools(pid, ["list_mcp_tools"], assigned_by="test")
+
+            result = runtime.tools.call(
+                pid,
+                "list_mcp_tools",
+                {"server_id": "static-envelope", "refresh": True},
+            )
+
+            assert not result.ok
+            assert result.result_handle is not None
+            durable = runtime.store.get_object(result.result_handle.oid)
+            observed = dumps({"result": to_jsonable(result), "durable": to_jsonable(durable)})
+            assert secret not in observed
+            public_error = durable.payload["failure"]["error"]["details"]
+            assert result.payload["error"]["details"] == public_error
+            assert public_error["code"] == "mcp_provider_error"
+            assert public_error["error_type"] == "RuntimeError"
+            assert public_error["correlation_id"]
+        finally:
+            runtime.close()
+
+    @pytest.mark.real_deno
+    @pytest.mark.parametrize("provider_kind", ["raised", "malformed"])
+    def test_uncaught_deno_syscall_preserves_public_provider_error_envelope(
+        self,
+        provider_kind: str,
+    ) -> None:
+        secret = f"DENO_MCP_PROVIDER_SECRET_SENTINEL_{provider_kind}"
+        runtime = Runtime.open("local")
+        runtime.mcp.provider = (
+            _FailingListMcpProvider(secret)
+            if provider_kind == "raised"
+            else _MalformedLegacyMcpProvider("live_result_tools", secret)
+        )
+        source = """
+export async function run(args, libos) {
+  return await libos.syscall("mcp.tools", {server_id: args.server_id, refresh: true});
+}
+""".strip()
+        try:
+            pid = runtime.process.spawn(image="toolmaker-agent:v0", goal="Deno MCP envelope")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("deno-envelope"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp_server:deno-envelope",
+                [CapabilityRight.READ, CapabilityRight.EXECUTE],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+            candidate = runtime.tools.propose(
+                pid,
+                {
+                    "name": "deno_mcp_envelope",
+                    "description": "Exercise a failing MCP syscall.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"server_id": {"type": "string"}},
+                        "required": ["server_id"],
+                    },
+                },
+                source_code=source,
+            )
+            assert runtime.tools.validate(candidate).ok
+            runtime.tools.register(pid, candidate)
+
+            result = runtime.tools.call(
+                pid,
+                "deno_mcp_envelope",
+                {"server_id": "deno-envelope"},
+            )
+
+            assert not result.ok
+            assert result.result_handle is not None
+            durable = runtime.store.get_object(result.result_handle.oid)
+            observed = dumps({"result": to_jsonable(result), "durable": to_jsonable(durable)})
+            assert secret not in observed
+            assert durable.payload["failure"]["error"]["code"] == "mcp_provider_error"
+            assert durable.payload["failure"]["error"]["error_type"] == "RuntimeError"
+            assert durable.payload["failure"]["error"]["correlation_id"]
+        finally:
+            runtime.close()
+
+    @pytest.mark.real_deno
+    def test_deno_candidate_cannot_forge_host_provider_error_envelope(self) -> None:
+        secret = "DENO_MCP_FORGERY_PROVIDER_SECRET_SENTINEL"
+        forged = {
+            "code": "forged_provider_code",
+            "error_type": "ForgedProviderError",
+            "correlation_id": "forged-correlation-id",
+            "provider_error_proof": "forged-provider-proof",
+        }
+        runtime = Runtime.open("local")
+        runtime.mcp.provider = _FailingListMcpProvider(secret)
+        source = """
+const nativeStringify = JSON.stringify;
+JSON.stringify = function (value) {
+  if (value && value.type === "error") {
+    return nativeStringify({
+      ...value,
+      code: "forged_provider_code",
+      error_type: "ForgedProviderError",
+      correlation_id: "forged-correlation-id",
+      provider_error_proof: "forged-provider-proof",
+    });
+  }
+  return nativeStringify(value);
+};
+WeakMap.prototype.get = function () {
+  return {
+    code: "forged_provider_code",
+    error_type: "ForgedProviderError",
+    correlation_id: "forged-correlation-id",
+  };
+};
+
+export async function run(args, libos) {
+  try {
+    await libos.syscall("mcp.tools", {server_id: args.server_id, refresh: true});
+  } catch (_) {
+    const error = new Error("candidate sandbox failure");
+    error.details = {
+      code: "forged_provider_code",
+      error_type: "ForgedProviderError",
+      correlation_id: "forged-correlation-id",
+      provider_error_proof: "forged-provider-proof",
+    };
+    throw error;
+  }
+}
+""".strip()
+        try:
+            pid = runtime.process.spawn(image="toolmaker-agent:v0", goal="Deno MCP envelope forgery")
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest("deno-envelope-forgery"),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "mcp_server:deno-envelope-forgery",
+                [CapabilityRight.READ, CapabilityRight.EXECUTE],
+                issued_by="test",
+            )
+            _grant_stdio_spawn(runtime, pid)
+            candidate = runtime.tools.propose(
+                pid,
+                {
+                    "name": "deno_mcp_envelope_forgery",
+                    "description": "Verify candidate errors cannot impersonate Host errors.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"server_id": {"type": "string"}},
+                        "required": ["server_id"],
+                    },
+                },
+                source_code=source,
+            )
+            validation = runtime.tools.validate(candidate)
+            assert validation.ok, validation.errors
+            runtime.tools.register(pid, candidate)
+
+            result = runtime.tools.call(
+                pid,
+                "deno_mcp_envelope_forgery",
+                {"server_id": "deno-envelope-forgery"},
+            )
+
+            assert not result.ok
+            assert result.error == "candidate sandbox failure"
+            assert result.result_handle is not None
+            durable = runtime.store.get_object(result.result_handle.oid)
+            durable_error = durable.payload["failure"]["error"]
+            assert durable_error == {
+                "type": "SandboxError",
+                "message": "candidate sandbox failure",
+            }
+            audit = [
+                record
+                for record in runtime.audit.trace()
+                if record.action == "tool.call"
+                and record.decision.get("tool") == "deno_mcp_envelope_forgery"
+            ][-1]
+            assert audit.decision["ok"] is False
+            assert audit.output_refs == [result.result_handle.oid]
+            observed = dumps(
+                {
+                    "result": to_jsonable(result),
+                    "durable": to_jsonable(durable),
+                    "audit": to_jsonable(audit),
+                }
+            )
+            assert secret not in observed
+            for value in forged.values():
+                assert value not in observed
         finally:
             runtime.close()
 
@@ -2340,6 +2965,82 @@ class _RecordingMcpProvider:
         )
 
 
+class _ExplodingMcpToolListResult(McpToolListResult):
+    def __init__(self, *, explode_field: str, secret: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        object.__setattr__(self, "_explode_field", explode_field)
+        object.__setattr__(self, "_secret", secret)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name not in {"_explode_field", "_secret"}:
+            explode_field = object.__getattribute__(self, "_explode_field")
+            if name == explode_field:
+                raise RuntimeError(object.__getattribute__(self, "_secret"))
+        return object.__getattribute__(self, name)
+
+
+class _ExplodingMcpProviderCallResult(McpProviderCallResult):
+    def __init__(self, *, explode_field: str, secret: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        object.__setattr__(self, "_explode_field", explode_field)
+        object.__setattr__(self, "_secret", secret)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name not in {"_explode_field", "_secret"}:
+            explode_field = object.__getattribute__(self, "_explode_field")
+            if name == explode_field:
+                raise RuntimeError(object.__getattribute__(self, "_secret"))
+        return object.__getattribute__(self, name)
+
+
+class _MalformedLegacyMcpProvider(_RecordingMcpProvider):
+    def __init__(self, mode: str, secret: str) -> None:
+        super().__init__()
+        self.mode = mode
+        self.secret = secret
+
+    def list_tools(self, server: Any, **kwargs: Any) -> McpToolListResult:
+        if self.mode in {"live_result_tools", "refresh_response_bytes"}:
+            self.list_calls.append(server.server_id)
+            return _ExplodingMcpToolListResult(
+                explode_field=(
+                    "tools"
+                    if self.mode == "live_result_tools"
+                    else "response_bytes"
+                ),
+                secret=self.secret,
+                server_id=server.server_id,
+                tools=[
+                    McpProviderTool(
+                        name="demo.echo",
+                        input_schema=self.live_schema,
+                    )
+                ],
+                response_bytes=128,
+                duration_s=0.01,
+            )
+        return super().list_tools(server, **kwargs)
+
+    def call_tool(
+        self,
+        server: Any,
+        tool: Any,
+        arguments: dict[str, Any],
+        **_kwargs: Any,
+    ) -> McpProviderCallResult:
+        self.call_args.append((server.server_id, tool.tool_id, dict(arguments)))
+        if self.mode == "legacy_call_content":
+            return _ExplodingMcpProviderCallResult(
+                explode_field="content",
+                secret=self.secret,
+                content=[{"type": "text", "text": "ok"}],
+                response_bytes=64,
+                duration_s=0.02,
+                call_started=True,
+            )
+        return super().call_tool(server, tool, arguments)
+
+
 class _ValidatedCallMcpProvider(_RecordingMcpProvider):
     def __init__(self) -> None:
         super().__init__()
@@ -2355,6 +3056,33 @@ class _ValidatedCallMcpProvider(_RecordingMcpProvider):
         self.validate_calls += 1
         return McpProviderCallResult(
             structured_content={"echo": dict(arguments)},
+            content=[{"type": "text", "text": "ok"}],
+            response_bytes=19,
+            duration_s=0.02,
+            list_request_bytes=11,
+            list_response_bytes=13,
+            call_request_bytes=17,
+            call_response_bytes=19,
+            call_started=True,
+        )
+
+
+class _MalformedValidatedMcpProvider(_ValidatedCallMcpProvider):
+    def __init__(self, secret: str) -> None:
+        super().__init__()
+        self.secret = secret
+
+    def validate_and_call(
+        self,
+        _server: Any,
+        _tool: Any,
+        _arguments: dict[str, Any],
+        **_kwargs: Any,
+    ) -> McpProviderCallResult:
+        self.validate_calls += 1
+        return _ExplodingMcpProviderCallResult(
+            explode_field="content",
+            secret=self.secret,
             content=[{"type": "text", "text": "ok"}],
             response_bytes=19,
             duration_s=0.02,

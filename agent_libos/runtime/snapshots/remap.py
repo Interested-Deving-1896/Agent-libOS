@@ -5,7 +5,17 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from agent_libos.models.exceptions import ValidationError
+from agent_libos.models.process_state import (
+    legacy_status_message,
+    process_outcome_from_json,
+    process_outcome_to_mapping,
+    process_wait_state_from_json,
+    process_wait_state_to_mapping,
+    remap_process_outcome,
+    remap_process_wait_state,
+)
 from agent_libos.runtime.snapshots.models import ProcessSnapshot, SnapshotHeader, SnapshotRows
+from agent_libos.utils.serde import dumps
 
 
 @dataclass(frozen=True)
@@ -65,6 +75,25 @@ class SnapshotRemapper:
             selected_map = getattr(identities, map_name)
             if value is not None and str(value) in selected_map:
                 remapped[field_name] = selected_map[str(value)]
+        if "wait_state_json" in remapped and "outcome_json" in remapped:
+            wait_state = remap_process_wait_state(
+                process_wait_state_from_json(remapped["wait_state_json"]),
+                pids=identities.pids,
+                objects=identities.objects,
+            )
+            outcome = remap_process_outcome(
+                process_outcome_from_json(remapped["outcome_json"]),
+                objects=identities.objects,
+            )
+            remapped["wait_state_json"] = dumps(
+                process_wait_state_to_mapping(wait_state)
+            )
+            remapped["outcome_json"] = dumps(process_outcome_to_mapping(outcome))
+            remapped["status_message"] = legacy_status_message(
+                wait_state,
+                outcome,
+                remapped.get("status_message"),
+            )
         return remapped
 
     @classmethod

@@ -1400,6 +1400,7 @@ class FilesystemAdapter:
         issued_by: str = "filesystem",
         cwd: str | os.PathLike[str] | None = None,
         delegable: bool = True,
+        metadata: dict[str, Any] | None = None,
     ) -> Capability:
         return self.capabilities.grant(
             subject=pid,
@@ -1407,6 +1408,7 @@ class FilesystemAdapter:
             rights=rights,
             issued_by=issued_by,
             delegable=delegable,
+            metadata=metadata,
         )
 
     def grant_directory(
@@ -1417,6 +1419,7 @@ class FilesystemAdapter:
         issued_by: str = "filesystem",
         cwd: str | os.PathLike[str] | None = None,
         delegable: bool = True,
+        metadata: dict[str, Any] | None = None,
     ) -> Capability:
         return self.capabilities.grant(
             subject=pid,
@@ -1424,6 +1427,7 @@ class FilesystemAdapter:
             rights=rights,
             issued_by=issued_by,
             delegable=delegable,
+            metadata=metadata,
         )
 
     def grant_path_list(

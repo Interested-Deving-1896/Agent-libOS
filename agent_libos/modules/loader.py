@@ -144,7 +144,14 @@ class ModuleLoader:
         "metadata",
         "sha256",
     }
-    PROVIDES_FIELDS = {"tools", "images", "syscalls", "provider_hooks", "startup_hooks"}
+    PROVIDES_FIELDS = {
+        "tools",
+        "images",
+        "syscalls",
+        "provider_hooks",
+        "startup_hooks",
+        "durable_object_release_finalizers",
+    }
 
     def __init__(
         self,
@@ -188,6 +195,9 @@ class ModuleLoader:
                 "syscalls": list(source.manifest.provides.syscalls),
                 "provider_hooks": list(source.manifest.provides.provider_hooks),
                 "startup_hooks": list(source.manifest.provides.startup_hooks),
+                "durable_object_release_finalizers": list(
+                    source.manifest.provides.durable_object_release_finalizers
+                ),
             },
         }
 
@@ -377,6 +387,11 @@ class ModuleLoader:
                 "provides.startup_hooks",
                 self.config.modules.max_declared_startup_hooks,
             ),
+            durable_object_release_finalizers=self._string_list(
+                value.get("durable_object_release_finalizers"),
+                "provides.durable_object_release_finalizers",
+                self.config.modules.max_declared_startup_hooks,
+            ),
         )
 
     def _validate_provides(self, provides: ModuleProvides) -> None:
@@ -386,6 +401,9 @@ class ModuleLoader:
             "syscalls": provides.syscalls,
             "provider_hooks": provides.provider_hooks,
             "startup_hooks": provides.startup_hooks,
+            "durable_object_release_finalizers": (
+                provides.durable_object_release_finalizers
+            ),
         }.items():
             duplicates = sorted({value for value in values if values.count(value) > 1})
             if duplicates:
@@ -396,6 +414,9 @@ class ModuleLoader:
         for field, values in {
             "provider_hooks": provides.provider_hooks,
             "startup_hooks": provides.startup_hooks,
+            "durable_object_release_finalizers": (
+                provides.durable_object_release_finalizers
+            ),
         }.items():
             for name in values:
                 if not _SYSCALL_PATTERN.match(name):

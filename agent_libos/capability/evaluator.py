@@ -51,24 +51,32 @@ _STRING_RULE_CONDITIONS = frozenset(
         "tool_id",
         "mcp_name",
         "arguments_sha256",
+        "registry_spec_sha256",
         "content_sha256",
         "network",
         "filesystem_intent",
     }
 )
 
+_INTEGER_RULE_CONDITIONS = frozenset({"registry_generation"})
+
 _BOOLEAN_RULE_CONDITIONS = frozenset(
     {"continuous_session", "recursive", "missing_ok", "overwrite", "parents", "exist_ok"}
 )
 
 _DIRECT_RULE_CONDITIONS = tuple(
-    sorted((_STRING_RULE_CONDITIONS - {"operation", "authority_operation"}) | _BOOLEAN_RULE_CONDITIONS)
+    sorted(
+        (_STRING_RULE_CONDITIONS - {"operation", "authority_operation"})
+        | _BOOLEAN_RULE_CONDITIONS
+        | _INTEGER_RULE_CONDITIONS
+    )
 )
 
 _ALLOWED_RULE_CONDITIONS = frozenset(
     {
         *_STRING_RULE_CONDITIONS,
         *_BOOLEAN_RULE_CONDITIONS,
+        *_INTEGER_RULE_CONDITIONS,
         "argv",
         "match",
         "regex_token",
@@ -380,16 +388,7 @@ class CapabilityEvaluator:
 
     def _malformed_authority_rule_conditions(self, rule: Any) -> list[str]:
         conditions = dict(rule.conditions or {})
-        malformed = [
-            key
-            for key in _STRING_RULE_CONDITIONS
-            if key in conditions and not isinstance(conditions[key], str)
-        ]
-        malformed.extend(
-            key
-            for key in _BOOLEAN_RULE_CONDITIONS
-            if key in conditions and not isinstance(conditions[key], bool)
-        )
+        malformed = self._malformed_typed_authority_conditions(conditions)
         if "argv" in conditions and (
             not isinstance(conditions["argv"], list)
             or not all(isinstance(item, str) for item in conditions["argv"])
@@ -403,6 +402,32 @@ class CapabilityEvaluator:
             if key in conditions and self._finite_nonnegative_timeout(conditions[key]) is None:
                 malformed.append(key)
         return sorted(set(malformed))
+
+    @staticmethod
+    def _malformed_typed_authority_conditions(
+        conditions: dict[str, Any],
+    ) -> list[str]:
+        malformed = [
+            key
+            for key in _STRING_RULE_CONDITIONS
+            if key in conditions and not isinstance(conditions[key], str)
+        ]
+        malformed.extend(
+            key
+            for key in _BOOLEAN_RULE_CONDITIONS
+            if key in conditions and not isinstance(conditions[key], bool)
+        )
+        malformed.extend(
+            key
+            for key in _INTEGER_RULE_CONDITIONS
+            if key in conditions
+            and (
+                isinstance(conditions[key], bool)
+                or not isinstance(conditions[key], int)
+                or conditions[key] < 0
+            )
+        )
+        return malformed
 
     def malformed_authority_rule_conditions(self, rule: Any) -> list[str]:
         return self._malformed_authority_rule_conditions(rule)

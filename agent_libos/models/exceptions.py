@@ -51,11 +51,63 @@ class ProcessRevisionConflict(ProcessError):
     pass
 
 
+class RuntimePublicationPending(ProcessError):
+    """A linked runtime publication still owns an operation's final outcome."""
+
+    def __init__(
+        self,
+        *,
+        publication_id: str,
+        operation_id: str,
+        state: str,
+        phase: str,
+    ) -> None:
+        self.publication_id = str(publication_id)
+        self.operation_id = str(operation_id)
+        self.state = str(state)
+        self.phase = str(phase)
+        super().__init__(
+            "runtime publication outcome remains pending: "
+            f"{self.publication_id} ({self.state}/{self.phase})"
+        )
+
+
+class RuntimeRecoveryRequired(ProcessError):
+    """A failed exec compensation requires reopen before further mutation."""
+
+    def __init__(
+        self,
+        *,
+        publication_id: str,
+        operation_id: str,
+        pid: str,
+        state: str,
+        phase: str,
+        _issuer_token: object | None = None,
+    ) -> None:
+        self.publication_id = str(publication_id)
+        self.operation_id = str(operation_id)
+        self.pid = str(pid)
+        self.state = str(state)
+        self.phase = str(phase)
+        self._issuer_token = _issuer_token
+        super().__init__(
+            "runtime recovery is required before further mutation: "
+            f"{self.publication_id} ({self.state}/{self.phase})"
+        )
+
+
 class ResourceLimitExceeded(ProcessError):
     pass
 
 
 class ValidationError(LibOSError):
+    pass
+
+
+class DurableObjectFinalizerUnavailable(ValidationError):
+    """A durable cleanup intent has no restart-stable handler."""
+
     pass
 
 

@@ -29,6 +29,20 @@ class OperationOutcome(StrEnum):
     UNKNOWN = "unknown"
 
 
+@dataclass(frozen=True, order=True, slots=True)
+class OperationCursor:
+    """Stable keyset cursor for bounded startup operation recovery."""
+
+    started_at: str
+    operation_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.started_at, str) or not self.started_at:
+            raise ValueError("operation cursor started_at must not be empty")
+        if not isinstance(self.operation_id, str) or not self.operation_id:
+            raise ValueError("operation cursor operation_id must not be empty")
+
+
 class OperationEvidenceRole(StrEnum):
     INVOCATION = "invocation"
     DECISION = "decision"
@@ -59,6 +73,43 @@ class OperationRecord:
     started_at: str = ""
     updated_at: str = ""
     completed_at: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OperationPage:
+    """One hard-bounded page of stale running operations."""
+
+    records: tuple[OperationRecord, ...]
+    next_cursor: OperationCursor | None = None
+
+    def __post_init__(self) -> None:
+        if self.next_cursor is not None and not self.records:
+            raise ValueError("empty operation page cannot have a cursor")
+
+
+@dataclass(frozen=True, slots=True)
+class StaleOperationRecoverySummary:
+    """Bounded diagnostics for a fully processed stale-operation backlog."""
+
+    total_count: int
+    sample_operation_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.total_count, bool)
+            or not isinstance(self.total_count, int)
+            or self.total_count < 0
+        ):
+            raise ValueError("stale operation recovery total must be non-negative")
+        if len(self.sample_operation_ids) > self.total_count:
+            raise ValueError("stale operation recovery sample exceeds total")
+
+    @property
+    def truncated(self) -> bool:
+        return len(self.sample_operation_ids) < self.total_count
+
+    def __len__(self) -> int:
+        return self.total_count
 
 
 @dataclass(frozen=True)

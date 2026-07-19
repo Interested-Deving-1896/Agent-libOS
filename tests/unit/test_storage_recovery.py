@@ -20,6 +20,7 @@ from agent_libos.models import (
     ExternalEffectRollbackClass,
     ExternalEffectRollbackStatus,
     MemoryView,
+    KilledProcessOutcome,
     ObjectHandle,
     ProcessStatus,
     ResourceBudget,
@@ -35,9 +36,15 @@ from agent_libos.evidence.external_effects import (
     abandon_external_effect_intent,
     record_external_effect,
 )
-from agent_libos.storage import SQLRuntimeStore, STORE_SCHEMA_VERSION, SQLiteStore
+from agent_libos.storage import (
+    ProcessRepository,
+    SQLRuntimeStore,
+    STORE_SCHEMA_VERSION,
+    SQLiteStore,
+)
 from agent_libos.storage.postgres import PostgresStore
 from agent_libos.storage.sql import _V3_REQUIRED_COLUMNS
+from agent_libos.process_transition import ProcessTransitionService
 from agent_libos.utils.ids import utc_now
 from tests.support.external_effects import begin_external_effect_intent
 
@@ -346,8 +353,12 @@ class TestStoreTransactionRecovery:
             stale = store.get_process("pid_terminal")
             killed = store.get_process("pid_terminal")
             assert stale is not None and killed is not None
-            killed.status = ProcessStatus.KILLED
-            store.update_process(killed)
+            ProcessTransitionService(ProcessRepository(store)).transition(
+                killed.pid,
+                ProcessStatus.KILLED,
+                expected_revision=killed.revision,
+                outcome=KilledProcessOutcome(code="test_fixture"),
+            )
 
             stale.tool_table["late"] = "tool_late"
             with pytest.raises(ProcessRevisionConflict):
@@ -437,6 +448,31 @@ class TestStoreTransactionRecovery:
                 store.set_object_payload("obj_payload", {"value": "after"})
 
             assert store.object_payload("obj_payload") == {"value": "before"}
+        finally:
+            store.close()
+
+    def test_outer_execute_commit_failure_preserves_primary_and_rolls_back_sql(self) -> None:
+        store = SQLiteStore(":memory:")
+        primary = RuntimeError("injected exact outer commit failure")
+
+        class _ExactCommitFailureConnection(_ConnectionProxy):
+            def commit(self) -> None:
+                raise primary
+
+        store.conn = _ExactCommitFailureConnection(store.conn)
+        try:
+            with pytest.raises(RuntimeError) as caught:
+                store._execute(
+                    "INSERT INTO object_namespaces VALUES (?, ?, ?, ?, ?, ?)",
+                    ("outer-commit-failed", None, "{}", "test", "1", "1"),
+                )
+
+            assert caught.value is primary
+            assert store.select_table_rows(
+                "object_namespaces",
+                "namespace = ?",
+                ("outer-commit-failed",),
+            ) == []
         finally:
             store.close()
 
@@ -656,6 +692,7 @@ class _PostgresLeaseConnection:
     def __init__(self, database: str, schema: str) -> None:
         self.database = database
         self.schema = schema
+        self.closed = False
         self.calls: list[tuple[str, tuple[Any, ...]]] = []
 
     def execute(self, sql: str, params: Any = ()) -> _PostgresResult:
@@ -664,6 +701,10 @@ class _PostgresLeaseConnection:
         if "current_database()" in sql:
             return _PostgresResult({"database_name": self.database, "schema_name": self.schema})
         return _PostgresResult({"acquired": True})
+
+    def close(self) -> None:
+        self.calls.append(("CLOSE SESSION", ()))
+        self.closed = True
 
 
 class TestPostgresRuntimeLeaseIsolation:
@@ -683,9 +724,13 @@ class TestPostgresRuntimeLeaseIsolation:
         assert len(set(keys)) == 3
 
         for store, connection in stores:
-            store._release_runtime_lease(connection)  # type: ignore[arg-type]
-            unlock_calls = [call for call in connection.calls if "pg_advisory_unlock" in call[0]]
-            assert unlock_calls == [("SELECT pg_advisory_unlock(?)", (store._runtime_lease_key,))]
+            lease_key = store._runtime_lease_key
+            assert lease_key is not None
+            store.conn = connection  # type: ignore[assignment]
+            store.close()
+            assert connection.calls[-1] == ("CLOSE SESSION", ())
+            assert store._runtime_lease_acquired is False
+            assert store._runtime_lease_key is None
 
 
 class TestUnsupportedStoreVersion:
@@ -747,6 +792,37 @@ class TestUnsupportedStoreVersion:
             assert row["schema_version"] == STORE_SCHEMA_VERSION
         finally:
             reopened.close()
+
+    def test_utf16_sqlite_store_is_rejected_before_bootstrap(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "utf16.sqlite"
+        lease_path = db_path.with_suffix(db_path.suffix + ".runtime.lock")
+        connection = sqlite3.connect(db_path)
+        try:
+            connection.execute("PRAGMA encoding = 'UTF-16le'")
+            connection.execute("CREATE TABLE encoding_seed (value TEXT)")
+            connection.execute("DROP TABLE encoding_seed")
+            connection.commit()
+            assert connection.execute("PRAGMA encoding").fetchone() == ("UTF-16le",)
+        finally:
+            connection.close()
+        before = db_path.read_bytes()
+
+        with pytest.raises(UnsupportedStoreVersion, match=r"SQLite.*requires UTF-8"):
+            SQLiteStore(db_path)
+
+        assert db_path.read_bytes() == before
+        assert not lease_path.exists()
+        connection = sqlite3.connect(db_path)
+        try:
+            assert connection.execute(
+                "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+            ).fetchall() == []
+            assert connection.execute("PRAGMA encoding").fetchone() == ("UTF-16le",)
+        finally:
+            connection.close()
 
     def test_wrong_schema_marker_is_rejected_without_mutation(self, tmp_path: Path) -> None:
         db_path = tmp_path / "wrong-version.sqlite"

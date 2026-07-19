@@ -144,19 +144,24 @@ class TestSkillIntegration:
                 source_code=_jit_source('partial'),
             )
             assert runtime.tools.validate(candidate_id, pid=pid).ok
-            real_update_process = runtime.store.update_process
+            real_patch_process = runtime.tools.jit.processes.patch_process
             calls = 0
 
-            def fail_once(process):
+            def fail_once(*args, **kwargs):
                 nonlocal calls
                 calls += 1
                 if calls == 1:
                     raise RuntimeError('process update failed')
-                return real_update_process(process)
+                return real_patch_process(*args, **kwargs)
 
-            monkeypatch.setattr(runtime.store, 'update_process', fail_once)
+            monkeypatch.setattr(
+                runtime.tools.jit.processes,
+                'patch_process',
+                fail_once,
+            )
             with pytest.raises(RuntimeError, match='process update failed'):
                 runtime.tools.register(pid, candidate_id)
+            assert calls == 1
 
             candidate = runtime.store.get_tool_candidate(candidate_id)
             assert candidate is not None

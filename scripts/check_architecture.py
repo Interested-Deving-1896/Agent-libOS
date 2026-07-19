@@ -15,6 +15,7 @@ from collections import Counter
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -31,8 +32,112 @@ RATCHET_RULES = (
     "concrete-runtime-import",
     "cross-component-private-access",
     "runtime-service-locator",
+    "runtime-storage-sql-bypass",
+    "typed-storage-reflection-bypass",
+    "untracked-blocking-dispatch",
     "undeclared-runtime-component",
     "whole-process-write",
+)
+
+_TYPED_STORAGE_RUNTIME_FILES = frozenset(
+    {
+        "agent_libos/runtime/process_manager.py",
+        "agent_libos/runtime/resource_manager.py",
+        "agent_libos/runtime/checkpoint_manager.py",
+        "agent_libos/runtime/checkpoint_reconciliation.py",
+        "agent_libos/runtime/checkpoint_image.py",
+        "agent_libos/runtime/image_boot.py",
+        "agent_libos/runtime/data_flow_manager.py",
+        "agent_libos/runtime/snapshots/exec_state.py",
+        "agent_libos/modules/registry.py",
+        "agent_libos/process_transition.py",
+    }
+)
+_RAW_STORAGE_CALLS = frozenset(
+    {
+        "execute",
+        "select_table_rows",
+        "insert_table_row",
+        "delete_table_rows",
+        "snapshot_tables",
+        "restore_tables",
+    }
+)
+_RAW_SQL_CALLS = frozenset(
+    {"execute", "executemany", "executescript", "_execute", "_execute_script"}
+)
+_CHECKPOINT_MANAGER_STORAGE_METHOD_OWNERS = {
+    "transaction": frozenset({"_unit_of_work"}),
+    "record_runtime_publication_artifact": frozenset({"_publications"}),
+    "current_effect_ledger_seq": frozenset({"_evidence"}),
+    "list_external_effects_changed_after": frozenset({"_evidence"}),
+    "list_events": frozenset({"_evidence"}),
+    "get_process": frozenset({"_processes"}),
+    "patch_process": frozenset({"_processes"}),
+    "list_processes": frozenset({"_processes"}),
+    "list_object_tasks": frozenset({"_processes"}),
+    "get_object_task": frozenset({"_processes"}),
+    "get_human_request": frozenset({"_processes"}),
+    "get_object": frozenset({"_objects"}),
+    "list_objects_owned_by": frozenset({"_objects"}),
+    "has_object_payload": frozenset({"_objects"}),
+    "object_payload": frozenset({"_objects"}),
+    "list_namespaces_created_by": frozenset({"_objects"}),
+    "get_namespace": frozenset({"_objects"}),
+    "namespace_exists": frozenset({"_objects"}),
+    "get_capability": frozenset({"_authority"}),
+    "get_image_artifact": frozenset({"_extensions"}),
+    "list_tools": frozenset({"_extensions"}),
+    "delete_tool": frozenset({"_extensions"}),
+    "upsert_image": frozenset({"_extensions"}),
+    "insert_image_artifact": frozenset({"_extensions"}),
+}
+_PROCESS_MANAGER_STORAGE_METHOD_OWNERS = {
+    "get_operation": ("self", "_evidence"),
+    "list_capabilities": ("self", "_authority"),
+}
+_TOOL_BROKER_STORAGE_METHOD_OWNERS = {
+    "transaction": ("self", "unit_of_work"),
+    "get_process": ("self", "processes"),
+    "list_processes": ("self", "processes"),
+    "patch_process": ("self", "processes"),
+    "tool_id_referenced_outside_process": ("self", "processes"),
+    "get_object": ("self", "objects"),
+    "list_objects_owned_by": ("self", "objects"),
+    "delete_tool_candidate": ("self", "extensions"),
+    "get_existing_tool_ids": ("self", "extensions"),
+    "get_tool_candidate": ("self", "extensions"),
+    "get_tool_spec": ("self", "extensions"),
+    "list_registered_tool_candidate_rows": ("self", "extensions"),
+    "list_tools": ("self", "extensions"),
+}
+_JIT_PROJECTION_SQL_TRUSTED_PATHS = frozenset(
+    {
+        "agent_libos/storage/sql.py",
+        "agent_libos/storage/migrations.py",
+    }
+)
+_JIT_PROJECTION_SQL_TRUSTED_PREFIXES = (
+    "agent_libos/storage/migrations/",
+)
+_JIT_PROJECTION_MUTATION = re.compile(
+    r"\b(?:"
+    r"(?:insert(?:\s+or\s+[a-z_]+)?|replace|merge)\s+into|"
+    r"update(?:\s+or\s+[a-z_]+)?|delete\s+from|"
+    r"truncate(?:\s+table)?"
+    r")\s+[\"`\[]?(tools|process_tool_bindings)\b",
+    re.IGNORECASE,
+)
+_TYPED_STORAGE_REPOSITORY_CLASSES = frozenset(
+    {
+        "ProcessRepository",
+        "ResourceRepository",
+        "RuntimePublicationRepository",
+        "CheckpointRestorePublicationWriter",
+        "SnapshotCheckpointRepository",
+        "EvidenceRepository",
+        "RuntimeModuleRepository",
+    }
 )
 
 FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
@@ -109,6 +214,82 @@ def _static_getattr_path(node: ast.AST) -> tuple[str, ...]:
         return ()
     base = _attribute_path(node.args[0]) or _static_getattr_path(node.args[0])
     return (*base, node.args[1].value) if base else ()
+
+
+def _is_default_executor_dispatch(node: ast.Call) -> bool:
+    """Recognize raw ``run_in_executor(None, ...)`` dispatch."""
+
+    if not isinstance(node.func, ast.Attribute) or node.func.attr != "run_in_executor":
+        return False
+    if node.args:
+        executor = node.args[0]
+    else:
+        executor = next(
+            (
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg == "executor"
+            ),
+            None,
+        )
+    return isinstance(executor, ast.Constant) and executor.value is None
+
+
+def _static_sql_text(node: ast.AST) -> str | None:
+    """Return statically visible SQL text without evaluating source code."""
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            value.value
+            if isinstance(value, ast.Constant) and isinstance(value.value, str)
+            else " ? "
+            for value in node.values
+        )
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_sql_text(node.left)
+        right = _static_sql_text(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _raw_jit_projection_mutation(
+    node: ast.Call,
+    *,
+    relative: str,
+) -> str | None:
+    """Identify raw writes to the two transactionally derived JIT tables.
+
+    Tests are outside ``SOURCE_ROOTS``. Schema migrations and the owning SQL
+    backend are the only production-source trust boundary for these writes;
+    all other runtime code must use typed repository mutations so the durable
+    eligibility bit cannot diverge from Tool metadata or process bindings.
+    """
+
+    if relative in _JIT_PROJECTION_SQL_TRUSTED_PATHS or relative.startswith(
+        _JIT_PROJECTION_SQL_TRUSTED_PREFIXES
+    ):
+        return None
+    call_path = _attribute_path(node.func) or _static_getattr_path(node.func)
+    if not call_path or call_path[-1] not in _RAW_SQL_CALLS:
+        return None
+    sql_node = node.args[0] if node.args else next(
+        (
+            keyword.value
+            for keyword in node.keywords
+            if keyword.arg in {"sql", "query", "statement"}
+        ),
+        None,
+    )
+    if sql_node is None:
+        return None
+    sql = _static_sql_text(sql_node)
+    if sql is None:
+        return None
+    match = _JIT_PROJECTION_MUTATION.search(sql)
+    return match.group(1).lower() if match is not None else None
 
 
 def _source_paths(root: Path) -> Iterable[Path]:
@@ -441,8 +622,256 @@ def _scan_file(path: Path, root: Path) -> ArchitectureReport:
         package_source and package_name not in {"api", "runtime"}
     )
 
+    if relative == "agent_libos/runtime/runtime.py":
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if _owner_for(function, parents, owners) != "Runtime._add_handle_to_process_view":
+                continue
+            call_paths = [
+                _attribute_path(candidate.func)
+                for candidate in ast.walk(function)
+                if isinstance(candidate, ast.Call)
+            ]
+            if call_paths != [("self", "process", "add_handle_to_process_view")]:
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner="Runtime._add_handle_to_process_view",
+                        detail="handle-publication:must-delegate-to-process-manager",
+                        line=function.lineno,
+                    )
+                )
+
     for node in ast.walk(tree):
         owner = _owner_for(node, parents, owners)
+        if (
+            relative == "agent_libos/runtime/checkpoint_manager.py"
+            and isinstance(node, ast.arg)
+            and (
+                node.arg in {"store", "snapshot_repository"}
+                or _attribute_path(node.annotation) == ("RuntimeStore",)
+            )
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail=f"{node.arg}:raw-or-overridable-storage-port",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/tools/broker.py"
+            and isinstance(node, ast.arg)
+            and node.arg == "store"
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail="store:raw-tool-broker-storage-port",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/tools/broker.py"
+            and isinstance(node, ast.arg)
+            and _attribute_path(node.annotation) == ("RuntimeStore",)
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail=f"{node.arg}:raw-tool-broker-storage-type",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/tools/broker.py"
+            and isinstance(node, ast.arg)
+            and node.arg == "unit_of_work"
+            and _attribute_path(node.annotation) != ("UnitOfWork",)
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail="unit_of_work:untyped-tool-broker-storage-port",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/tools/broker.py"
+            and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and owner == "ToolBroker.__init__"
+            and "unit_of_work"
+            not in {
+                argument.arg
+                for argument in (
+                    *node.args.posonlyargs,
+                    *node.args.args,
+                    *node.args.kwonlyargs,
+                )
+            }
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail="unit_of_work:missing-tool-broker-storage-port",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/runtime/checkpoint_manager.py"
+            and isinstance(node, ast.arg)
+            and node.arg == "unit_of_work"
+            and _attribute_path(node.annotation) != ("UnitOfWork",)
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail="unit_of_work:untyped-storage-port",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/runtime/checkpoint_manager.py"
+            and isinstance(node, ast.arg)
+            and node.arg == "checkpoint_publication_writer"
+            and _attribute_path(node.annotation)
+            != ("CheckpointRestorePublicationWriterPort",)
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail="checkpoint_publication_writer:untyped-publication-port",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/runtime/checkpoint_manager.py"
+            and isinstance(node, ast.arg)
+            and node.arg == "operations"
+            and _attribute_path(node.annotation)
+            != ("RuntimePublicationOperationPort",)
+        ):
+            violations.append(
+                Violation(
+                    rule="typed-storage-reflection-bypass",
+                    path=relative,
+                    owner=owner,
+                    detail="operations:untyped-publication-operation-port",
+                    line=node.lineno,
+                )
+            )
+        if (
+            relative == "agent_libos/runtime/checkpoint_reconciliation.py"
+            and isinstance(node, ast.arg)
+            and node.arg in {"store", "writer", "operations"}
+        ):
+            expected = {
+                "store": "CheckpointRestorePublicationReader",
+                "writer": "CheckpointRestorePublicationWriterPort",
+                "operations": "RuntimePublicationOperationPort",
+            }[node.arg]
+            if _attribute_path(node.annotation) != (expected,):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=f"{node.arg}:untyped-publication-port",
+                        line=node.lineno,
+                    )
+                )
+        if (
+            relative == "agent_libos/runtime/builder.py"
+            and isinstance(node, ast.Call)
+            and _attribute_path(node.func) == ("CheckpointManager",)
+        ):
+            unit_of_work_value = (
+                node.args[0]
+                if node.args
+                else next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "unit_of_work"
+                    ),
+                    None,
+                )
+            )
+            if _attribute_path(unit_of_work_value) != ("host", "uow"):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail="unit_of_work:miswired-storage-port",
+                        line=node.lineno,
+                    )
+                )
+            writer_keyword = next(
+                (
+                    keyword
+                    for keyword in node.keywords
+                    if keyword.arg == "checkpoint_publication_writer"
+                ),
+                None,
+            )
+            if writer_keyword is None or _attribute_path(writer_keyword.value) != (
+                "host",
+                "uow",
+                "checkpoint_restore_publications",
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail="checkpoint_publication_writer:miswired-publication-port",
+                        line=node.lineno,
+                    )
+                )
+        if (
+            relative == "agent_libos/runtime/builder.py"
+            and isinstance(node, ast.Call)
+            and _attribute_path(node.func) == ("ToolBroker",)
+        ):
+            tool_broker_uow = (
+                node.args[0]
+                if node.args
+                else next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "unit_of_work"
+                    ),
+                    None,
+                )
+            )
+            if _attribute_path(tool_broker_uow) != ("host", "uow"):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail="tool-broker:miswired-unit-of-work",
+                        line=node.lineno,
+                    )
+                )
         if (
             relative == "agent_libos/runtime/builder.py"
             and isinstance(node, ast.Call)
@@ -492,6 +921,71 @@ def _scan_file(path: Path, root: Path) -> ArchitectureReport:
         if isinstance(node, ast.Attribute) and _is_outermost_attribute(node, parents):
             access_path = _attribute_path(node)
             if (
+                relative == "agent_libos/runtime/runtime.py"
+                and access_path[:2] == ("self", "store")
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(access_path),
+                        line=node.lineno,
+                    )
+                )
+            if (
+                relative == "agent_libos/tools/broker.py"
+                and access_path[:2] == ("self", "store")
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(access_path),
+                        line=node.lineno,
+                    )
+                )
+            if (
+                relative == "agent_libos/runtime/syscalls.py"
+                and access_path[:3] == ("self", "runtime", "store")
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(access_path),
+                        line=node.lineno,
+                    )
+                )
+            if (
+                relative == "agent_libos/runtime/checkpoint_manager.py"
+                and access_path[:2] in {("self", "store"), ("self", "_store")}
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(access_path),
+                        line=node.lineno,
+                    )
+                )
+            if (
+                relative == "agent_libos/runtime/checkpoint_reconciliation.py"
+                and access_path[:3] == ("self", "_operations", "store")
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(access_path),
+                        line=node.lineno,
+                    )
+                )
+            if (
                 relative != "agent_libos/storage/sql.py"
                 and access_path
                 and access_path[-1] == "update_process"
@@ -537,8 +1031,142 @@ def _scan_file(path: Path, root: Path) -> ArchitectureReport:
                 )
 
         if isinstance(node, ast.Call):
+            call_path = _attribute_path(node.func)
+            owner_class = owner.split(".", 1)[0]
+            if (
+                relative == "agent_libos/runtime/process_manager.py"
+                and call_path
+                and call_path[-1] in _PROCESS_MANAGER_STORAGE_METHOD_OWNERS
+                and call_path[:-1]
+                != _PROCESS_MANAGER_STORAGE_METHOD_OWNERS[call_path[-1]]
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(call_path),
+                        line=node.lineno,
+                    )
+                )
+            if (
+                relative == "agent_libos/tools/broker.py"
+                and call_path
+                and call_path[-1] in _TOOL_BROKER_STORAGE_METHOD_OWNERS
+                and call_path[:-1]
+                != _TOOL_BROKER_STORAGE_METHOD_OWNERS[call_path[-1]]
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(call_path),
+                        line=node.lineno,
+                    )
+                )
+            if (
+                relative == "agent_libos/runtime/checkpoint_manager.py"
+                and len(call_path) == 3
+                and call_path[0] == "self"
+                and call_path[-1] in _CHECKPOINT_MANAGER_STORAGE_METHOD_OWNERS
+                and call_path[1]
+                not in _CHECKPOINT_MANAGER_STORAGE_METHOD_OWNERS[call_path[-1]]
+            ):
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(call_path),
+                        line=node.lineno,
+                    )
+                )
+            projection_table = _raw_jit_projection_mutation(
+                node,
+                relative=relative,
+            )
+            if projection_table is not None:
+                violations.append(
+                    Violation(
+                        rule="runtime-storage-sql-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=f"raw-jit-projection-sql:{projection_table}",
+                        line=node.lineno,
+                    )
+                )
+            typed_storage_reflection = (
+                relative == "agent_libos/storage/repositories.py"
+                and owner_class in _TYPED_STORAGE_REPOSITORY_CLASSES
+                and (
+                    (call_path and call_path[-1] == "_delegate")
+                    or (
+                        isinstance(node.func, ast.Name)
+                        and node.func.id == "getattr"
+                    )
+                )
+            )
+            if typed_storage_reflection:
+                detail = ".".join(call_path) if call_path else "getattr"
+                violations.append(
+                    Violation(
+                        rule="typed-storage-reflection-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=detail,
+                        line=node.lineno,
+                    )
+                )
+            if (
+                relative in _TYPED_STORAGE_RUNTIME_FILES
+                and call_path
+                and call_path[-1] in _RAW_STORAGE_CALLS
+            ):
+                violations.append(
+                    Violation(
+                        rule="runtime-storage-sql-bypass",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(call_path),
+                        line=node.lineno,
+                    )
+                )
+            if call_path in {("asyncio", "to_thread"), ("to_thread",)}:
+                violations.append(
+                    Violation(
+                        rule="untracked-blocking-dispatch",
+                        path=relative,
+                        owner=owner,
+                        detail=".".join(call_path),
+                        line=node.lineno,
+                    )
+                )
+            if _is_default_executor_dispatch(node):
+                violations.append(
+                    Violation(
+                        rule="untracked-blocking-dispatch",
+                        path=relative,
+                        owner=owner,
+                        detail="run_in_executor(None)",
+                        line=node.lineno,
+                    )
+                )
             access_path = _static_getattr_path(node)
             if access_path:
+                if (
+                    relative in _TYPED_STORAGE_RUNTIME_FILES
+                    and access_path[-1] in _RAW_STORAGE_CALLS
+                ):
+                    violations.append(
+                        Violation(
+                            rule="runtime-storage-sql-bypass",
+                            path=relative,
+                            owner=owner,
+                            detail=".".join(access_path),
+                            line=node.lineno,
+                        )
+                    )
                 if (
                     relative != "agent_libos/storage/sql.py"
                     and access_path[-1] == "update_process"

@@ -110,6 +110,55 @@ def test_direct_protected_operation_is_persisted_and_explainable() -> None:
         )
 
 
+def test_process_exec_is_one_operation_covering_publication_and_evidence() -> None:
+    with temporary_runtime() as runtime:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="before exec")
+        runtime.capability.grant(
+            pid,
+            runtime.image_registry.resource_for("review-agent:v0"),
+            [CapabilityRight.READ],
+            issued_by="test",
+        )
+
+        runtime.exec_process(pid, "review-agent:v0", goal="after exec")
+
+        operations = [
+            operation
+            for operation in runtime.store.list_operations(pid=pid)
+            if operation.name == "process.exec"
+        ]
+        assert len(operations) == 1
+        operation = operations[0]
+        assert operation.parent_operation_id is None
+        assert operation.outcome.value == "succeeded"
+
+        publications = [
+            publication
+            for publication in runtime.store.list_runtime_publications(pid=pid)
+            if publication["kind"] == "process_exec"
+        ]
+        assert len(publications) == 1
+        publication = publications[0]
+        assert publication["state"] == "committed"
+        assert publication["plan"]["operation_id"] == operation.operation_id
+
+        links = runtime.store.list_operation_evidence(
+            operation_ids=[operation.operation_id]
+        )
+        assert {link.evidence_type for link in links} >= {"audit", "event"}
+        commit_receipt = publication["receipt"]["phases"][-1]
+        assert commit_receipt["phase"] == "committed"
+        assert commit_receipt["audit_id"] in {
+            link.evidence_id for link in links if link.evidence_type == "audit"
+        }
+        assert commit_receipt["event_id"] in {
+            link.evidence_id for link in links if link.evidence_type == "event"
+        }
+        explanation = runtime.explain.explain_operation(operation.operation_id)
+        assert explanation["evidence_complete"] is True
+        assert explanation["root"]["outcome"] == "succeeded"
+
+
 def test_tool_primitive_capability_effect_and_resource_evidence_form_one_tree() -> None:
     with workspace_runtime() as (runtime, root):
         relative = "input.txt"

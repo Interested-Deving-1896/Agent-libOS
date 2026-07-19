@@ -44,17 +44,29 @@ a narrower child template. Omitted child fields inherit those ceilings. An
 explicit child template cannot add or replace parent data-flow or approval
 policy keys,
 request authority outside the parent's authorized/requestable space, extend the
-parent expiry, or turn a non-empty effect ceiling into the compatibility-mode
-empty ceiling.
+parent expiry, or widen a concrete or deny-all effect ceiling to unrestricted
+`null` (or to patterns outside the parent's ceiling).
 
 Model permission requests are checked against the manifest before a Human
 request is created. `approval_policy.requestable_capabilities` declares
 authority that may be requested but is not granted at launch; a Human decision
-still creates the narrower one-time or policy capability. An explicit
-`permitted_effects` list is an additional
-provider-boundary ceiling with exact entries or terminal wildcards such as
-`jsonrpc.*`. An empty list preserves capability-only effect gating for
-compatibility; it does not grant a capability.
+still creates the narrower one-time or policy capability.
+
+`permitted_effects` is an additional provider-boundary ceiling with exact
+entries or terminal wildcards such as `jsonrpc.*`. Omitting the field or using
+JSON `null` preserves capability-only effect gating for compatibility. An
+explicit empty list is deny-all: no provider effect may cross the Task
+Authority boundary even when an ordinary capability would otherwise allow it.
+That deny-all ceiling also covers runtime-mediated LLM and Human provider
+effects owned by the process.
+
+The durable effect-policy envelope is schema version 2 so unrestricted `null`
+and deny-all `[]` cannot collapse during persistence. Legacy version 1 rows are
+upcast on read: their empty list retains its historical unrestricted meaning,
+while every newly written manifest uses the tagged version 2 representation.
+Derived manifests inherit an omitted parent value. An unrestricted parent may
+be narrowed to any list, including deny-all; a concrete or deny-all parent
+cannot be widened back to unrestricted.
 
 Per-use external-operation approval preallocates the eventual external
 `effect_id` and binds it with the canonical argument hash and target state

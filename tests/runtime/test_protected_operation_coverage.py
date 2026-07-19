@@ -71,6 +71,72 @@ def test_static_check_rejects_provider_handle_call_outside_sdk_phase(tmp_path: P
     assert any("provider handle method read" in error for error in errors)
 
 
+def test_static_check_accepts_leased_recovery_handle_close(tmp_path: Path) -> None:
+    source = tmp_path / "recovery_close.py"
+    source.write_text(
+        "class RecoveryCleanup:\n"
+        "    def close_transient(self, session):\n"
+        "        self.host.require_recovery_cleanup_lease()\n"
+        "        return session.handle.close()\n"
+        "    def release(self, session):\n"
+        "        return self.close_transient(session)\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(source, relative=Path("modules/recovery_close.py"))
+
+    assert errors == []
+
+
+def test_static_check_rejects_recovery_guard_after_provider_close(tmp_path: Path) -> None:
+    source = tmp_path / "late_recovery_guard.py"
+    source.write_text(
+        "class UnsafeCleanup:\n"
+        "    def close_transient(self, session):\n"
+        "        result = session.handle.close()\n"
+        "        self.host.require_recovery_cleanup_lease()\n"
+        "        return result\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(source, relative=Path("modules/late_recovery_guard.py"))
+
+    assert any("provider handle method close" in error for error in errors)
+
+
+def test_static_check_rejects_non_close_recovery_provider_call(tmp_path: Path) -> None:
+    source = tmp_path / "recovery_read.py"
+    source.write_text(
+        "class UnsafeCleanup:\n"
+        "    def read_transient(self, session):\n"
+        "        self.host.require_recovery_cleanup_lease()\n"
+        "        return session.handle.read()\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(source, relative=Path("modules/recovery_read.py"))
+
+    assert any(
+        "recovery cleanup lease permits only provider handle close" in error
+        for error in errors
+    )
+
+
+def test_static_check_rejects_similarly_named_non_host_guard(tmp_path: Path) -> None:
+    source = tmp_path / "forged_recovery_guard.py"
+    source.write_text(
+        "class UnsafeCleanup:\n"
+        "    def close_transient(self, session):\n"
+        "        self.require_recovery_cleanup_lease()\n"
+        "        return session.handle.close()\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(source, relative=Path("modules/forged_recovery_guard.py"))
+
+    assert any("provider handle method close" in error for error in errors)
+
+
 def test_static_check_rejects_egress_without_sink_and_source_descriptors(tmp_path: Path) -> None:
     source = tmp_path / "bad_egress.py"
     source.write_text(

@@ -4,7 +4,15 @@ from contextlib import contextmanager
 
 import pytest
 
-from agent_libos.models import Checkpoint
+from agent_libos.models import (
+    Checkpoint,
+    ChildProcessWait,
+    ExitedProcessOutcome,
+    process_outcome_from_json,
+    process_outcome_to_mapping,
+    process_wait_state_from_json,
+    process_wait_state_to_mapping,
+)
 from agent_libos.models.exceptions import ValidationError
 from agent_libos.runtime.snapshots import (
     SNAPSHOT_SCHEMA_VERSION,
@@ -15,6 +23,7 @@ from agent_libos.runtime.snapshots import (
     SnapshotRows,
     SnapshotVersionError,
 )
+from agent_libos.utils.serde import dumps
 
 
 def _row(table: str, **values: object) -> dict[str, object]:
@@ -37,7 +46,17 @@ def _snapshot() -> dict:
         "namespaces": ["proc:pid_1"],
         "owned_namespaces": ["proc:pid_1"],
         "rows": {
-            "processes": [_row("processes", pid="pid_1", goal_oid="obj_1")],
+            "processes": [
+                _row(
+                    "processes",
+                    pid="pid_1",
+                    status="runnable",
+                    goal_oid="obj_1",
+                    wait_state_json=dumps(None),
+                    outcome_json=dumps(None),
+                    state_generation=0,
+                )
+            ],
             "object_namespaces": [_row("object_namespaces", namespace="proc:pid_1")],
             "objects": [_row("objects", oid="obj_1", namespace="proc:pid_1")],
             "object_links": [],
@@ -104,6 +123,45 @@ def test_snapshot_codec_rejects_missing_tables_and_process_rows() -> None:
         SnapshotCodec.decode_mapping(missing_process)
 
 
+@pytest.mark.parametrize(
+    ("status", "wait_state_json", "outcome_json", "state_generation"),
+    [
+        ("waiting_event", dumps(None), dumps(None), 1),
+        ("exited", dumps(None), dumps(None), 1),
+        ("runnable", dumps(None), dumps(None), -1),
+    ],
+)
+def test_snapshot_codec_rejects_invalid_typed_process_product_before_restore(
+    status: str,
+    wait_state_json: str,
+    outcome_json: str,
+    state_generation: int,
+) -> None:
+    invalid = _snapshot()
+    invalid["rows"]["processes"][0].update(
+        {
+            "status": status,
+            "wait_state_json": wait_state_json,
+            "outcome_json": outcome_json,
+            "state_generation": state_generation,
+        }
+    )
+    with pytest.raises(ValidationError, match="invalid snapshot rows.processes"):
+        SnapshotCodec.decode_mapping(invalid)
+
+
+def test_snapshot_codec_rejects_sql_null_typed_process_state_fields() -> None:
+    for field_name in ("wait_state_json", "outcome_json"):
+        invalid = _snapshot()
+        invalid["rows"]["processes"][0][field_name] = None
+
+        with pytest.raises(
+            ValidationError,
+            match=f"{field_name} must be canonical JSON text",
+        ):
+            SnapshotCodec.decode_mapping(invalid)
+
+
 def test_snapshot_remapper_updates_typed_identity_fields() -> None:
     snapshot = SnapshotCodec.decode_mapping(_snapshot())
     remapped = SnapshotRemapper.remap(
@@ -123,6 +181,50 @@ def test_snapshot_remapper_updates_typed_identity_fields() -> None:
     assert encoded["rows"]["capabilities"][0]["subject"] == "pid_2"
     assert encoded["object_payloads"] == {"obj_2": {"text": "hello"}}
     assert encoded["jit_sources"] == {"tool_2": "export default {}"}
+
+
+def test_snapshot_row_remapper_updates_nested_process_state_identities() -> None:
+    identities = SnapshotIdentityMap(
+        pids={"pid_1": "pid_2"},
+        objects={"obj_1": "obj_2"},
+    )
+    child_wait = SnapshotRemapper.remap_row(
+        _row(
+            "processes",
+            pid="pid_1",
+            status="waiting_event",
+            status_message="waiting for pid_1",
+            wait_state_json=dumps(
+                process_wait_state_to_mapping(ChildProcessWait(child_pid="pid_1"))
+            ),
+            outcome_json=dumps(None),
+            state_generation=7,
+        ),
+        identities,
+    )
+    terminal = SnapshotRemapper.remap_row(
+        _row(
+            "processes",
+            pid="pid_1",
+            status="exited",
+            status_message="result_oid:obj_1",
+            wait_state_json=dumps(None),
+            outcome_json=dumps(
+                process_outcome_to_mapping(ExitedProcessOutcome(result_oid="obj_1"))
+            ),
+            state_generation=8,
+        ),
+        identities,
+    )
+
+    assert process_wait_state_from_json(child_wait["wait_state_json"]) == (
+        ChildProcessWait(child_pid="pid_2")
+    )
+    assert child_wait["status_message"] == "waiting for pid_2"
+    assert process_outcome_from_json(terminal["outcome_json"]) == (
+        ExitedProcessOutcome(result_oid="obj_2")
+    )
+    assert terminal["status_message"] == "result_oid:obj_2"
 
 
 def test_snapshot_identity_maps_must_be_one_to_one() -> None:
@@ -152,7 +254,7 @@ class _CoordinatorStore:
             self.calls.append("store.exit")
 
 
-def test_snapshot_coordinator_compensates_reservation_after_publish_failure() -> None:
+def test_snapshot_coordinator_rolls_back_its_transaction_after_publish_failure() -> None:
     store = _CoordinatorStore()
     coordinator = SnapshotCoordinator(store)
 
@@ -165,21 +267,15 @@ def test_snapshot_coordinator_compensates_reservation_after_publish_failure() ->
     with pytest.raises(RuntimeError, match="publish failure"):
         coordinator.atomic_publish(
             _snapshot(),
-            reserve=lambda: store.calls.append("reserve") or "reservation",
             prepare=lambda _snapshot: store.calls.append("prepare") or "prepared",
-            settle=lambda token: store.calls.append(f"settle:{token}"),
             publish=fail_publish,
-            compensate=lambda token: store.calls.append(f"compensate:{token}"),
         )
 
     assert store.calls == [
-        "reserve",
-        "prepare",
         "transaction.enter",
-        "settle:reservation",
+        "prepare",
         "publish",
         "transaction.exit",
-        "compensate:reservation",
     ]
 
 

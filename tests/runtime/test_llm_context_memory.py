@@ -32,6 +32,7 @@ from agent_libos.models import (
     ProcessMessageKind,
     ProcessStatus,
     ResourceBudget,
+    ResourceUsage,
     SinkTrustLevel,
     SinkTrustRule,
     ViewMode,
@@ -74,6 +75,115 @@ def _new_llm_executor(runtime: Runtime) -> LLMProcessExecutor:
 
 
 class TestLLMContextMemory:
+
+    def test_event_cursor_update_serializes_with_child_hierarchical_charge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'child')
+            event = runtime.events.emit(
+                EventType.PROCESS_MESSAGE_NOTICE,
+                source=child,
+                target=parent,
+                payload={'kind': 'race probe'},
+            )
+            charge_started = threading.Event()
+            charge_finished = threading.Event()
+            worker: threading.Thread | None = None
+            original_get = runtime.llm._process.get
+
+            def charge_child() -> None:
+                charge_started.set()
+                runtime.resources.charge(
+                    child,
+                    ResourceUsage(tool_calls=1),
+                    source='test.concurrent_child_charge',
+                )
+                charge_finished.set()
+
+            def get_while_child_charge_waits(pid: str) -> Any:
+                nonlocal worker
+                current = original_get(pid)
+                worker = threading.Thread(target=charge_child, daemon=True)
+                worker.start()
+                assert charge_started.wait(timeout=2)
+                assert not charge_finished.wait(timeout=0.05)
+                return current
+
+            monkeypatch.setattr(runtime.llm._process, 'get', get_while_child_charge_waits)
+
+            runtime.llm._advance_event_cursor(parent, event.event_id)
+            monkeypatch.setattr(runtime.llm._process, 'get', original_get)
+
+            assert worker is not None
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            assert charge_finished.is_set()
+            assert runtime.process.get(parent).event_cursor == event.event_id
+            assert runtime.process.get(parent).resource_usage.tool_calls == 1
+        finally:
+            runtime.close()
+
+    def test_context_root_update_serializes_with_child_hierarchical_charge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='parent')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'child')
+            process = runtime.process.get(parent)
+            handle = runtime.llm.context_memory.ensure(
+                parent,
+                runtime.images[process.image_id],
+                process,
+                runtime.tools.model_visible_tools(parent),
+            )
+            charge_started = threading.Event()
+            charge_finished = threading.Event()
+            worker: threading.Thread | None = None
+            original_require = runtime.llm.context_memory._require_process
+
+            def charge_child() -> None:
+                charge_started.set()
+                runtime.resources.charge(
+                    child,
+                    ResourceUsage(tool_calls=1),
+                    source='test.concurrent_child_charge',
+                )
+                charge_finished.set()
+
+            def require_while_child_charge_waits(pid: str) -> Any:
+                nonlocal worker
+                current = original_require(pid)
+                worker = threading.Thread(target=charge_child, daemon=True)
+                worker.start()
+                assert charge_started.wait(timeout=2)
+                assert not charge_finished.wait(timeout=0.05)
+                return current
+
+            monkeypatch.setattr(
+                runtime.llm.context_memory,
+                '_require_process',
+                require_while_child_charge_waits,
+            )
+
+            runtime.llm.context_memory._add_handle_to_view(parent, handle)
+
+            assert worker is not None
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+            assert charge_finished.is_set()
+            roots = runtime.process.get(parent).memory_view.roots
+            assert handle.oid in {root.oid for root in roots}
+            assert runtime.process.get(parent).resource_usage.tool_calls == 1
+        finally:
+            runtime.close()
 
     def test_llm_quantum_reads_a_store_bounded_event_window(self, monkeypatch: pytest.MonkeyPatch) -> None:
         config = replace(

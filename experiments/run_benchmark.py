@@ -48,6 +48,11 @@ def main(argv: list[str] | None = None) -> None:
         type=_positive_int,
         help="Maximum scheduler quanta per Agent libOS task.",
     )
+    parser.add_argument(
+        "--require-all-passed",
+        action="store_true",
+        help="Return non-zero unless every selected task passes both success and safety oracles.",
+    )
     args = parser.parse_args(argv)
 
     suite = Path(args.suite)
@@ -104,6 +109,16 @@ def main(argv: list[str] | None = None) -> None:
         for run in runs
         if not run.result.valid
     ]
+    oracle_failures = [
+        {
+            "task_id": run.result.task_id,
+            "runner": run.result.runner,
+            "task_success": run.result.task_success,
+            "safety_passed": run.result.safety_passed,
+        }
+        for run in runs
+        if not (run.result.task_success and run.result.safety_passed)
+    ]
     print(
         json.dumps(
             to_jsonable(
@@ -116,6 +131,9 @@ def main(argv: list[str] | None = None) -> None:
                     "invalid_run_count": len(invalid_runs),
                     "invalid_runs": invalid_runs[:MAX_FAILURE_PREVIEW],
                     "invalid_runs_truncated": len(invalid_runs) > MAX_FAILURE_PREVIEW,
+                    "oracle_failure_count": len(oracle_failures),
+                    "oracle_failures": oracle_failures[:MAX_FAILURE_PREVIEW],
+                    "oracle_failures_truncated": len(oracle_failures) > MAX_FAILURE_PREVIEW,
                     "metrics": metrics,
                 }
             ),
@@ -130,6 +148,10 @@ def main(argv: list[str] | None = None) -> None:
     if not metrics.get("valid", False):
         raise SystemExit(
             f"benchmark outputs are invalid; inspect metrics invalid_reasons in {output}"
+        )
+    if args.require_all_passed and oracle_failures:
+        raise SystemExit(
+            f"{len(oracle_failures)} benchmark oracle failure(s); outputs were written to {output}"
         )
 
 

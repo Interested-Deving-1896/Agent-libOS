@@ -29,7 +29,13 @@ from agent_libos.models import (
     SinkTrustLevel,
     SinkTrustRule,
 )
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, NotFound, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    HumanApprovalRequired,
+    NotFound,
+    ProviderHostError,
+    ValidationError,
+)
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import HttpJsonRpcProvider, LocalResourceProviderSubstrate, ProviderEffectNotStarted
 from agent_libos.utils.serde import dumps
@@ -262,6 +268,71 @@ class TestJsonRpcPrimitive:
         finally:
             runtime.close()
 
+    @pytest.mark.parametrize('operation', ['register', 'unregister'])
+    def test_registry_reauthorizes_unlimited_authority_before_mutation(
+        self,
+        monkeypatch: MonkeyPatch,
+        operation: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(
+                image='base-agent:v0',
+                goal=f'JSON-RPC registry authority race {operation}',
+            )
+            endpoint_id = f'reauthorization-{operation}'
+            if operation == 'unregister':
+                runtime.jsonrpc.register_endpoint_from_yaml_text(
+                    _manifest(
+                        endpoint_id,
+                        'https://safe.example.test/jsonrpc',
+                        with_header=False,
+                    ),
+                    actor='test.host',
+                    require_capability=False,
+                )
+            authority = runtime.capability.grant(
+                actor,
+                runtime.jsonrpc.endpoint_resource(endpoint_id),
+                [
+                    CapabilityRight.WRITE
+                    if operation == 'register'
+                    else CapabilityRight.ADMIN
+                ],
+                issued_by='test.host',
+            )
+            original_require = runtime.capability.require
+
+            def revoke_after_outer_authorization(*args: Any, **kwargs: Any):
+                decision = original_require(*args, **kwargs)
+                runtime.capability.revoke(
+                    authority.cap_id,
+                    revoked_by='test.host',
+                    reason='JSON-RPC registry revocation race regression',
+                    require_authority=False,
+                )
+                return decision
+
+            monkeypatch.setattr(runtime.capability, 'require', revoke_after_outer_authorization)
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                if operation == 'register':
+                    runtime.jsonrpc.register_endpoint_from_yaml_text(
+                        _manifest(
+                            endpoint_id,
+                            'https://safe.example.test/jsonrpc',
+                            with_header=False,
+                        ),
+                        actor=actor,
+                    )
+                else:
+                    runtime.jsonrpc.unregister_endpoint(endpoint_id, actor=actor)
+
+            persisted = runtime.store.get_jsonrpc_endpoint(endpoint_id)
+            assert (persisted is None) is (operation == 'register')
+        finally:
+            runtime.close()
+
     def test_manifest_validation_rejects_unsafe_endpoint_shapes(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -405,8 +476,12 @@ class TestJsonRpcPrimitive:
                 issued_by='test',
             )
 
-            with pytest.raises(ProviderEffectNotStarted, match='before transport'):
+            with pytest.raises(ProviderHostError) as caught:
                 runtime.jsonrpc.call(pid, 'not-started', 'echo', {'x': 1})
+            assert 'jsonrpc failed before transport' not in str(caught.value)
+            assert caught.value.code == 'jsonrpc_provider_not_started'
+            assert caught.value.error_type == 'ProviderEffectNotStarted'
+            assert caught.value.correlation_id
 
             assert provider.calls == 1
             persisted = runtime.store.get_capability(cap.cap_id)
@@ -417,6 +492,81 @@ class TestJsonRpcPrimitive:
             assert effects[0].rollback_status == ExternalEffectRollbackStatus.UNKNOWN
             assert effects[0].information_flow
             assert effects[0].provider_metadata['phase'] == 'transport_not_started_after_dns'
+        finally:
+            runtime.close()
+
+    def test_malformed_transport_result_is_sanitized_before_field_access(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        secret = "JSONRPC_MALFORMED_RESULT_SECRET_SENTINEL"
+        runtime = Runtime.open("local")
+        runtime.jsonrpc.provider = _MalformedJsonRpcProvider(secret)
+        monkeypatch.setattr(
+            "agent_libos.primitives.jsonrpc.socket.getaddrinfo",
+            lambda *_args, **_kwargs: [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("93.184.216.34", 443),
+                )
+            ],
+        )
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="sanitize malformed JSON-RPC result",
+            )
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    "malformed-result",
+                    "https://safe.example.test/jsonrpc",
+                    with_header=False,
+                ),
+                actor="cli",
+                require_capability=False,
+            )
+            runtime.capability.grant(
+                pid,
+                "jsonrpc:malformed-result:echo",
+                [CapabilityRight.READ],
+                issued_by="test",
+            )
+
+            with pytest.raises(ProviderHostError) as caught:
+                runtime.jsonrpc.call(
+                    pid,
+                    "malformed-result",
+                    "echo",
+                    {"x": 1},
+                )
+
+            observed = dumps(
+                {
+                    "exception": caught.value.to_dict(),
+                    "exception_text": str(caught.value),
+                    "audit": runtime.audit.trace(),
+                    "events": runtime.events.list(),
+                    "effects": runtime.store.list_external_effects(pid=pid),
+                }
+            )
+            assert caught.value.code == "jsonrpc_provider_error"
+            assert caught.value.error_type == "RuntimeError"
+            assert caught.value.correlation_id
+            assert secret not in observed
+            process = runtime.process.get(pid)
+            assert (
+                process.resource_usage.jsonrpc_response_bytes
+                == runtime.config.jsonrpc.max_response_bytes
+            )
+            effect = runtime.store.list_external_effects(pid=pid)[0]
+            assert effect.transaction_state == "unknown"
+            assert (
+                effect.provider_metadata["phase"]
+                == "transport_not_started_after_dns"
+            )
         finally:
             runtime.close()
 
@@ -446,8 +596,10 @@ class TestJsonRpcPrimitive:
                 lambda _spec: (_ for _ in ()).throw(ProviderEffectNotStarted('resolution did not start')),
             )
 
-            with pytest.raises(ProviderEffectNotStarted, match='resolution did not start'):
+            with pytest.raises(ProviderHostError) as caught:
                 runtime.jsonrpc.call(pid, 'resolution-not-started', 'echo', {'x': 1})
+            assert 'resolution did not start' not in str(caught.value)
+            assert caught.value.code == 'jsonrpc_provider_not_started'
 
             persisted = runtime.store.get_capability(cap.cap_id)
             assert persisted is not None and persisted.uses_remaining == 1
@@ -465,6 +617,13 @@ class TestJsonRpcPrimitive:
                 raise AssertionError('endpoint manifest should stay hidden before capability gate')
 
             monkeypatch.setattr(runtime.store, 'get_jsonrpc_endpoint', fail_if_manifest_loaded)
+            monkeypatch.setattr(
+                runtime.store,
+                'get_jsonrpc_registry_binding',
+                lambda _endpoint_id: (_ for _ in ()).throw(
+                    AssertionError('registry binding should stay hidden without matching authority')
+                ),
+            )
 
             with pytest.raises(CapabilityDenied, match='JSON-RPC call authority'):
                 runtime.jsonrpc.call(pid, 'secret-endpoint', 'hidden-method', {'city': 'Beijing'})
@@ -802,6 +961,67 @@ class TestJsonRpcPrimitive:
             finally:
                 runtime.close()
 
+    def test_human_jsonrpc_approval_cannot_authorize_a_later_first_registration(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        provider = _RecordingJsonRpcProvider()
+        runtime.jsonrpc.provider = provider
+        try:
+            pid = runtime.process.spawn(image='base-agent:v0', goal='future jsonrpc approval')
+            resource = 'jsonrpc:future-approval:echo'
+            runtime.capability.set_permission_policy(
+                pid,
+                resource,
+                [CapabilityRight.READ],
+                runtime.capability.ASK_EACH_TIME,
+                issued_by='test',
+            )
+
+            with pytest.raises(HumanApprovalRequired):
+                runtime.jsonrpc.call(pid, 'future-approval', 'echo', {'x': 1})
+            first = runtime.human.pending()[0]
+            first_context = first.payload['context']
+            first_conditions = first.payload['requested_once_capability']['constraints'][
+                AUTHORITY_RULES_KEY
+            ][0]['conditions']
+            assert len(first_context['registry_spec_sha256']) == 64
+            assert first_conditions['registry_spec_sha256'] == first_context['registry_spec_sha256']
+            assert first_conditions['registry_generation'] == first_context['registry_generation']
+            runtime.human.drain_terminal_queue(auto_approve=True)
+
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    'future-approval',
+                    'https://safe.example.test/jsonrpc',
+                    with_header=False,
+                    rpc_method='dangerous.mutate',
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+
+            with pytest.raises(HumanApprovalRequired):
+                runtime.jsonrpc.call(pid, 'future-approval', 'echo', {'x': 1})
+            second = runtime.human.pending()[0]
+            second_context = second.payload['context']
+            assert second_context['registry_generation'] > first_context['registry_generation']
+            assert second_context['registry_spec_sha256'] != first_context['registry_spec_sha256']
+            assert provider.calls == []
+
+            runtime.human.drain_terminal_queue(auto_approve=True)
+            monkeypatch.setattr(
+                runtime.jsonrpc,
+                '_validate_runtime_resolution',
+                lambda _spec: ('93.184.216.34',),
+            )
+            result = runtime.jsonrpc.call(pid, 'future-approval', 'echo', {'x': 1})
+            assert result.ok
+            assert len(provider.calls) == 1
+        finally:
+            runtime.close()
+
     def test_effectful_provider_without_classifier_fails_closed(self) -> None:
         runtime = Runtime.open('local')
         try:
@@ -1076,6 +1296,51 @@ class _RecordingJsonRpcProvider:
             state_mutation=False,
             information_flow=True,
             metadata={'operation': operation, 'endpoint_id': context.get('endpoint_id'), 'status': result.get('status') if isinstance(result, dict) else None},
+        )
+
+
+class _ExplodingJsonRpcTransportResult(JsonRpcTransportResult):
+    def __init__(self, *, explode_field: str, secret: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        object.__setattr__(self, "_explode_field", explode_field)
+        object.__setattr__(self, "_secret", secret)
+
+    def __getattribute__(self, name: str) -> Any:
+        if name not in {"_explode_field", "_secret"}:
+            explode_field = object.__getattribute__(self, "_explode_field")
+            if name == explode_field:
+                raise RuntimeError(object.__getattribute__(self, "_secret"))
+        return object.__getattribute__(self, name)
+
+
+class _MalformedJsonRpcProvider(_RecordingJsonRpcProvider):
+    def __init__(self, secret: str) -> None:
+        super().__init__()
+        self.secret = secret
+
+    def call(
+        self,
+        _endpoint: Any,
+        _method: Any,
+        request_body: bytes,
+        **_kwargs: Any,
+    ) -> JsonRpcTransportResult:
+        self.calls.append(request_body)
+        payload = json.loads(request_body.decode("utf-8"))
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": payload.get("id"),
+                "result": {"ok": True},
+            }
+        ).encode("utf-8")
+        return _ExplodingJsonRpcTransportResult(
+            explode_field="error",
+            secret=self.secret,
+            status_code=200,
+            body=body,
+            elapsed_s=0.01,
+            response_bytes=len(body),
         )
 
 

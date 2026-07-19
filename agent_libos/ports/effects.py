@@ -3,7 +3,11 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Any, Protocol
 
-from agent_libos.models import ExternalEffectRecord
+from agent_libos.models import (
+    ExternalEffectPage,
+    ExternalEffectRecord,
+    ExternalEffectRecoveryQuery,
+)
 
 
 class ProtectedEffectPort(Protocol):
@@ -23,6 +27,19 @@ class ProtectedEffectPort(Protocol):
         ...
 
     def list_external_effects(self, **filters: Any) -> list[ExternalEffectRecord]:
+        ...
+
+    def query_external_effect_recovery(
+        self,
+        query: ExternalEffectRecoveryQuery,
+    ) -> ExternalEffectPage:
+        ...
+
+    def get_external_effect_by_idempotency(
+        self,
+        pid: str,
+        idempotency_key: str,
+    ) -> ExternalEffectRecord | None:
         ...
 
     def finalize_external_effect(self, *args: Any, **kwargs: Any) -> Any:

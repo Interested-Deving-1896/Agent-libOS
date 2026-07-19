@@ -61,7 +61,7 @@ same change.
 
 | Group | Fields |
 | --- | --- |
-| `runtime` | `local_store_target`, `runtime_db_filename`, `store_backend`, `store_dsn`, `workspace_namespace`, `default_image_id`, `coding_image_id`, `default_human`, `terminal_channel`, `run_until_idle_max_quanta`, `launcher_max_quanta`, `launch_authority_mode` |
+| `runtime` | `local_store_target`, `runtime_db_filename`, `store_backend`, `store_dsn`, `workspace_namespace`, `default_image_id`, `coding_image_id`, `default_human`, `terminal_channel`, `run_until_idle_max_quanta`, `launcher_max_quanta`, `launch_authority_mode`, `publication_recovery_max_attempts`, `publication_reconciliation_page_size`, `publication_reconciliation_page_hard_limit`, `publication_artifact_lookup_hard_limit`, `resource_usage_reservation_recovery_page_size`, `resource_usage_reservation_recovery_page_hard_limit`, `capability_use_reservation_recovery_page_size`, `capability_use_reservation_recovery_page_hard_limit`, `object_payload_recovery_page_size`, `object_payload_recovery_page_hard_limit`, `object_task_recovery_page_size`, `object_task_recovery_page_hard_limit`, `jit_rehydration_page_size`, `jit_rehydration_page_hard_limit`, `external_effect_recovery_page_size`, `external_effect_recovery_page_hard_limit`, `operation_recovery_page_size`, `operation_recovery_page_hard_limit`, `payload_retention_enabled`, `payload_retention_summary_after_seconds`, `payload_retention_hash_only_after_seconds`, `payload_retention_page_size`, `payload_retention_page_hard_limit` |
 | `gui` | `event_buffer_limit`, `request_body_max_bytes`, `scheduler_shutdown_join_timeout_s`, `http_shutdown_delay_s`, `object_task_wait_default_timeout_s`, `object_task_wait_max_timeout_s`, `snapshot_event_limit`, `snapshot_audit_limit`, `snapshot_llm_call_limit`, `snapshot_process_message_limit`, `snapshot_process_llm_call_limit`, `snapshot_object_task_limit`, `snapshot_collection_max_items`, `snapshot_string_max_chars`, `sse_payload_max_bytes`, `agent_rating_comment_max_chars` |
 | `capability` | `default_delegation_depth`, `max_rights_per_capability`, `max_constraints_bytes`, `list_limit`, `decision_explain_preview_chars` |
 | `data_flow` | `default_trust_level`, `default_max_sensitivity`, `sink_rules`, `registry_resource`, `registry_list_limit`, `decision_list_limit`, `file_binding_list_limit` |
@@ -111,6 +111,60 @@ configurable. A runtime release emits only the snapshot version it can decode.
   `llm.store` and `llm.responses_previous_response_id`.
 - `runtime.launch_authority_mode: manifest_required` treats image capability
   requirements as declarations, not grants; this value is fixed in 0.3.
+- `runtime.publication_recovery_max_attempts` bounds durable compensation
+  retries. Exceeding it persists a `manual` publication disposition and fails
+  every startup closed instead of silently repeating an uncertain cleanup
+  forever. Under the exclusive runtime-store lease, startup may take over a
+  claim left by a prior runtime instance; takeover consumes a fresh attempt and
+  uses a new recovery lease.
+- Runtime-publication startup recovery and launch/exec terminal-operation
+  reconciliation use exact kind/state/marker keyset pages sized by
+  `runtime.publication_reconciliation_page_size`. The configured hard limit is
+  enforced by the repository; online terminalization marks completed rows in
+  the same transaction so reopen does not rescan settled history.
+- Exact publication-compensation artifact lookups reject receipt identity sets
+  above `runtime.publication_artifact_lookup_hard_limit`. Tool existence reads
+  are primary-key batched, and process tool escape checks use the normalized
+  `process_tool_bindings` reverse index rather than scanning process JSON.
+- Startup JIT rehydration keyset-pages only normalized durable ephemeral
+  bindings by `(pid, tool_name)`, with every SQL page bounded by
+  `runtime.jit_rehydration_page_size`. Tool and process mutations maintain an
+  exact indexed eligibility bit in the binding projection in the same
+  transaction. The partial covering index therefore makes database work
+  proportional to eligible JIT bindings even when callable history is sparse.
+  Each page performs one batched exact tool/candidate lookup rather than one
+  lookup per process, and it never decodes unrelated process control state or
+  materializes a process's complete binding set.
+  The opaque startup recovery lease is required before the first durable read.
+  Exact restored/pruned totals are returned with at most one page of samples;
+  historical scans and diagnostic buffers are bounded, while the final loaded
+  registry remains proportional to the number of active JIT tools.
+- External-effect startup reconciliation is keyset-paged by
+  `runtime.external_effect_recovery_page_size` and rejects any page above the
+  configured hard limit. Active provider-usage reservations are independently
+  scanned through indexed keyset pages sized by
+  `runtime.resource_usage_reservation_recovery_page_size`. Recovery requires
+  the opaque startup lease before its first read, atomically couples each
+  settlement to its actual usage charge, and returns an exact count plus at
+  most one page of sample IDs. Accordingly,
+  `Runtime.recovered_resource_usage_reservations` is now a
+  `ResourceUsageReservationRecoverySummary`, not an unbounded `list[str]`.
+  Capability-use reservations are recovered only after prepared protected
+  effects have restored their linked reservations. Remaining stale rows are
+  abandoned through the status-first keyset index using
+  `runtime.capability_use_reservation_recovery_page_size`; recovery requires
+  the same opaque startup lease and exposes only an exact count plus one
+  bounded sample page.
+  Stale-running operation recovery is independently
+  keyset-paged by `runtime.operation_recovery_page_size`. One store-locked,
+  connection-local temporary index materializes the running ancestors of
+  indexed pending/unknown effects; each page then performs only a bounded
+  primary-key membership read. Recovery processes the full backlog but exposes
+  only a page-bounded ID sample plus the exact total count. Payload retention is separately opt-in through
+  `runtime.payload_retention_enabled`; startup never runs it implicitly. The
+  summary/hash ages and page limits are validated together, and every applied
+  maintenance page is lifecycle-gated, CAS-protected, and audited in the same
+  transaction. See [Evidence and LLM Payload Retention](evidence_payload_retention.md).
 - `data_flow.default_trust_level` is fixed to `untrusted`, and
   `default_max_sensitivity` cannot exceed `normal`. Higher clearance is valid
   only in a Host-owned `sink_rules` record. Rules accept exact or terminal-`*`

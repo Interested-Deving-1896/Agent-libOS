@@ -167,19 +167,21 @@ filesystem authority for each package file it snapshots.
 ## Activation And Unload
 
 Process-mediated catalog reads, registration, trust changes, activation, and
-unload reserve any finite-use Skill/process-admin grants before their durable
-operation. A failure before that operation commits restores the exact
-reservation token; an explicit revoke still wins over late cleanup. Registry,
-trust, event, and audit writes that describe one operation share its store
-transaction.
+unload reauthorize their complete allow/deny decisions after entering the
+operation's `AuthorityTransaction`, then reserve any finite-use
+Skill/process-admin grants before the durable mutation. Business rows,
+event/audit evidence, and finite-use settlement share that transaction. A
+failure before commit therefore restores the exact reservation token; an
+explicit revoke still wins over late cleanup.
 
 `activate_skill` is atomic across the process tool table, loaded Skill metadata,
 process-local JIT rows, executable handles, and name aliases. The runtime
 validates the package, existing tool references, duplicate tool/JIT names,
 TypeScript source limits, Deno static checks and tests through ToolBroker, and
 static tool shadowing before publishing the new activation. A failed activation
-discards its unpublished candidates and aliases. Reactivation retires only the
-superseded JIT ids after the replacement commits.
+discards its unpublished candidates and executable aliases, including when
+authority settlement fails. Reactivation retires only the superseded JIT ids
+after the replacement and its authority settlement commit.
 
 `unload_skill` removes tool visibility and prompt instructions contributed by
 that Skill, along with the loaded Skill's process-local JIT tool and candidate

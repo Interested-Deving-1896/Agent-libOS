@@ -14,6 +14,11 @@ from pydantic import ValidationError as PydanticValidationError
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, load_config_file, load_config_from_project_root
+from agent_libos.evidence import (
+    PayloadRetentionCursor,
+    PayloadRetentionKind,
+    PayloadRetentionRequest,
+)
 from agent_libos.models.exceptions import HumanApprovalRequired, LibOSError, NotFound
 from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.models import (
@@ -32,6 +37,7 @@ from agent_libos.models import (
     ProcessStatus,
     ToolCallResult,
     ViewMode,
+    process_state_to_mapping,
 )
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import display_store_target
@@ -42,6 +48,16 @@ _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 DEMO_PATCH_PREVIEW_PATH = "agent_outputs/demo_patch_preview.txt"
 DEMO_PATCH_PREVIEW_CONTENT = "change add() expected value\n"
 _TERMINAL_PROCESS_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
+_COMPACT_COMMANDS = frozenset(
+    {
+        "audit",
+        "llm-calls",
+        "payload-retention",
+        "processes",
+        "resources",
+        "tools",
+    }
+)
 
 
 def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParser) -> AgentLibOSConfig:
@@ -52,6 +68,92 @@ def _load_runtime_config(config_path: str | None, parser: argparse.ArgumentParse
     except (OSError, ValueError, PydanticValidationError) as exc:
         parser.error(str(exc))
     raise AssertionError("argparse parser.error should exit")
+
+
+def _run_payload_retention_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+) -> Any:
+    cursor_values = (args.after_created_at, args.after_record_id)
+    if (cursor_values[0] is None) != (cursor_values[1] is None):
+        raise LibOSValidationError(
+            "payload retention cursor requires both --after-created-at and "
+            "--after-record-id"
+        )
+    try:
+        cursor = (
+            PayloadRetentionCursor(*cursor_values)
+            if cursor_values[0] is not None and cursor_values[1] is not None
+            else None
+        )
+        return runtime.payload_retention.run(
+            PayloadRetentionRequest(
+                kind=PayloadRetentionKind(args.kind),
+                dry_run=not args.apply,
+                cursor=cursor,
+                limit=args.limit,
+                actor=args.actor,
+                correlation_id=args.correlation_id,
+            )
+        )
+    except ValueError as exc:
+        raise LibOSValidationError(str(exc)) from exc
+
+
+def _process_to_mapping(process: Any) -> dict[str, Any]:
+    """Serialize an AgentProcess without dropping its tagged state fields."""
+
+    return {
+        **to_jsonable(process),
+        **process_state_to_mapping(
+            process.status.value,
+            process.wait_state,
+            process.outcome,
+            process.state_generation,
+        ),
+    }
+
+
+def _add_payload_retention_parser_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "kind",
+        choices=[item.value for item in PayloadRetentionKind],
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply the page; the default is a non-mutating dry run.",
+    )
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--after-created-at")
+    parser.add_argument("--after-record-id")
+    parser.add_argument("--actor", default="host.retention")
+    parser.add_argument("--correlation-id")
+
+
+def _run_compact_command(
+    runtime: Runtime,
+    args: argparse.Namespace,
+) -> Any:
+    if args.command == "audit":
+        return [record.__dict__ for record in runtime.audit.trace()]
+    if args.command == "llm-calls":
+        return [
+            record.__dict__
+            for record in runtime.store.list_llm_calls(
+                pid=args.pid,
+                limit=args.limit,
+            )
+        ]
+    if args.command == "payload-retention":
+        return _run_payload_retention_command(runtime, args)
+    if args.command == "processes":
+        return [_process_to_mapping(process) for process in runtime.process.list()]
+    if args.command == "resources":
+        return _resource_summary(runtime, args.pid)
+    if args.command == "tools":
+        return runtime.tools.list()
+    raise AssertionError(f"unsupported compact command: {args.command}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -101,6 +203,11 @@ def main(argv: list[str] | None = None) -> None:
     llm_calls_parser = sub.add_parser("llm-calls", help="Print persisted LLM call records")
     llm_calls_parser.add_argument("--pid", help="Filter by process id.")
     llm_calls_parser.add_argument("--limit", type=int, help="Maximum number of records to print.")
+    retention_parser = sub.add_parser(
+        "payload-retention",
+        help="Preview or apply one bounded LLM/effect payload-retention page",
+    )
+    _add_payload_retention_parser_args(retention_parser)
     sub.add_parser("processes", help="Print process table")
     resources_parser = sub.add_parser("resources", help="Print process resource budget and usage")
     resources_parser.add_argument("pid")
@@ -212,12 +319,12 @@ def main(argv: list[str] | None = None) -> None:
         trusted_module_sha256=args.trusted_module_sha256,
     )
     try:
-        if args.command == "init":
+        if args.command in _COMPACT_COMMANDS:
+            _print_json(to_jsonable(_run_compact_command(runtime, args)))
+        elif args.command == "init":
             print(f"initialized {selected_db_display}")
         elif args.command == "demo":
             print(json.dumps(run_demo(runtime), indent=2, ensure_ascii=False))
-        elif args.command == "audit":
-            _print_json([record.__dict__ for record in runtime.audit.trace()])
         elif args.command == "explain":
             try:
                 result = _run_explain_command(runtime, args)
@@ -232,14 +339,6 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(result)
             if result.get("ambiguous"):
                 raise SystemExit(2)
-        elif args.command == "llm-calls":
-            _print_json([record.__dict__ for record in runtime.store.list_llm_calls(pid=args.pid, limit=args.limit)])
-        elif args.command == "processes":
-            _print_json([process.__dict__ for process in runtime.process.list()])
-        elif args.command == "resources":
-            _print_json(_resource_summary(runtime, args.pid))
-        elif args.command == "tools":
-            _print_json(runtime.tools.list())
         elif args.command == "workflow":
             result = _run_workflow_command(runtime, args)
             _print_json(to_jsonable(result))
@@ -323,8 +422,13 @@ def _resource_summary(runtime: Runtime, pid: str) -> dict[str, Any]:
     process = runtime.process.get(pid)
     return {
         "pid": pid,
-        "status": process.status.value,
         "status_message": process.status_message,
+        **process_state_to_mapping(
+            process.status.value,
+            process.wait_state,
+            process.outcome,
+            process.state_generation,
+        ),
         "budget": to_jsonable(process.resource_budget),
         "usage": to_jsonable(process.resource_usage),
         "remaining": to_jsonable(runtime.resources.remaining_budget(pid)),
@@ -668,13 +772,23 @@ def _run_exit_command(runtime: Runtime, args: argparse.Namespace) -> dict[str, A
             payload=_parse_json_value(args.payload),
             metadata=ObjectMetadata(title="CLI process final result", tags=["final", "cli"]),
         )
-    runtime.process.exit(args.pid, result=result_handle, failed=args.failed, message=args.message)
+    result_handle = runtime.process.exit(
+        args.pid,
+        result=result_handle,
+        failed=args.failed,
+        message=args.message,
+    )
     process = runtime.process.get(args.pid)
     return {
         "pid": process.pid,
-        "status": process.status.value,
         "message": args.message,
         "result_oid": result_handle.oid if result_handle is not None else None,
+        **process_state_to_mapping(
+            process.status.value,
+            process.wait_state,
+            process.outcome,
+            process.state_generation,
+        ),
     }
 
 
@@ -1758,7 +1872,12 @@ def _process_cli_summary(process: Any) -> dict[str, Any]:
     return {
         "pid": process.pid,
         "image": process.image_id,
-        "status": process.status.value,
+        **process_state_to_mapping(
+            process.status.value,
+            process.wait_state,
+            process.outcome,
+            process.state_generation,
+        ),
         "goal_oid": process.goal_oid,
         "working_directory": process.working_directory,
         "active_tools": sorted(process.tool_table),

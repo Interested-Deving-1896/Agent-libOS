@@ -99,6 +99,16 @@ limit, missing classifier, or sink failure after dispatch is ambiguous:
 - provider reconciliation may query an existing receipt after restart;
 - startup never automatically replays an unknown effect.
 
+Host provider exceptions cross the public boundary through one
+`PublicErrorEnvelope`: a stable Host-selected `code`, Host exception-class
+`error_type`, and Host-generated `correlation_id`. Provider-authored exception
+messages are never copied into MCP/JSON-RPC results, static Tool failures, Deno
+syscall frames, ToolExecution events/audit, or durable Tool result objects.
+Static Tools retain their generic Tool error category for compatibility and put
+the complete provider envelope in structured error details; uncaught Deno
+syscall failures are reconstructed as the same envelope before ToolExecution
+persists them.
+
 Checkpoint restore and image commit report provider-classified effects but do
 not compensate or roll back provider state. Audit/effect rows are append-only
 evidence only within the RuntimeStore trust boundary: an operator with direct

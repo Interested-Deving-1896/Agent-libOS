@@ -12,6 +12,8 @@ from agent_libos.models import (
     PROMPT_MODE_LIBOS_DEFAULT,
     PROMPT_MODE_MINIMAL_RUNTIME,
     PROMPT_MODES,
+    process_outcome_to_mapping,
+    process_wait_state_to_mapping,
 )
 from agent_libos.utils.serde import loads
 
@@ -162,6 +164,9 @@ def _process_fact_section(process: AgentProcess) -> str:
         f"- working_directory: {process.working_directory}\n"
         f"- goal_oid: {process.goal_oid}\n"
         f"- checkpoint_head: {process.checkpoint_head}\n"
+        f"- wait_state: {process_wait_state_to_mapping(process.wait_state)}\n"
+        f"- outcome: {process_outcome_to_mapping(process.outcome)}\n"
+        f"- state_generation: {process.state_generation}\n"
         f"- status_message: {process.status_message}"
     )
 
@@ -178,6 +183,9 @@ def _process_section(process: AgentProcess) -> str:
         f"- loaded_skills: {process.loaded_skills}\n"
         f"- tool_table: {process.model_tool_table}\n"
         f"- checkpoint_head: {process.checkpoint_head}\n"
+        f"- wait_state: {process_wait_state_to_mapping(process.wait_state)}\n"
+        f"- outcome: {process_outcome_to_mapping(process.outcome)}\n"
+        f"- state_generation: {process.state_generation}\n"
         f"- status_message: {process.status_message}"
     )
 

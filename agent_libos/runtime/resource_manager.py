@@ -1,14 +1,37 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from dataclasses import fields
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import nullcontext
+from dataclasses import dataclass, fields
 from typing import Any
 
-from agent_libos.models import AgentProcess, EventPriority, EventType, ProcessStatus, ResourceBudget, ResourceReservation, ResourceUsage
+from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
+from agent_libos.models import (
+    AgentProcess,
+    ChildProcessWait,
+    EventPriority,
+    EventType,
+    KilledProcessOutcome,
+    ProcessExecutionToken,
+    ProcessStatus,
+    ResourceBudget,
+    ResourceReservation,
+    ResourceUsage,
+    ResourceUsageReservation,
+    ResourceUsageReservationCursor,
+    ResourceUsageReservationRecoverySummary,
+    ResourceUsageReservationStatus,
+)
 from agent_libos.models.exceptions import NotFound, ResourceLimitExceeded, ValidationError
+from agent_libos.process_execution import (
+    current_process_execution_token,
+    trusted_process_execution_takeover,
+    trusted_terminal_process_mutation,
+)
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
-from agent_libos.storage import RuntimeStore
+from agent_libos.process_transition import ProcessTransitionService
+from agent_libos.storage import RuntimeStore, UnitOfWork
 from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import to_jsonable
 
@@ -41,6 +64,15 @@ _BUDGET_USAGE_MAP: dict[str, tuple[str, ...]] = {
 _NON_RESERVABLE_BUDGET_FIELDS = {"max_subprocess_memory_bytes", "max_child_processes"}
 
 
+@dataclass(frozen=True, slots=True)
+class _ResourceLimitFinalization:
+    """Terminal hooks that are safe only after their durable kill commits."""
+
+    pid: str
+    killed_pids: tuple[str, ...]
+    reason: str
+
+
 class ResourceManager:
     """Hierarchical process resource accounting.
 
@@ -50,10 +82,31 @@ class ResourceManager:
     can bound the total consumption of all descendants.
     """
 
-    def __init__(self, store: RuntimeStore, audit: AuditManager, events: EventBus) -> None:
-        self.store = store
+    def __init__(
+        self,
+        unit_of_work: UnitOfWork | RuntimeStore,
+        audit: AuditManager,
+        events: EventBus,
+        *,
+        require_recovery_lease: Callable[[], None],
+        transitions: ProcessTransitionService | None = None,
+        config: AgentLibOSConfig | None = None,
+    ) -> None:
+        # Keep direct-store construction working for embedders while all
+        # runtime composition goes through one explicit UnitOfWork boundary.
+        self.unit_of_work = (
+            unit_of_work
+            if isinstance(unit_of_work, UnitOfWork)
+            else UnitOfWork(unit_of_work)
+        )
+        self.store = self.unit_of_work.processes
+        self.resource_repository = self.unit_of_work.resources
+        self.effects = self.unit_of_work.evidence
         self.audit = audit
         self.events = events
+        self.config = config or DEFAULT_CONFIG
+        self._require_recovery_lease = require_recovery_lease
+        self._transitions = transitions or ProcessTransitionService(self.store)
         self._process_kill_finalizer: Callable[..., None] | None = None
         self._object_task_terminal_notifier: Callable[[str], None] | None = None
 
@@ -74,7 +127,7 @@ class ResourceManager:
         usage = self._coerce_usage(request)
         if self._is_zero(usage):
             return
-        with self.store.locked():
+        with self.unit_of_work.locked():
             self._preflight_locked(pid, usage, source=source, context=context)
 
     def reserve_usage(
@@ -94,9 +147,9 @@ class ResourceManager:
             raise ValidationError("resource usage reservation must be non-zero")
         selected_id = reservation_id or new_id("usage_reservation")
         now = utc_now()
-        with self.store.transaction():
+        with self.unit_of_work.transaction():
             self._preflight_locked(pid, selected, source=source, context=context)
-            self.store.insert_resource_usage_reservation(
+            self.resource_repository.insert_resource_usage_reservation(
                 reservation_id=selected_id,
                 pid=pid,
                 usage=selected,
@@ -118,16 +171,39 @@ class ResourceManager:
     ) -> ResourceUsage:
         """Settle exactly once; unknown provider outcomes charge the full envelope."""
 
+        return self._settle_usage_reservation(
+            reservation_id,
+            actual_usage=actual_usage,
+            charge_maximum=charge_maximum,
+            release=release,
+            source=source,
+            context=context,
+            recovery=False,
+        )
+
+    def _settle_usage_reservation(
+        self,
+        reservation_id: str,
+        *,
+        actual_usage: ResourceUsage | dict[str, Any] | None = None,
+        charge_maximum: bool = False,
+        release: bool = False,
+        source: str,
+        context: dict[str, Any] | None = None,
+        recovery: bool,
+    ) -> ResourceUsage:
         if charge_maximum and release:
             raise ValidationError("resource reservation cannot both release and charge maximum")
-        with self.store.transaction():
-            reservation = self.store.get_resource_usage_reservation(reservation_id)
+        post_commit_finalizations: list[_ResourceLimitFinalization] = []
+        with self.unit_of_work.transaction():
+            reservation = self.resource_repository.get_resource_usage_reservation(
+                reservation_id
+            )
             if reservation is None:
                 raise ValidationError(f"resource usage reservation not found: {reservation_id}")
-            if reservation["status"] != "active":
-                settled = reservation.get("settled_usage")
-                return settled if isinstance(settled, ResourceUsage) else ResourceUsage()
-            maximum = reservation["usage"]
+            if reservation.status.value != "active":
+                return reservation.settled_usage or ResourceUsage()
+            maximum = reservation.usage
             if release:
                 selected = ResourceUsage()
                 status = "released"
@@ -138,7 +214,7 @@ class ResourceManager:
                 selected = self._coerce_usage(actual_usage or ResourceUsage())
                 self._assert_usage_within_reservation(selected, maximum)
                 status = "settled"
-            if not self.store.settle_resource_usage_reservation(
+            if not self.resource_repository.settle_resource_usage_reservation(
                 reservation_id,
                 status=status,
                 settled_usage=selected,
@@ -148,33 +224,123 @@ class ResourceManager:
                     f"resource usage reservation changed concurrently: {reservation_id}"
                 )
             if not self._is_zero(selected):
-                self.charge(
-                    reservation["pid"],
-                    selected,
-                    source=source,
-                    context={**(context or {}), "reservation_id": reservation_id, "settlement": status},
-                )
-            return selected
+                if recovery:
+                    try:
+                        self._charge(
+                            reservation.pid,
+                            selected,
+                            source=source,
+                            context={
+                                **(context or {}),
+                                "reservation_id": reservation_id,
+                                "settlement": status,
+                            },
+                            allow_overage=True,
+                            kill_on_exceed=True,
+                            include_active_reservations=False,
+                            deferred_resource_limit_finalizations=post_commit_finalizations,
+                        )
+                    except ResourceLimitExceeded:
+                        # Recovery charges an ambiguous provider effect even if
+                        # that pushes the durable usage over budget.  The
+                        # charge and resource-limit termination are already in
+                        # this outer transaction; continue draining the backlog.
+                        pass
+                else:
+                    self._charge(
+                        reservation.pid,
+                        selected,
+                        source=source,
+                        context={
+                            **(context or {}),
+                            "reservation_id": reservation_id,
+                            "settlement": status,
+                        },
+                        allow_overage=False,
+                        kill_on_exceed=True,
+                        include_active_reservations=True,
+                        deferred_resource_limit_finalizations=post_commit_finalizations,
+                    )
+        self._run_resource_limit_finalizations(post_commit_finalizations)
+        return selected
 
-    def recover_usage_reservations(self) -> list[str]:
+    def recover_usage_reservations(
+        self,
+    ) -> ResourceUsageReservationRecoverySummary:
         """Release certified pre-dispatch rows and charge ambiguous rows maximally."""
 
-        recovered: list[str] = []
-        for reservation in self.store.list_resource_usage_reservations(status="active"):
-            effect = self.store.get_external_effect(reservation["reserved_by"])
+        self._require_recovery_lease()
+        page_size = (
+            self.config.runtime.resource_usage_reservation_recovery_page_size
+        )
+        sample: list[str] = []
+        total_count = 0
+        for reservation in self._iter_active_usage_reservations():
+            effect = self.effects.get_external_effect(reservation.reserved_by)
             release = effect is None or effect.transaction_state == "prepared"
-            self.settle_usage_reservation(
-                reservation["reservation_id"],
+            self._settle_usage_reservation(
+                reservation.reservation_id,
                 release=release,
                 charge_maximum=not release,
                 source="resource.recovery",
                 context={
-                    "effect_id": reservation["reserved_by"],
-                    "outcome": "not_started" if release else "unknown_after_dispatch",
+                    "effect_id": reservation.reserved_by,
+                    "outcome": (
+                        "not_started" if release else "unknown_after_dispatch"
+                    ),
                 },
+                recovery=True,
             )
-            recovered.append(reservation["reservation_id"])
-        return recovered
+            total_count += 1
+            if len(sample) < page_size:
+                sample.append(reservation.reservation_id)
+        return ResourceUsageReservationRecoverySummary(
+            total_count=total_count,
+            sample_reservation_ids=tuple(sample),
+        )
+
+    def _iter_active_usage_reservations(
+        self,
+    ) -> Iterator[ResourceUsageReservation]:
+        page_size = (
+            self.config.runtime.resource_usage_reservation_recovery_page_size
+        )
+        after: ResourceUsageReservationCursor | None = None
+        while True:
+            page = self.resource_repository.query_resource_usage_reservation_recovery(
+                after=after,
+                limit=page_size,
+            )
+            if len(page.records) > page_size:
+                raise ValidationError(
+                    "resource usage reservation recovery repository exceeded the page limit"
+                )
+            previous = after
+            for reservation in page.records:
+                cursor = ResourceUsageReservationCursor(
+                    reservation.created_at,
+                    reservation.reservation_id,
+                )
+                if (
+                    reservation.status is not ResourceUsageReservationStatus.ACTIVE
+                    or (previous is not None and cursor <= previous)
+                ):
+                    raise ValidationError(
+                        "resource usage reservation recovery repository returned "
+                        "an invalid page"
+                    )
+                previous = cursor
+            if page.next_cursor is not None and (
+                previous is None or page.next_cursor != previous
+            ):
+                raise ValidationError(
+                    "resource usage reservation recovery repository returned "
+                    "an invalid next cursor"
+                )
+            yield from page.records
+            if page.next_cursor is None:
+                break
+            after = page.next_cursor
 
     def charge(
         self,
@@ -186,6 +352,28 @@ class ResourceManager:
         allow_overage: bool = False,
         kill_on_exceed: bool = True,
     ) -> None:
+        self._charge(
+            pid,
+            usage,
+            source=source,
+            context=context,
+            allow_overage=allow_overage,
+            kill_on_exceed=kill_on_exceed,
+            include_active_reservations=True,
+        )
+
+    def _charge(
+        self,
+        pid: str,
+        usage: ResourceUsage | dict[str, Any],
+        *,
+        source: str,
+        context: dict[str, Any] | None,
+        allow_overage: bool,
+        kill_on_exceed: bool,
+        include_active_reservations: bool,
+        deferred_resource_limit_finalizations: list[_ResourceLimitFinalization] | None = None,
+    ) -> None:
         delta = self._coerce_usage(usage)
         if self._is_zero(delta):
             return
@@ -193,7 +381,7 @@ class ResourceManager:
         # A hierarchical charge is one accounting mutation.  In particular,
         # never leave the child charged when an ancestor update, reservation
         # consume, event, or audit write fails part-way through the chain.
-        with self.store.transaction():
+        with self.unit_of_work.transaction():
             chain = self._process_chain(pid)
             relevant_fields = self._nonzero_fields(delta)
             if not allow_overage:
@@ -202,19 +390,43 @@ class ResourceManager:
                 latest = self._get(process.pid)
                 latest.resource_usage = self._merge_usage(latest.resource_usage, delta)
                 latest.updated_at = utc_now()
-                latest = self.store.patch_process(
-                    latest.pid,
-                    {
-                        "resource_usage": latest.resource_usage,
-                        "updated_at": latest.updated_at,
-                    },
-                    expected_revision=latest.revision,
+                patch = {
+                    "resource_usage": latest.resource_usage,
+                    "updated_at": latest.updated_at,
+                }
+                terminal_scope = (
+                    trusted_terminal_process_mutation(
+                        latest.pid,
+                        expected_revision=latest.revision,
+                        expected_generation=latest.execution_generation,
+                        allowed_statuses={latest.status},
+                        execution_token=current_process_execution_token(),
+                        reason="resource accounting appends usage to a terminal process",
+                    )
+                    if latest.status in _TERMINAL_STATUSES
+                    else nullcontext()
                 )
+                with terminal_scope:
+                    if index == 0:
+                        latest = self.store.patch_process(
+                            latest.pid,
+                            patch,
+                            expected_revision=latest.revision,
+                        )
+                    else:
+                        latest = self.store.patch_process_control(
+                            latest.pid,
+                            patch,
+                            expected_revision=latest.revision,
+                            allowed_statuses={latest.status},
+                            reason="hierarchical resource charge updates an ancestor",
+                        )
                 if index > 0:
                     self._consume_reservation_locked(latest.pid, chain[index - 1].pid, delta, relevant_fields)
                 exceeded = self._first_exceeded_effective(
                     latest,
                     relevant_fields=relevant_fields,
+                    include_active_reservations=include_active_reservations,
                 )
                 if exceeded is not None and exceeded_after_charge is None:
                     exceeded_after_charge = (latest, exceeded)
@@ -239,10 +451,20 @@ class ResourceManager:
             return
         owner, exceeded = exceeded_after_charge
         message = self._limit_message(owner.pid, exceeded)
-        # Terminal hooks acquire Human/Object Memory locks.  Invoke the kill
-        # path only after releasing the accounting transaction's store lock.
+        # The durable kill may join a caller's outer transaction.  Its terminal
+        # hooks acquire Human/Object Memory locks, so either run them after this
+        # direct charge committed or return a receipt to the outer committer.
         if kill_on_exceed:
-            self.kill_if_exceeded(owner.pid, reason=message, owner_pid=owner.pid, limit=exceeded)
+            finalization = self._persist_resource_limit_kill(
+                owner.pid,
+                reason=message,
+                owner_pid=owner.pid,
+                limit=exceeded,
+            )
+            if deferred_resource_limit_finalizations is None:
+                self._finalize_resource_limit(finalization)
+            else:
+                deferred_resource_limit_finalizations.append(finalization)
         raise ResourceLimitExceeded(message)
 
     def kill_if_exceeded(
@@ -253,26 +475,49 @@ class ResourceManager:
         owner_pid: str | None = None,
         limit: dict[str, Any] | None = None,
     ) -> None:
+        finalization = self._persist_resource_limit_kill(
+            pid,
+            reason=reason,
+            owner_pid=owner_pid,
+            limit=limit,
+        )
+        self._finalize_resource_limit(finalization)
+
+    def _persist_resource_limit_kill(
+        self,
+        pid: str,
+        *,
+        reason: str,
+        owner_pid: str | None,
+        limit: dict[str, Any] | None,
+    ) -> _ResourceLimitFinalization:
         killed: list[str] = []
         # Persist the complete descendant state transition, reservation
         # release, and corresponding evidence atomically.  Cross-subsystem
         # terminal hooks run only after this transaction releases the store
         # lock, avoiding a store -> terminal-lock / terminal-lock -> store
         # inversion with HumanRequestManager.
-        with self.store.transaction():
+        with self.unit_of_work.transaction():
             for process in self._descendant_tree(pid):
                 if process.status in _TERMINAL_STATUSES:
                     continue
-                process.status = ProcessStatus.KILLED
-                process.status_message = reason
-                process.updated_at = utc_now()
-                self.store.transition_process(
-                    process.pid,
-                    ProcessStatus.KILLED,
-                    expected_revision=process.revision,
-                    status_message=reason,
+                previous_status = process.status
+                takeover_scope = self._resource_limit_takeover_scope(process)
+                with takeover_scope:
+                    self._transitions.transition(
+                        process.pid,
+                        ProcessStatus.KILLED,
+                        expected_revision=process.revision,
+                        expected_state_generation=process.state_generation,
+                        outcome=KilledProcessOutcome(code="resource_limit_exceeded"),
+                        status_message=reason,
+                        control=True,
+                        allowed_statuses={previous_status},
+                        reason="resource limit terminates an affected process tree",
+                    )
+                self.resource_repository.delete_resource_reservations_for_process(
+                    process.pid
                 )
-                self.store.delete_resource_reservations_for_process(process.pid)
                 killed.append(process.pid)
             self.events.emit(
                 EventType.RESOURCE_LIMIT_EXCEEDED,
@@ -287,6 +532,26 @@ class ResourceManager:
                 target=f"process:{pid}",
                 decision={"reason": reason, "owner_pid": owner_pid or pid, "killed_pids": killed, "limit": limit or {}},
             )
+        return _ResourceLimitFinalization(
+            pid=pid,
+            killed_pids=tuple(killed),
+            reason=reason,
+        )
+
+    def _run_resource_limit_finalizations(
+        self,
+        finalizations: Iterable[_ResourceLimitFinalization],
+    ) -> None:
+        for finalization in finalizations:
+            self._finalize_resource_limit(finalization)
+
+    def _finalize_resource_limit(
+        self,
+        finalization: _ResourceLimitFinalization,
+    ) -> None:
+        pid = finalization.pid
+        killed = list(finalization.killed_pids)
+        reason = finalization.reason
         finalizer_errors: list[dict[str, str]] = []
         for killed_pid in killed:
             try:
@@ -322,8 +587,37 @@ class ResourceManager:
                 # failure or skip the remaining cleanup callbacks.
                 pass
 
+    @staticmethod
+    def _resource_limit_takeover_scope(process: AgentProcess) -> Any:
+        if process.status != ProcessStatus.RUNNING:
+            return nullcontext()
+        if (
+            process.execution_owner_id is None
+            and process.execution_lease_id is None
+        ):
+            return nullcontext()
+        if process.execution_owner_id is None or process.execution_lease_id is None:
+            raise ValidationError(
+                f"running process has an incomplete execution lease: {process.pid}"
+            )
+        return trusted_process_execution_takeover(
+            process.pid,
+            source_revision=process.revision,
+            source_state_generation=process.state_generation,
+            source_execution_token=ProcessExecutionToken(
+                pid=process.pid,
+                generation=process.execution_generation,
+                owner_id=process.execution_owner_id,
+                lease_id=process.execution_lease_id,
+            ),
+            intended_status=ProcessStatus.KILLED,
+            reason="resource limit takes over an execution lease",
+            nonce=new_id("process_takeover"),
+            outcome_code="resource_limit_exceeded",
+        )
+
     def _wake_parent_waiting_on_child(self, child_pid: str) -> None:
-        with self.store.transaction():
+        with self.unit_of_work.transaction():
             child = self.store.get_process(child_pid)
             if child is None or child.parent_pid is None:
                 return
@@ -332,17 +626,15 @@ class ResourceManager:
                 return
             if parent.status != ProcessStatus.WAITING_EVENT:
                 return
-            if parent.status_message != f"waiting for {child.pid}":
+            if not isinstance(parent.wait_state, ChildProcessWait):
                 return
-            parent.status = ProcessStatus.RUNNABLE
-            parent.status_message = None
-            parent.updated_at = utc_now()
-            self.store.transition_process(
-                parent.pid,
-                ProcessStatus.RUNNABLE,
-                expected_revision=parent.revision,
-                expected_status=ProcessStatus.WAITING_EVENT,
-                status_message=None,
+            if parent.wait_state.child_pid != child.pid:
+                return
+            token = self._transitions.wait_token(parent)
+            self._transitions.wake(
+                token,
+                control=True,
+                reason="resource termination wakes a waiting parent",
             )
             self.audit.record(
                 actor="resource_manager",
@@ -364,7 +656,7 @@ class ResourceManager:
     def remaining_cumulative(self, pid: str, budget_field: str, usage_field: str) -> float | None:
         if budget_field not in _BUDGET_USAGE_MAP or usage_field not in _USAGE_FIELD_NAMES:
             raise ValidationError(f"unknown resource remaining query: {budget_field}/{usage_field}")
-        with self.store.locked():
+        with self.unit_of_work.locked():
             return self._remaining_budget_field_locked(pid, budget_field, (usage_field,))
 
     def peak_limit(self, pid: str, budget_field: str) -> int | None:
@@ -388,7 +680,7 @@ class ResourceManager:
     ) -> None:
         reserve = reserved_usage or ResourceUsage()
         self._coerce_usage(reserve)
-        with self.store.locked():
+        with self.unit_of_work.locked():
             if not self._is_zero(reserve):
                 self._preflight_locked(
                     parent_pid,
@@ -435,7 +727,7 @@ class ResourceManager:
         selected = sorted({str(pid) for pid in pids if str(pid)})
         if not selected:
             return {}
-        with self.store.locked():
+        with self.unit_of_work.locked():
             process_by_pid = {
                 process.pid: process
                 for process in self.store.get_processes_with_ancestors(selected)
@@ -443,7 +735,9 @@ class ResourceManager:
             missing = [pid for pid in selected if pid not in process_by_pid]
             if missing:
                 raise NotFound(f"process not found: {missing[0]}")
-            reservations = self.store.list_resource_reservations(parent_pids=process_by_pid)
+            reservations = self.resource_repository.list_resource_reservations(
+                parent_pids=process_by_pid
+            )
             reserved_by_parent: dict[str, dict[str, float]] = {}
             for reservation in reservations:
                 totals = reserved_by_parent.setdefault(reservation.parent_pid, {})
@@ -502,13 +796,13 @@ class ResourceManager:
             return result
 
     def reserve_child_budget(self, parent_pid: str, child_pid: str, child_budget: ResourceBudget) -> None:
-        with self.store.locked():
+        with self.unit_of_work.locked():
             self.validate_child_budget(parent_pid, child_budget, reserved_usage=ResourceUsage(child_processes=1))
             reserved = self._reservation_from_budget(child_budget)
             if not reserved:
                 return
             now = utc_now()
-            self.store.upsert_resource_reservation(
+            self.resource_repository.upsert_resource_reservation(
                 ResourceReservation(
                     parent_pid=parent_pid,
                     child_pid=child_pid,
@@ -525,10 +819,14 @@ class ResourceManager:
             )
 
     def release_process_reservations(self, pid: str) -> None:
-        with self.store.locked():
-            reservations = self.store.list_resource_reservations(child_pid=pid)
-            reservations.extend(self.store.list_resource_reservations(parent_pid=pid))
-            self.store.delete_resource_reservations_for_process(pid)
+        with self.unit_of_work.locked():
+            reservations = self.resource_repository.list_resource_reservations(
+                child_pid=pid
+            )
+            reservations.extend(
+                self.resource_repository.list_resource_reservations(parent_pid=pid)
+            )
+            self.resource_repository.delete_resource_reservations_for_process(pid)
             if reservations:
                 self.audit.record(
                     actor="resource_manager",
@@ -658,7 +956,10 @@ class ResourceManager:
         usage: ResourceUsage,
         relevant_fields: set[str],
     ) -> None:
-        reservation = self.store.get_resource_reservation(parent_pid, child_pid)
+        reservation = self.resource_repository.get_resource_reservation(
+            parent_pid,
+            child_pid,
+        )
         if reservation is None:
             return
         changed = False
@@ -683,7 +984,7 @@ class ResourceManager:
         if not changed:
             return
         if remaining:
-            self.store.upsert_resource_reservation(
+            self.resource_repository.upsert_resource_reservation(
                 ResourceReservation(
                     parent_pid=parent_pid,
                     child_pid=child_pid,
@@ -693,7 +994,7 @@ class ResourceManager:
                 )
             )
         else:
-            self.store.delete_resource_reservation(parent_pid, child_pid)
+            self.resource_repository.delete_resource_reservation(parent_pid, child_pid)
 
     def _reserved_budget_value_locked(
         self,
@@ -705,7 +1006,9 @@ class ResourceManager:
     ) -> float:
         total = 0.0
         usage_fields = _BUDGET_USAGE_MAP[budget_field]
-        for reservation in self.store.list_resource_reservations(parent_pid=parent_pid):
+        for reservation in self.resource_repository.list_resource_reservations(
+            parent_pid=parent_pid
+        ):
             value = float(reservation.reserved.get(budget_field, 0.0))
             if value <= 0:
                 continue
@@ -721,16 +1024,18 @@ class ResourceManager:
     ) -> float:
         usage_fields = _BUDGET_USAGE_MAP[budget_field]
         total = 0.0
-        for reservation in self.store.list_resource_usage_reservations(status="active"):
+        for reservation in self._iter_active_usage_reservations():
             try:
-                chain_pids = {process.pid for process in self._process_chain(reservation["pid"])}
+                chain_pids = {
+                    process.pid for process in self._process_chain(reservation.pid)
+                }
             except NotFound:
                 # A durable reservation whose process vanished is uncertain.
                 # Keep it visible to the root budget instead of silently freeing it.
-                chain_pids = {reservation["pid"]}
+                chain_pids = {reservation.pid}
             if owner_pid not in chain_pids:
                 continue
-            total += self._usage_value(reservation["usage"], budget_field, usage_fields)
+            total += self._usage_value(reservation.usage, budget_field, usage_fields)
         return total
 
     def _usage_value(
@@ -798,6 +1103,7 @@ class ResourceManager:
         relevant_fields: set[str] | None = None,
         consuming_child_pid: str | None = None,
         consuming_usage: ResourceUsage | None = None,
+        include_active_reservations: bool = True,
     ) -> dict[str, Any] | None:
         selected_usage = usage or process.resource_usage
         for budget_field, usage_fields in _BUDGET_USAGE_MAP.items():
@@ -814,7 +1120,11 @@ class ResourceManager:
                     consuming_child_pid=consuming_child_pid,
                     consuming_usage=consuming_usage,
                 )
-                value += self._reserved_usage_value_locked(process.pid, budget_field)
+                if include_active_reservations:
+                    value += self._reserved_usage_value_locked(
+                        process.pid,
+                        budget_field,
+                    )
             if float(value) > float(limit):
                 return {"budget": budget_field, "usage": list(usage_fields), "value": value, "limit": limit}
         return None

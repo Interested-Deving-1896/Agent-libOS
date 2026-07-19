@@ -8,12 +8,15 @@ from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import (
     CapabilityRight,
     EventType,
+    KilledProcessOutcome,
     ObjectOwnerKind,
     ObjectType,
     ProcessMessageKind,
     ProcessSignal,
     ProcessStatus,
     ResourceBudget,
+    process_outcome_to_mapping,
+    process_wait_state_to_mapping,
 )
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired
 from agent_libos.runtime.syscalls import LibOSSyscallSession
@@ -157,35 +160,150 @@ class TestChildProcessTool:
 
             assert waited.ok, waited.error
             assert waited.payload['ready'] is False
+            child_state = runtime.process.get(child)
+            assert waited.payload['wait_state'] is None
+            assert waited.payload['outcome'] is None
+            assert waited.payload['state_generation'] == child_state.state_generation
             assert runtime.process.get(parent).status == ProcessStatus.RUNNABLE
             assert runtime.process.get(parent).status_message is None
         finally:
             runtime.close()
 
-    def test_wait_child_process_rechecks_child_after_wait_state_write(self) -> None:
+    def test_child_wait_boundaries_publish_typed_terminal_outcome(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='observe typed child outcome')
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, 'cancelled child')
+            runtime.process.cancel(child, 'typed cancellation reason')
+            terminal = runtime.process.get(child)
+            assert isinstance(terminal.outcome, KilledProcessOutcome)
+            expected_outcome = process_outcome_to_mapping(terminal.outcome)
+
+            direct = runtime.process.wait(parent, child)
+            assert direct.wait_state is None
+            assert direct.outcome == terminal.outcome
+            assert direct.state_generation == terminal.state_generation
+
+            session = LibOSSyscallSession(runtime, parent)
+            listed = asyncio.run(session.handle('process.list_children', {}))
+            listed_child = next(item for item in listed['children'] if item['pid'] == child)
+            assert listed_child['wait_state'] is None
+            assert listed_child['outcome'] == expected_outcome
+            assert listed_child['state_generation'] == terminal.state_generation
+
+            syscall_wait = asyncio.run(
+                session.handle(
+                    'process.wait',
+                    {'child_pid': child, 'block': False},
+                )
+            )
+            assert syscall_wait['ready'] is True
+            assert syscall_wait['wait_state'] is None
+            assert syscall_wait['outcome'] == expected_outcome
+            assert syscall_wait['state_generation'] == terminal.state_generation
+
+            tool_wait = runtime.tools.call(
+                parent,
+                'wait_child_process',
+                {'child_pid': child, 'block': False},
+            )
+            assert tool_wait.ok, tool_wait.error
+            assert tool_wait.payload['ready'] is True
+            assert tool_wait.payload['wait_state'] is None
+            assert tool_wait.payload['outcome'] == expected_outcome
+            assert tool_wait.payload['state_generation'] == terminal.state_generation
+        finally:
+            runtime.close()
+
+    def test_child_signal_boundaries_publish_canonical_typed_state(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='typed signal parent')
+            _grant_process_spawn(runtime, parent)
+
+            tool_child = runtime.spawn_child_process(parent, 'tool signal child')
+            tool_paused = runtime.tools.call(
+                parent,
+                'signal_child_process',
+                {'child_pid': tool_child, 'signal': ProcessSignal.PAUSE.value},
+            )
+            assert tool_paused.ok, tool_paused.error
+            paused = runtime.process.get(tool_child)
+            assert tool_paused.payload['status'] == ProcessStatus.PAUSED.value
+            assert tool_paused.payload['wait_state'] == process_wait_state_to_mapping(paused.wait_state)
+            assert tool_paused.payload['outcome'] is None
+            assert tool_paused.payload['state_generation'] == paused.state_generation
+
+            tool_terminated = runtime.tools.call(
+                parent,
+                'signal_child_process',
+                {'child_pid': tool_child, 'signal': ProcessSignal.TERMINATE.value},
+            )
+            assert tool_terminated.ok, tool_terminated.error
+            terminated = runtime.process.get(tool_child)
+            assert tool_terminated.payload['status'] == ProcessStatus.KILLED.value
+            assert tool_terminated.payload['wait_state'] is None
+            assert tool_terminated.payload['outcome'] == process_outcome_to_mapping(terminated.outcome)
+            assert tool_terminated.payload['state_generation'] == terminated.state_generation
+
+            syscall_child = runtime.spawn_child_process(parent, 'syscall signal child')
+            session = LibOSSyscallSession(runtime, parent)
+            syscall_paused = asyncio.run(
+                session.handle(
+                    'process.signal',
+                    {'child_pid': syscall_child, 'signal': ProcessSignal.PAUSE.value},
+                )
+            )
+            paused = runtime.process.get(syscall_child)
+            assert syscall_paused['status'] == ProcessStatus.PAUSED.value
+            assert syscall_paused['wait_state'] == process_wait_state_to_mapping(paused.wait_state)
+            assert syscall_paused['outcome'] is None
+            assert syscall_paused['state_generation'] == paused.state_generation
+
+            syscall_terminated = asyncio.run(
+                session.handle(
+                    'process.signal',
+                    {'child_pid': syscall_child, 'signal': ProcessSignal.TERMINATE.value},
+                )
+            )
+            terminated = runtime.process.get(syscall_child)
+            assert syscall_terminated['status'] == ProcessStatus.KILLED.value
+            assert syscall_terminated['wait_state'] is None
+            assert syscall_terminated['outcome'] == process_outcome_to_mapping(terminated.outcome)
+            assert syscall_terminated['state_generation'] == terminated.state_generation
+        finally:
+            runtime.close()
+
+    def test_wait_child_process_rechecks_child_after_wait_state_write(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         runtime = Runtime.open('local')
         try:
             parent = runtime.process.spawn(image='base-agent:v0', goal='wait race parent')
             _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, 'wait race child')
-            original_update_process = runtime.store.update_process
+            process_repository = runtime.process.transitions.store
+            original_transition = process_repository.apply_process_state_transition
             triggered = {'value': False}
 
-            def racing_update_process(process):
+            def racing_transition(pid, status, *args, **kwargs):
                 if (
-                    process.pid == parent
-                    and process.status == ProcessStatus.WAITING_EVENT
+                    pid == parent
+                    and ProcessStatus(status) == ProcessStatus.WAITING_EVENT
                     and not triggered['value']
                 ):
                     triggered['value'] = True
                     runtime.process.exit(child, message='done before parent wait persisted')
-                return original_update_process(process)
+                return original_transition(pid, status, *args, **kwargs)
 
-            runtime.store.update_process = racing_update_process
-            try:
-                waited = runtime.process.wait(parent, child)
-            finally:
-                runtime.store.update_process = original_update_process
+            monkeypatch.setattr(
+                process_repository,
+                'apply_process_state_transition',
+                racing_transition,
+            )
+            waited = runtime.process.wait(parent, child)
 
             assert triggered['value']
             assert waited.status == ProcessStatus.EXITED
@@ -475,7 +593,11 @@ class TestChildProcessTool:
         runtime = Runtime.open('local')
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='become coding agent')
-            runtime.filesystem.grant_workspace(pid, [CapabilityRight.READ], issued_by='test')
+            workspace_capability = runtime.filesystem.grant_workspace(
+                pid,
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
             _grant_image_read(runtime, pid, 'coding-agent:v0')
             executed = runtime.tools.call(pid, 'exec_process', {'image': 'coding-agent:v0', 'goal': 'inspect without automatic capability lift', 'preserve_capabilities': False, 'preserve_memory': False})
             assert executed.ok, executed.error
@@ -485,6 +607,9 @@ class TestChildProcessTool:
             assert 'spawn_child_process' in process.tool_table
             read_resource = runtime.filesystem.resource_for_path('README.md')
             assert not runtime.capability.check(pid, read_resource, CapabilityRight.READ)
+            persisted_workspace = runtime.store.get_capability(workspace_capability.cap_id)
+            assert persisted_workspace is not None and persisted_workspace.revoked
+            assert '_agent_libos_exec_rollback_token' not in persisted_workspace.metadata
             assert [handle.oid for handle in process.memory_view.roots] == [process.goal_oid]
             assert 'process.exec' in [record.action for record in runtime.audit.trace()]
         finally:
@@ -507,10 +632,21 @@ class TestChildProcessTool:
             before_tools = dict(before.tool_table)
             original_configure_skills = runtime.image_boot._configure_skills
 
-            def fail_after_unrelated_mutation(target_pid: str, image_id: str, assigned_by: str) -> None:
+            def fail_after_unrelated_mutation(
+                target_pid: str,
+                image_id: str,
+                assigned_by: str,
+                *,
+                publication_id: str | None = None,
+            ) -> None:
                 other_process = runtime.process.get(other)
-                other_process.status_message = 'must survive scoped rollback'
-                runtime.store.update_process(other_process)
+                runtime.store.patch_process_control(
+                    other,
+                    {'status_message': 'must survive scoped rollback'},
+                    expected_revision=other_process.revision,
+                    allowed_statuses={ProcessStatus.RUNNABLE},
+                    reason='inject unrelated Host mutation during exec rollback test',
+                )
                 raise RuntimeError('skill boot failed')
 
             runtime.image_boot._configure_skills = fail_after_unrelated_mutation
@@ -536,6 +672,11 @@ class TestChildProcessTool:
         try:
             pid = runtime.process.spawn(image='base-agent:v0', goal='stay on base')
             _grant_image_read(runtime, pid, 'coding-agent:v0')
+            workspace_capability = runtime.filesystem.grant_workspace(
+                pid,
+                [CapabilityRight.READ],
+                issued_by='test',
+            )
             before = runtime.process.get(pid)
             before_capabilities = {cap.cap_id for cap in runtime.capability.capabilities_for(pid)}
             original_emit = runtime.events.emit
@@ -561,6 +702,13 @@ class TestChildProcessTool:
             assert after.tool_table == before.tool_table
             assert after.loaded_skills == before.loaded_skills
             assert {cap.cap_id for cap in runtime.capability.capabilities_for(pid)} == before_capabilities
+            restored_workspace = runtime.store.get_capability(workspace_capability.cap_id)
+            assert restored_workspace is not None and restored_workspace.active
+            assert runtime.capability.check(
+                pid,
+                runtime.filesystem.workspace_resource(),
+                CapabilityRight.READ,
+            )
         finally:
             runtime.close()
 

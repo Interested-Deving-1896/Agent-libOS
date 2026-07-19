@@ -1,15 +1,30 @@
 from __future__ import annotations
+import importlib
 import pytest
 import asyncio
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.models import CapabilityRight
+from agent_libos.runtime import RuntimeAssemblyCleanupRequired
 from agent_libos.substrate import LocalResourceProviderSubstrate
-from scripts import run_coding_agent
+from scripts import run_coding_agent, runtime_assembly
+
+
+ASYNC_RUNTIME_ENTRYPOINTS = (
+    'ask_file_then_show.py',
+    'async_clock_interleave_smoke.py',
+    'human_llm_chat.py',
+    'llm_summarize_document.py',
+    'llm_write_goal_smoke.py',
+    'object_memory_file_copy_smoke.py',
+    'run_coding_agent.py',
+)
 
 class TestCodingAgentLauncher:
 
@@ -53,9 +68,119 @@ class TestCodingAgentLauncher:
         with tempfile.TemporaryDirectory() as tmp:
             before = Path.cwd()
             args = run_coding_agent.build_parser().parse_args(['--goal', 'inspect', '--workspace', tmp, '--ephemeral-db', '--no-run'])
-            with patch.object(run_coding_agent, 'load_dotenv'):
+            with patch.object(run_coding_agent, 'load_dotenv'), patch.object(
+                Runtime,
+                'open',
+                side_effect=AssertionError('async launcher must not call Runtime.open'),
+            ):
                 asyncio.run(run_coding_agent.amain(args))
             assert Path.cwd() == before
+
+    def test_aopen_runtime_returns_successful_runtime(self) -> None:
+        async def exercise() -> None:
+            args = run_coding_agent.build_parser().parse_args(
+                ['--goal', 'inspect', '--workspace', '.', '--ephemeral-db', '--no-run']
+            )
+            runtime = object()
+            with patch.object(Runtime, 'aopen', new=AsyncMock(return_value=runtime)) as aopen:
+                opened = await run_coding_agent._aopen_runtime(args, Path.cwd())
+            assert opened is runtime
+            assert aopen.await_count == 1
+            assert aopen.await_args.args == ('local',)
+            assert isinstance(
+                aopen.await_args.kwargs['substrate'],
+                LocalResourceProviderSubstrate,
+            )
+
+        asyncio.run(exercise())
+
+    def test_aopen_runtime_releases_assembly_cleanup_handle_before_reraising(self) -> None:
+        async def exercise() -> None:
+            args = run_coding_agent.build_parser().parse_args(
+                ['--goal', 'inspect', '--workspace', '.', '--ephemeral-db', '--no-run']
+            )
+            handle = RuntimeAssemblyCleanupRequired(
+                partial_runtime=None,
+                store=object(),  # type: ignore[arg-type]
+                cleanup_errors=[{'component': 'scheduler'}],
+            )
+            release = AsyncMock()
+            handle.arelease = release  # type: ignore[method-assign]
+            assembly_error = BaseExceptionGroup(
+                'injected assembly failure',
+                [RuntimeError('assembly failed'), handle],
+            )
+            with patch.object(Runtime, 'aopen', new=AsyncMock(side_effect=assembly_error)):
+                with pytest.raises(BaseExceptionGroup) as caught:
+                    await run_coding_agent._aopen_runtime(args, Path.cwd())
+            assert caught.value is assembly_error
+            release.assert_awaited_once_with()
+
+        asyncio.run(exercise())
+
+    def test_aopen_runtime_preserves_primary_cleanup_and_cancellation_errors(self) -> None:
+        async def exercise() -> None:
+            args = run_coding_agent.build_parser().parse_args(
+                ['--goal', 'inspect', '--workspace', '.', '--ephemeral-db', '--no-run']
+            )
+            handle = RuntimeAssemblyCleanupRequired(
+                partial_runtime=None,
+                store=object(),  # type: ignore[arg-type]
+                cleanup_errors=[{'component': 'scheduler'}],
+            )
+            cleanup_error = BaseExceptionGroup(
+                'injected cleanup failure',
+                [OSError('cleanup failed'), asyncio.CancelledError()],
+            )
+            release = AsyncMock(side_effect=cleanup_error)
+            handle.arelease = release  # type: ignore[method-assign]
+            primary = RuntimeError('assembly failed')
+            assembly_error = BaseExceptionGroup(
+                'injected assembly failure',
+                [primary, handle],
+            )
+            with patch.object(Runtime, 'aopen', new=AsyncMock(side_effect=assembly_error)):
+                with pytest.raises(BaseExceptionGroup) as caught:
+                    await run_coding_agent._aopen_runtime(args, Path.cwd())
+            assert caught.value is not assembly_error
+            assert caught.value.exceptions[0] is assembly_error
+            assert caught.value.subgroup(RuntimeError) is not None
+            assert caught.value.subgroup(OSError) is not None
+            assert caught.value.subgroup(asyncio.CancelledError) is not None
+            assert RuntimeAssemblyCleanupRequired.extract(caught.value) == (handle,)
+            release.assert_awaited_once_with()
+
+        asyncio.run(exercise())
+
+    @pytest.mark.parametrize('script_name', ASYNC_RUNTIME_ENTRYPOINTS)
+    def test_async_entrypoint_uses_shared_runtime_assembly_helper(
+        self,
+        script_name: str,
+    ) -> None:
+        module_name = script_name.removesuffix('.py')
+        module = importlib.import_module(f'scripts.{module_name}')
+        assert module.aopen_runtime is runtime_assembly.aopen_runtime
+        source = (run_coding_agent.PROJECT_ROOT / 'scripts' / script_name).read_text(
+            encoding='utf-8'
+        )
+        assert 'await Runtime.aopen(' not in source
+
+    @pytest.mark.parametrize('script_name', ASYNC_RUNTIME_ENTRYPOINTS)
+    def test_async_entrypoint_can_load_as_a_direct_script(
+        self,
+        script_name: str,
+        tmp_path: Path,
+    ) -> None:
+        script = run_coding_agent.PROJECT_ROOT / 'scripts' / script_name
+        completed = subprocess.run(
+            [sys.executable, str(script), '--help'],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
 
     def test_explicit_missing_env_file_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

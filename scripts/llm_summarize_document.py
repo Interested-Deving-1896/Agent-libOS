@@ -10,6 +10,11 @@ from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import HumanRequestStatus, ProcessStatus, ResourceBudget
 
+if __package__:  # pragma: no branch - depends on module versus file execution
+    from scripts.runtime_assembly import aopen_runtime
+else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
+    from runtime_assembly import aopen_runtime
+
 
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
@@ -76,7 +81,7 @@ def main() -> None:
 
 
 async def amain(args: argparse.Namespace) -> None:
-    runtime = Runtime.open(args.db)
+    runtime = await aopen_runtime(args.db)
     try:
         document_path = _workspace_relative_document(args.document, runtime.workspace_root)
         output_path = _workspace_relative_output(args.output, runtime.workspace_root)
@@ -134,7 +139,7 @@ async def amain(args: argparse.Namespace) -> None:
         if not output_exists and not _had_permission_rejection(runtime, pid):
             raise SystemExit(f"Agent exited without writing summary file: {output_path}")
     finally:
-        runtime.shutdown(actor="script", reason="script.complete")
+        await runtime.ashutdown(actor="script", reason="script.complete")
 
 
 def _workspace_relative_document(raw_path: str, workspace: Path) -> str:

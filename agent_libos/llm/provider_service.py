@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 from typing import Any
 
 from agent_libos.llm.client import LLMClient
+from agent_libos.ports.blocking_work import run_blocking_once
 
 
 class LLMProviderService:
@@ -16,7 +16,7 @@ class LLMProviderService:
     async def _run_sync(self, function: Any, /, *args: Any, **kwargs: Any) -> Any:
         if self._blocking_work is not None:
             return await self._blocking_work.run(function, *args, **kwargs)
-        return await asyncio.to_thread(function, *args, **kwargs)
+        return await run_blocking_once(function, *args, **kwargs)
 
     async def complete_action(
         self,

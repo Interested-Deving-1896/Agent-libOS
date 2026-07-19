@@ -38,6 +38,15 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   malformed authority-rule fail-closed behavior, and ISO-normalized leases.
   Delegation publishes its row/process attachment/evidence atomically, and a
   multi-spec authority derivation is prevalidated and committed all-or-nothing.
+- `authority-mutations-revalidate-inside-one-transaction`: JSON-RPC, MCP,
+  DataFlow, Skill registration/activation/unload/trust, capability issue/revoke, and
+  checkpoint publication recompute the complete allow/deny decision after
+  entering their UnitOfWork. Global Skill publication also rechecks the exact
+  source/hash trust row in that boundary. Finite uses are reserved before
+  mutation and settled with its evidence; JIT activation retires superseded
+  executable handles only after settlement. Unlimited revocation, a newly
+  inserted deny, or failed reservation settlement therefore has a documented
+  serial order with the write on both SQLite and PostgreSQL.
 - `process-authority-is-explicit`: spawn, fork, exec, and cwd behavior do not
   imply broader authority. Cwd selection requires filesystem directory read,
   and explicit child/PTY cwd probes occur only after their higher-level
@@ -69,6 +78,14 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   operation descriptors. Egress source, trust, target-state, payload, and exact
   release bindings are revalidated before every provider phase, including
   multi-phase state/resolve-to-write transitions.
+- `provider-usage-reservations-fail-closed`: MCP uses one absolute deadline
+  across DNS, executable snapshot, live listing, validation, and call dispatch.
+  An exhausted deadline cannot start a provider; known response bytes settle
+  exactly, an unknown host failure charges the current phase maximum, and a
+  later phase that never started charges zero rather than the full composite
+  reservation. Provider exceptions cross public, Tool, syscall, LLM, and
+  evidence surfaces only as a code/type/correlation envelope without host
+  exception text.
 - `data-labels-propagate-conservatively`: derived Object sensitivity, trust,
   and integrity labels merge conservatively; manifests expose metadata only;
   label downgrade requires declassification authority.
@@ -143,10 +160,30 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `storage-transactions-recover-or-fail-closed`: commit/savepoint finalization
   failure restores SQL and opted-in Object payload state; rollback failure
   poisons/closes the store.
+- `process-waits-and-outcomes-are-typed-and-generation-fenced`: every semantic
+  process transition atomically persists status, typed wait/outcome, and a
+  monotonic state generation. Wakeups compare the exact typed state and
+  generation, checkpoint restore reserves a new high-water generation, and
+  fork remaps typed PID/Object references. `status_message` is compatibility
+  output only and is never a runtime control protocol. Process list/wait
+  boundaries expose the tagged values and generation directly. Exec rejects an
+  active typed wait before creating its publication because no exec transaction
+  owns the child, mailbox, Human, Tool, or Host-resume dependency that would
+  otherwise be orphaned. Generic store patches and whole-process updates cannot
+  write semantic state fields. Normal orchestration uses one transition service;
+  explicitly typed execution/restore repository CAS primitives are the only
+  exceptions when the state and its concurrency fence require the same SQL
+  commit point. Exec-epoch commit requires the exact non-null admission token
+  recorded by the matching applying `process_exec` publication at its final
+  pre-commit phase and CASes RUNNING status, generation, owner, and lease. These
+  typed boundaries compute the next state generation, preventing a direct-write
+  rewind from reviving a stale token.
 - `v3-persisted-state-is-strict-and-versioned`: a 0.3 store accepts only the
-  complete version-3 schema and canonical security carriers. Older,
-  incomplete, or malformed state is rejected before mutation; active wait
-  cleanup and provider-effect recovery operate only on valid 0.3 state.
+  frozen release version-3 physical schema (including typed process state) and
+  canonical security carriers. Older, draft-v3, incomplete, or malformed state
+  is rejected before mutation; no draft-v3 compatibility path is represented
+  as a migration. Active wait cleanup and provider-effect recovery operate only
+  on valid 0.3 state.
 - `human-approval-is-blocking-and-audited`: human questions and approvals block,
   resume, reserve and consume one-shot grants exactly once, are decided exactly
   once from pending state, and route through primitives. Concurrent terminal
@@ -170,6 +207,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   process-local, cached-only at runtime, and syscall-mediated. JIT lifecycle
   rows/aliases/handles commit atomically, composite failures discard unpublished
   candidates, and cancellation terminates the isolated Deno process group;
+  Host provider-error attribution requires both runner-private syscall-error
+  provenance and a per-execution protocol proof, so candidate-authored error
+  metadata remains an ordinary sandbox failure;
   a dedicated POSIX death-pipe/process-group supervisor or Windows
   `KILL_ON_JOB_CLOSE` Job Object establishes hard-host-termination containment
   before Deno is released, failing closed if containment setup fails;
@@ -229,16 +269,199 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   parent/message waiter transitions do not publish partial authoritative state
   when an in-transaction sink fails. Higher-level image boot uses compensating
   restore rather than claiming one transaction across host/package work.
+  Exec capability staging uses an expected-state transition, so a concurrent
+  revoke or disable wins and cannot be overwritten or later resurrected.
+  Successful exec advances the process execution generation, clears the old
+  owner/lease, and returns the replacement image to `RUNNABLE` in the same
+  transaction as its publication and evidence. The fenced worker may finish
+  exactly one ToolResult handle append only when the committed publication,
+  operation binding, prior token fields, current generation, cleared lease,
+  row revision, ToolResult Object, and new object-handle capability all match.
+  That narrow completion does not publish another MemoryView root or admit a
+  repeated, forged, cross-purpose, or otherwise ordinary old-token mutation.
   Terminal signals use the same durable boundary; independent post-commit
   terminal notifier/finalizer failures cannot strand the other cleanup phase.
+- `runtime-publication-compensation-is-retry-safe`: interrupted process launch
+  and exec publications carry typed, exact artifact ownership receipts before
+  publication-owned effects commit. Each recovery claim is durable before
+  compensation starts; the same runtime resumes its lease idempotently, while
+  startup under the backend-wide runtime lease takes over an orphaned claimant
+  with a new fenced attempt. Cleanup, restore, terminal publication, and linked
+  operation convergence then share one store transaction. Failed attempts remain
+  retryable until the configured attempt ceiling persists a manual disposition,
+  and every later reopen fails closed while that manual record remains.
+  Launch-time capability grants and their exact receipts share one database and
+  Object-payload unit of work. Committed checkpoint JIT installation records the
+  candidate and Tool as separate exact receipts in the same unit of work;
+  compensation handles those identities independently and never infers candidate
+  ownership by looking up `registered_tool_id` from a Tool receipt.
+  Compensation runs receipts in reverse order, rejects unknown handlers, and
+  verifies capability/reservation, Tool row/handle/source/alias, candidate
+  descriptor, loaded Skill, and workspace convergence before reporting
+  `rolled_back`. Global JIT rehydration runs only after publication recovery and
+  is never reached while an orphaned or manual publication is unresolved.
+- `runtime-publication-startup-recovery-is-keyset-bounded`: launch, exec, and
+  checkpoint pending recovery scan exact kind/state/marker keyset pages under a
+  hard limit. Launch/exec terminal-operation repair and committed
+  checkpoint-restore operation repair scan only durable marker-false rows;
+  failed/manual checkpoint restores remain forward-recovery inputs. Orphaned
+  `CREATED` processes are found by an indexed anti-join. Every backlog is fully
+  processed while returned diagnostic ids remain bounded.
+- `checkpoint-restore-payload-replay-precedes-generic-release`: startup validates
+  the receipt-anchored checkpoint plan and snapshot, then selectively rehydrates
+  exact restored Object rows before the generic missing-payload sweep. A newer
+  Object with the same immutable creation identity (including a versioned owner
+  transfer), or a released Object, is never overwritten; missing, stale, or
+  creation-identity-drifted rows fail closed. Terminal
+  `pending`/`confirmed`/`completed` delivery receipts
+  keep the operation index dirty until startup services are ready, and a late
+  startup failure compensates back to `pending` before Store ownership is
+  released.
+- `startup-recovery-entrypoints-require-the-opaque-lifecycle-lease`: every
+  mutation-capable recovery entry invoked by Runtime assembly (prepared
+  protected effects, provider reconciliation, capability/resource
+  reservations, volatile Object payloads, ObjectTasks,
+  launch/exec/checkpoint publications, stale operations, and stale process
+  executions) validates the lifecycle-owned recovery lease as
+  its first action. The lease is valid only while the runtime is `RECOVERING`
+  and its private ContextVar value has the lifecycle's opaque identity. Calls
+  from an `OPEN` runtime therefore fail before the first durable read, claim,
+  callback, compensation, audit, or event write. JIT registry rehydration is
+  also mutation-capable startup recovery: it requires the same opaque lease
+  before its first process or artifact read, including when called directly
+  through the JIT service rather than the broker.
+- `jit-rehydration-is-keyset-bounded-and-owner-validated`: startup scans
+  the normalized durable ephemeral-binding projection directly through the
+  stable `(pid, tool_name)` keyset, without scanning or decoding unrelated
+  process rows. Process and Tool mutations maintain exact JIT eligibility in
+  that projection transactionally; a binary-collated partial covering index
+  keeps both first-page and deep-cursor database work proportional to eligible
+  bindings, not all callable history. Every SQL page and exact ephemeral-Tool/
+  registered-owner-candidate lookup is hard-capped, and artifacts are fetched
+  once per binding page rather than once per process. Candidate ownership and
+  durable name are validated before the loaded-registry shortcut, so a
+  cross-process alias is pruned even when its Tool id was already restored for
+  the owner. Recovery returns exact totals and retains only one page of
+  restored/pruned samples. Historical scan and temporary diagnostic memory are
+  page-bounded; the final registry remains proportional to active JIT tools. A
+  single process with arbitrarily many aliases cannot create an unbounded
+  Python record or per-binding SQL query.
+- `resource-usage-reservation-recovery-is-lease-gated-and-bounded`: startup
+  recovery rejects callers without the opaque recovery lease before the first
+  repository read. Active usage reservations are traversed by a status-first,
+  hard-bounded `(created_at, reservation_id)` keyset. Ambiguous settlements,
+  actual charges, and any resulting overage kill share one transaction, while
+  diagnostics retain only one page of IDs plus the exact total.
+- `startup-recovery-diagnostics-are-bounded`: prepared-effect reconciliation,
+  provider reconciliation, stale capability-use reservations, provider-usage
+  reservations, volatile Object payloads, ObjectTask reconciliation, JIT
+  rehydration, stale operations, and stale process executions
+  process their complete indexed/keyset backlog but retain only exact totals
+  and one bounded sample page. Prepared protected effects restore their linked finite-use
+  reservations before the remaining status-indexed capability reservations
+  are abandoned. Stale execution state, concurrency high-water, audit, and
+  event rows commit together page by page.
+- `object-and-object-task-recovery-is-keyset-bounded`: volatile runtime-memory
+  Object rows are released under the startup lease through a partial recovery
+  index and per-Object CAS transactions before ObjectTask result repair. Active
+  tasks, succeeded rows with result references, and retryable notification rows
+  use normalized status columns plus stable `(created_at, task_id)` keysets.
+  Same-timestamp backlogs larger than SQL bind limits converge without full
+  history lists, and Runtime exposes exact totals with one-page samples.
+- `checkpoint-restore-publication-program-is-immutable`: a restore plan is
+  complete at insert, anchored by an immutable receipt-side digest, and
+  validated before a recovery claim or callback. Committed marker-false rows
+  also revalidate the exact operation binding and kind/name/actor/PID before
+  convergence; plan-only persisted corruption fails startup closed.
+  A failed exec preserves unrelated authority even when its issuer happens to
+  use an `image:*` name; only exact publication metadata or receipts establish
+  rollback ownership. Snapshot-based exec and process-local Tool, candidate,
+  and Skill publication share one registry lifecycle lock, so a legitimate
+  concurrent mutation commits only after exec reaches a terminal publication
+  and cannot be overwritten by compensation from an older snapshot. Snapshot
+  restore and a durable `compensation_applied` receipt marker commit together;
+  if the later publication/operation terminal transaction fails, recovery sees
+  that marker and finishes terminalization without replaying the snapshot over
+  mutations admitted after the original exec returned. If online compensation
+  fails before that marker exists, the internally issued, exact
+  publication/operation-bound recovery signal moves the whole runtime to
+  `CLOSE_FAILED` before control leaves ImageBoot, including its service-level
+  direct entry point. The store stays available for diagnosis and ordinary
+  close remains fail closed; every public mutation admission is rejected
+  without writes until an explicit `release_recovery_diagnostics()` handoff
+  releases the backend lease and a fresh reopen performs authoritative startup
+  recovery. Forged or unbound
+  recovery signals cannot suppress ordinary operation terminalization, while a
+  damaged association discovered after a genuine durable signal remains
+  fail-closed. The recovery fence also advances an admission epoch. The shared
+  registry barrier revalidates that epoch after its outermost lock acquisition,
+  so a candidate or Skill mutation admitted before the fence cannot wake and
+  publish afterward. Capability consume/reserve waiters likewise revalidate
+  after acquiring the backend transaction lock, and `AuthorityTransaction`
+  revalidates before settlement and UnitOfWork commit. A stale lease therefore
+  rolls back business state, finite-use reservations, and evidence instead of
+  committing after poison. A recovery fence may supersede an earlier ordinary
+  shutdown timeout; ordinary shutdown alone does not revoke already-admitted
+  work.
 - `scheduler-quantum-ownership-is-serialized`: scheduler and direct pid
   single-step APIs share the same runtime lock, store claim, and resource-charge
-  boundary, so one process cannot be re-entered concurrently.
+  boundary, so one process cannot be re-entered concurrently. Terminal process
+  rows are immutable to ordinary writers, and a detached worker's execution
+  generation/owner/lease token cannot mutate any process-local field. A bound
+  worker token never falls back to Host authority for another PID; intentional
+  cross-PID control writes name the target, allowed source statuses, revision,
+  and reason. While a `process_exec` publication is active, its exact RUNNING
+  generation/owner/lease tuple exclusively owns process-row writes; an ordinary
+  tokenless Host patch is rejected before mutation. Trusted pause, cancellation,
+  termination, resource-limit kill, and ObjectTask fallback may supersede that
+  lease only through a scoped takeover naming the exact PID, revision, state
+  generation, lease tuple, intended typed state, and nonce. Optional reason
+  Object/capability/view preparation and the single semantic state transition
+  must all finish in the same unit of work; a cross-PID write or incomplete
+  takeover rolls the transaction back. A synthetic RUNNING row with no lease
+  tuple retains the legacy exact control CAS, while a partially populated tuple
+  fails closed. The only terminal-row bookkeeping exception is an exact CAS scope
+  naming target, terminal source status, revision, execution generation,
+  ambient worker token, and reason; there is no general terminal-mutation
+  bypass. Exec admission atomically rotates either the runnable Host epoch or
+  the exact active worker token before it creates a publication. Successful
+  exec clears that internal lease and returns the process to the runnable queue
+  in the publication commit transaction. Failed exec compensation also returns
+  it to the queue behind a newer generation; it never revives the superseded
+  worker token. Snapshot restore itself CASes the caller-observed current row
+  revision together with RUNNING status, the state generation derived from the
+  publication-bound before snapshot, and the admission generation/owner/lease
+  recorded by the publication. If a trusted takeover wins first, compensation
+  preserves that winner, records
+  `compensation_failed`, resolves the operation as `UNKNOWN`, and fences the
+  runtime in `close_failed` instead of reporting a false rollback. Terminal
+  commit receipts remain authoritative if acknowledgement is interrupted,
+  while a successor claim may legitimately advance the live row.
 - `runtime-shutdown-is-drained-and-retry-safe`: scheduler work, ObjectTask
-  executors, PTY reader/monitor workers, and GUI runtime users drain before
-  shared state closes; a timed-out shutdown leaves storage open and can be
-  retried. The HTTP endpoint acknowledges success only after completed Runtime
-  teardown, while process exit fails visibly if bounded retries still fail.
+  executors, Human/provider blocking jobs, PTY reader/monitor workers, active
+  admission leases, and GUI runtime users drain before shared state closes; a
+  timed-out shutdown leaves storage open and can be retried. A checked public
+  mutation inventory is installed under admission. Every public Human control
+  method is classified as mutation or read-only; approvals, presentation,
+  terminal draining, cancellation, and recovery are rejected at `STOPPING`
+  before any durable or in-memory write. All 48 public CapabilityManager
+  methods are likewise classified as read, mutation, or audit-sensitive mixed;
+  the public lease and mutation subservices are complete guarded ratchets, so
+  direct lower-level calls cannot bypass lifecycle fail-close. Runtime-owned blocking work uses a
+  drainable supervisor; standalone reusable components use an owned one-call
+  executor that is drained even after coroutine cancellation. The architecture
+  ratchet permits no raw `asyncio.to_thread` or default-executor dispatches.
+  Recovery-diagnostics handoff never reclassifies ordinary user/module
+  shutdown callbacks as safe. It runs only explicitly tagged, idempotent
+  transient cleanups under a no-commit fence. The PTY cleanup closes live
+  handles and joins reader/monitor workers without changing Objects or evidence;
+  a partial failure preserves the callback and session for retry and keeps the
+  store open. Its only evidence-free provider action is `handle.close()` behind
+  the lifecycle's opaque, callback-scoped recovery-cleanup lease. The static
+  protected-operation ratchet rejects direct invocation, a late/forged guard,
+  or any other provider method on this path.
+  The HTTP endpoint acknowledges success only after completed Runtime teardown,
+  while process exit fails visibly if bounded retries still fail.
 - `gui-local-control-surface-is-origin-bound`: browser CORS accepts loopback
   development origins and exactly `agent-libos://app` for the packaged
   renderer, while rejecting `null` and every other custom origin.
@@ -318,11 +541,33 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   captures one consistent store snapshot and publishes its row, head, initial
   read capability, event, and audit. Restore/fork are scoped,
   capability-controlled, ownership-based, revoke-wins, and append-only outside
-  reconstructable state. Borrowed/`EXTERNAL_REF` state is not cloned, JIT
+  reconstructable state. Restore allocates revision and execution-generation
+  high-water marks, clears owner/lease identity, and never revalidates a stale
+  CAS or worker token; fork initializes a new identity rather than cloning
+  concurrency tokens. Persistent SQLite-file and PostgreSQL contracts prove
+  those high-water marks and fork identities survive reopen, and that a writer
+  paused behind restore's transaction cannot commit against the old epoch.
+  Borrowed/`EXTERNAL_REF` state is not cloned, JIT
   tool/candidate ids are remapped and atomically published, and finite-use
-  snapshot authority is never copied. Fork revalidates/consumes actor authority
+  snapshot authority is never copied. Restore reauthorizes its composite
+  decision set, publishes reconstructable state and core event/audit evidence,
+  and settles finite uses in one AuthorityTransaction; a sink or settlement
+  failure rolls back the full unit without fallible compensation. Fork revalidates/consumes actor authority
   only in its publication transaction, global Skill/Image rows are not replaced
-  by fork, and post-commit failures are reported without claiming rollback.
+  by fork. Restore records a versioned `checkpoint_restore` publication and
+  exact operation binding in the main-state transaction; post-commit phases
+  receive ordered receipts, fence mutation admission on failure, and resume
+  under a durable startup lease. Version 2 records Object-payload reconciliation
+  before image/JIT/finalizer work; exact version-1 programs and anchors remain
+  readable without mutation. Recovery selectively rehydrates unchanged restored
+  rows from the hash-bound snapshot before general missing-payload cleanup and
+  general JIT rehydration. A terminal delivery handshake prevents a late startup
+  failure from consuming that replay, while a newer Object version is never
+  overwritten. A second successful reopen is a no-op. Bounded Object-release
+  intents use stable module-declared handler ids and idempotency keys; a missing
+  handler preserves its work and moves the publication to `manual` rather than
+  claiming completion. Fork post-commit failures are reported without claiming
+  rollback.
   Legacy minimal flow carriers canonicalize during restore; incomplete active
   pending carriers fail closed through the retryable terminal lifecycle, while
   completed history receives conservative labels without failing its process.
@@ -340,15 +585,18 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   before Object Memory ownership and store locks; image/JIT reconciliation
   remains inside that lifecycle boundary, while host release finalizers run
   outside it. Multi-image reconciliation commits cache, image rows, and artifact
-  rows as one batch or restores the complete prior cache.
+  rows as one batch or restores the complete prior cache. Durable finalizer
+  handlers are buffered by trusted module entrypoints, so they are reconstructed
+  before checkpoint publication recovery rather than waiting for startup hooks.
   The implementation uses one reservation scope for diagnostic
   inspect/diff/replay; the mapped one-shot regression directly proves inspect
   consumes the selected finite checkpoint/process read exactly once.
 - `image-self-evolution-requires-image-authority`: image registration, package
   boot, exec, and checkpoint commit require image authority and do not bake
   external authority. Failed registration/commit removes new artifacts and
-  restores replaced manifests; failed package boot/exec removes private
-  workspace and unpublished JIT source/candidate state. Registry callers and
+  restores replaced manifests; failed package boot/exec removes the exact
+  publication-owned capability, receipt, private workspace, and unpublished
+  JIT source/candidate state. Registry callers and
   getters receive isolated deep copies, concurrent same-id registrations are
   serialized and revalidated in the cache/store critical section, and
   committed-image boot does not overwrite the global Skill registry. New image
@@ -375,9 +623,28 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `explainable-operations-use-explicit-causality`: protected LLM, Tool,
   syscall, primitive, and runtime boundaries persist typed parent/child rows and
   explicit evidence links. Human/child/message waits reuse their durable
-  operation ids; reopen interrupts only orphaned running rows. Explanation
+  operation ids. Runtime publications authoritatively reconcile their linked
+  operations in the same terminal transaction: `committed` is `succeeded`,
+  `rolled_back` is `failed`, and uncertain compensation is `unknown`. Reopen
+  performs this reconciliation before interrupting only the remaining orphaned
+  running rows, and may correct an earlier terminal outcome after a crash. A
+  failed terminal transaction leaves both the publication and its exactly
+  linked operation nonterminal for recovery; an unlinked pending signal cannot
+  bypass generic operation finalization. Publication planning atomically stores
+  both immutable versioned `plan.operation_id` data and the operation's
+  publication id/kind/binding metadata; the reverse link must resolve to exactly
+  one operation. Recovery never creates a missing association: blank, missing,
+  unbound, multiply-bound, identity-mismatched, or already-bound operations fail
+  reopen closed without being rewritten. Online spawn/fork/spawn-child process,
+  event/audit, publication, and operation terminal writes share one transaction;
+  terminal sink failure compensates exactly or fences mutation until reopen.
+  Exact prebinding permits a root-spawn pre-return `pid=None` row only so its
+  terminal transaction can canonicalize the publication child PID.
+  Explanation
   completeness checks declared roles and never fills gaps from pid/time
-  proximity. Host output applies observability redaction.
+  proximity. A `process.exec` root spans snapshot, publication, boot, evidence,
+  commit, and rollback under the same admission lease. Host output applies
+  observability redaction.
 - `context-manifests-are-metadata-only`: each LLM context preparation records
   source Object selection/omission reason, version, transform, tokens, hashes,
   final context generation/Object, and compaction metadata without copying

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 import threading
@@ -29,6 +30,8 @@ from agent_libos.models import (
     RelationType,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ProcessError, ProcessMessageWaitRequired, ValidationError
+from agent_libos.process_execution import bind_process_execution
+from agent_libos.storage import SQLiteStore
 from agent_libos.substrate import LocalResourceProviderSubstrate
 from agent_libos.tools.base import SyncAgentTool, ToolContext, ToolPolicy
 
@@ -43,6 +46,13 @@ def _grant_delegable_clock_sleep(runtime: Runtime, pid: str) -> None:
 
 def _inherit_clock_sleep() -> list[dict[str, object]]:
     return [{"resource": "clock:sleep", "rights": [CapabilityRight.READ.value]}]
+
+
+def _close_fenced_runtime(runtime: Runtime) -> None:
+    """Release test resources without weakening the public recovery latch."""
+
+    result = runtime.release_recovery_diagnostics()
+    assert result["ok"] is True
 
 
 class EmptyArgs(BaseModel):
@@ -580,8 +590,10 @@ class TestObjectTasks:
             assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
 
             runner = runtime.process.get(str(waiting.runner_pid))
-            runner.status = ProcessStatus.RUNNABLE
-            runtime.store.update_process(runner)
+            runtime.process_transitions.wake(
+                runtime.process_transitions.wait_token(runner),
+                reason="test object-task scheduler isolation",
+            )
 
             assert str(waiting.runner_pid) not in runtime.scheduler.runnable_pids()
             results = runtime.scheduler.run_until_idle(lambda selected_pid: {"pid": selected_pid}, max_quanta=2)
@@ -709,8 +721,23 @@ class TestObjectTasks:
 
             monkeypatch.setattr(runtime.store, "insert_object_task", fail_insert)
 
-            with pytest.raises(RuntimeError, match="object task insert failed"):
-                runtime.object_tasks.start(child, one_time_owner, "get_working_directory", {})
+            token = runtime.store.claim_execution(
+                child,
+                owner_id="test.object-task-start-cleanup",
+            )
+            assert token is not None
+            with bind_process_execution(token):
+                with pytest.raises(RuntimeError, match="object task insert failed"):
+                    runtime.object_tasks.start(
+                        child,
+                        one_time_owner,
+                        "get_working_directory",
+                        {},
+                    )
+            assert runtime.store.complete_execution(
+                token,
+                status=ProcessStatus.RUNNABLE,
+            )
 
             assert len(runner_pids) == 1
             assert runtime.store.get_process(runner_pids[0]) is None
@@ -1271,9 +1298,48 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
-    def test_object_task_owner_watch_link_payload_does_not_grant_dst_authority(self) -> None:
+    def test_object_task_owner_watch_link_payload_does_not_grant_dst_authority(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        background_revalidation = threading.Event()
+        release_revalidation = threading.Event()
         runtime = Runtime.open("local")
         try:
+            original_notify_owner_change = runtime.object_tasks._notify_owner_change
+            original_execute_task = runtime.object_tasks._execute_task
+            gate_background_revalidation = False
+
+            async def controlled_execute_task(task_id: str) -> None:
+                if (
+                    gate_background_revalidation
+                    and not background_revalidation.is_set()
+                ):
+                    background_revalidation.set()
+                    assert release_revalidation.wait(timeout=2), (
+                        "background admission revalidation was not released"
+                    )
+                await original_execute_task(task_id)
+
+            def controlled_notify_owner_change(*args: object, **kwargs: object) -> bool:
+                nonlocal gate_background_revalidation
+                gate_background_revalidation = True
+                notified = original_notify_owner_change(*args, **kwargs)
+                assert background_revalidation.wait(timeout=2), (
+                    "resumed object task did not revalidate admission"
+                )
+                return notified
+
+            monkeypatch.setattr(
+                runtime.object_tasks,
+                "_execute_task",
+                controlled_execute_task,
+            )
+            monkeypatch.setattr(
+                runtime.object_tasks,
+                "_notify_owner_change",
+                controlled_notify_owner_change,
+            )
             parent = runtime.process.spawn(image="base-agent:v0", goal="watch link")
             _grant_process_spawn(runtime, parent)
             child = runtime.spawn_child_process(parent, "watcher")
@@ -1308,9 +1374,10 @@ class TestObjectTasks:
             assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
 
             runtime.memory.link_objects(parent, owner, RelationType.REFERENCES, dst)
+            release_revalidation.set()
             completed = runtime.object_tasks.wait(task.task_id, actor_pid=child, timeout=2)
 
-            assert completed.status == ObjectTaskStatus.SUCCEEDED
+            assert completed.status == ObjectTaskStatus.SUCCEEDED, completed.error
             payload = runtime.store.get_object(completed.result_oid).payload
             message = payload["result"]["messages"][0]
             assert message["payload"]["event"] == "linked"
@@ -1319,6 +1386,7 @@ class TestObjectTasks:
             with pytest.raises(CapabilityDenied):
                 runtime.memory.handle_for_oid(child, dst.oid, required_rights={ObjectRight.READ.value})
         finally:
+            release_revalidation.set()
             runtime.close()
 
     def test_object_task_owner_watch_disabled_does_not_notify_runner(self) -> None:
@@ -1421,6 +1489,207 @@ class TestObjectTasks:
 
             assert cancelled.status == ObjectTaskStatus.CANCELLED
             assert runtime.process.get(str(cancelled.runner_pid)).status == ProcessStatus.KILLED
+        finally:
+            runtime.close()
+
+    def test_object_task_start_bootstraps_runner_under_creator_execution_token(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="scheduler starts object task",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            token = runtime.store.claim_execution(pid, owner_id="test.object-task-start")
+            assert token is not None
+
+            with bind_process_execution(token):
+                task = runtime.object_tasks.start(
+                    pid,
+                    owner,
+                    "receive_process_messages",
+                    {"channel": "never"},
+                )
+
+            assert runtime.store.complete_execution(token, status=ProcessStatus.RUNNABLE)
+            runner = runtime.process.get(str(task.runner_pid))
+            assert runner.tool_table == {
+                "receive_process_messages": task.tool_id,
+            }
+            assert any(
+                capability.resource == f"object:{owner.oid}"
+                for capability in runtime.capability.list_subject(str(task.runner_pid))
+            )
+            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            cancelled = runtime.object_tasks.cancel(
+                task.task_id,
+                actor_pid=pid,
+                reason="test cleanup",
+            )
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            assert (
+                runtime.process.get(str(task.runner_pid)).status
+                == ProcessStatus.KILLED
+            )
+        finally:
+            runtime.close()
+
+    def test_object_task_cancel_terminalizes_runner_under_creator_execution_token(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="scheduler cancels object task",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            token = runtime.store.claim_execution(pid, owner_id="test.object-task-cancel")
+            assert token is not None
+            with bind_process_execution(token):
+                cancelled = runtime.object_tasks.cancel(
+                    task.task_id,
+                    actor_pid=pid,
+                    reason="cancel from scheduler quantum",
+                )
+
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            assert (
+                runtime.process.get(str(cancelled.runner_pid)).status
+                == ProcessStatus.KILLED
+            )
+            assert runtime.store.complete_execution(token, status=ProcessStatus.RUNNABLE)
+            settled = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert settled.status == ObjectTaskStatus.CANCELLED
+            assert (
+                runtime.process.get(str(settled.runner_pid)).status
+                == ProcessStatus.KILLED
+            )
+        finally:
+            runtime.close()
+
+    def test_object_task_cancel_fallback_uses_creator_execution_control_scope(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="scheduler cancellation fallback",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+
+            def fail_signal(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("injected object task signal failure")
+
+            monkeypatch.setattr(runtime.object_tasks._state._process, "signal", fail_signal)
+            token = runtime.store.claim_execution(
+                pid,
+                owner_id="test.object-task-cancel-fallback",
+            )
+            assert token is not None
+            with bind_process_execution(token):
+                cancelled = runtime.object_tasks.cancel(
+                    task.task_id,
+                    actor_pid=pid,
+                    reason="cancel through fallback",
+                )
+
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            runner = runtime.process.get(str(cancelled.runner_pid))
+            assert runner.status == ProcessStatus.KILLED
+            assert runner.status_message == "cancel through fallback"
+            assert runtime.store.complete_execution(token, status=ProcessStatus.RUNNABLE)
+            settled = runtime.object_tasks.wait(task.task_id, actor_pid=pid, timeout=2)
+            assert settled.status == ObjectTaskStatus.CANCELLED
+            assert runtime.process.get(str(settled.runner_pid)).status == ProcessStatus.KILLED
+        finally:
+            runtime.close()
+
+    def test_object_task_cancel_fallback_takes_over_active_runner_execution(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="cancel active object task runner",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            runner_pid = str(waiting.runner_pid)
+            runtime.object_tasks._state.set_runner_status(
+                runner_pid,
+                ProcessStatus.RUNNABLE,
+                "test active cancellation",
+            )
+            token = runtime.store.claim_execution(
+                runner_pid,
+                owner_id="test.object-task-active-runner",
+            )
+            assert token is not None
+            assert runtime.process.get(runner_pid).status == ProcessStatus.RUNNING
+
+            def fail_signal(*_args: object, **_kwargs: object) -> None:
+                raise RuntimeError("injected object task signal failure")
+
+            monkeypatch.setattr(
+                runtime.object_tasks._state._process,
+                "signal",
+                fail_signal,
+            )
+            cancelled = runtime.object_tasks.cancel(
+                task.task_id,
+                actor_pid=pid,
+                reason="cancel active runner through fallback",
+            )
+
+            assert cancelled.status == ObjectTaskStatus.CANCELLED
+            runner = runtime.process.get(runner_pid)
+            assert runner.status == ProcessStatus.KILLED
+            assert runner.status_message == "cancel active runner through fallback"
+            assert not runtime.store.complete_execution(
+                token,
+                status=ProcessStatus.RUNNABLE,
+            )
         finally:
             runtime.close()
 
@@ -1601,7 +1870,8 @@ class TestObjectTasks:
             result = runtime.shutdown(actor="test", reason="object-task-slow-drain")
 
             assert result["ok"] is False
-            assert result["object_tasks_stopped"] is False
+            assert result["admission_stopped"] is False
+            assert "object_tasks_stopped" not in result
             assert runtime.store.get_object_task(task.task_id) is not None
 
             release.set()
@@ -1611,6 +1881,430 @@ class TestObjectTasks:
         finally:
             release.set()
             runtime.close()
+
+    def test_recovery_fence_blocks_background_object_task_failure_publication(
+        self,
+    ) -> None:
+        runtime = Runtime.open("local")
+        release = threading.Event()
+        slow_tool = SlowSyncSideEffectTool(release)
+        try:
+            handle = runtime.tools.register_tool(
+                slow_tool,
+                registered_by="test",
+                ephemeral=True,
+            )
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="fence background object task",
+            )
+            _grant_process_spawn(runtime, pid)
+            runtime.tools.configure_process_tools(pid, [handle], assigned_by="test")
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "slow_sync_side_effect_for_object_task",
+                {},
+            )
+            assert slow_tool.started.wait(timeout=1.0)
+            before_task = runtime.store.get_object_task(task.task_id)
+            assert before_task is not None
+            assert before_task.status == ObjectTaskStatus.RUNNING
+            assert before_task.runner_pid is not None
+            before_runner = runtime.store.get_process(str(before_task.runner_pid))
+            assert before_runner is not None
+            before_runner_identity = (
+                before_runner.status,
+                before_runner.revision,
+                before_runner.state_generation,
+                before_runner.execution_generation,
+                before_runner.execution_owner_id,
+                before_runner.execution_lease_id,
+            )
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.store.list_events()
+
+            with runtime.lifecycle.admit():
+                runtime.lifecycle.mark_recovery_required(
+                    publication_id="publication-object-task-worker-fence",
+                )
+            with pytest.raises(
+                RuntimeError,
+                match="recovery diagnostics release requires admission drain",
+            ):
+                runtime.release_recovery_diagnostics()
+            assert runtime.object_tasks._closing is False
+            release.set()
+            assert slow_tool.finished.wait(timeout=2.0)
+            deadline = time.monotonic() + 2.0
+            while runtime.object_tasks._has_active_future(task.task_id):
+                if time.monotonic() >= deadline:
+                    pytest.fail("fenced object task worker did not settle")
+                time.sleep(0.01)
+
+            after_task = runtime.store.get_object_task(task.task_id)
+            assert after_task == before_task
+            after_runner = runtime.store.get_process(str(before_task.runner_pid))
+            assert after_runner is not None
+            assert (
+                after_runner.status,
+                after_runner.revision,
+                after_runner.state_generation,
+                after_runner.execution_generation,
+                after_runner.execution_owner_id,
+                after_runner.execution_lease_id,
+            ) == before_runner_identity
+            assert runtime.store.list_audit() == before_audit
+            assert runtime.store.list_events() == before_events
+        finally:
+            release.set()
+            _close_fenced_runtime(runtime)
+
+    def test_recovery_release_settles_queued_object_task_without_writes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        db_path = tmp_path / "queued-object-task-recovery-release.sqlite"
+        runtime = Runtime.open(db_path)
+        loop_blocked = threading.Event()
+        release_loop = threading.Event()
+        stop_queued = threading.Event()
+        loop_errors: list[dict[str, object]] = []
+        release_result: list[dict[str, object]] = []
+        release_error: list[BaseException] = []
+        release_thread: threading.Thread | None = None
+        fenced = False
+        released = False
+        try:
+            loop = runtime.object_tasks._loop
+            loop.call_soon_threadsafe(
+                loop.set_exception_handler,
+                lambda _loop, context: loop_errors.append(dict(context)),
+            )
+
+            def block_loop() -> None:
+                loop_blocked.set()
+                release_loop.wait(timeout=10)
+
+            loop.call_soon_threadsafe(block_loop)
+            assert loop_blocked.wait(timeout=2), "object task loop did not block"
+
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="queue object task before recovery release",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "get_working_directory",
+                {},
+            )
+            queued = runtime.store.get_object_task(task.task_id)
+            assert queued is not None
+            assert queued.status == ObjectTaskStatus.QUEUED
+            assert queued.runner_pid is not None
+            runner = runtime.store.get_process(str(queued.runner_pid))
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.store.list_events()
+            bridge_future = runtime.object_tasks._futures[task.task_id]
+
+            with runtime.lifecycle.admit():
+                runtime.lifecycle.mark_recovery_required(
+                    publication_id="publication-object-task-queued-release",
+                )
+            fenced = True
+
+            original_call_soon_threadsafe = loop.call_soon_threadsafe
+
+            def observe_stop_barrier(
+                callback: Callable[..., object],
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                handle = original_call_soon_threadsafe(
+                    callback,
+                    *args,
+                    **kwargs,
+                )
+                if getattr(callback, "__name__", "") == "stop_if_quiescent":
+                    stop_queued.set()
+                return handle
+
+            monkeypatch.setattr(
+                loop,
+                "call_soon_threadsafe",
+                observe_stop_barrier,
+            )
+
+            def release_runtime() -> None:
+                try:
+                    release_result.append(runtime.release_recovery_diagnostics())
+                except BaseException as exc:
+                    release_error.append(exc)
+
+            release_thread = threading.Thread(target=release_runtime)
+            release_thread.start()
+            assert stop_queued.wait(timeout=2), "recovery stop barrier was not queued"
+            release_loop.set()
+            release_thread.join(timeout=5)
+
+            assert not release_thread.is_alive()
+            assert release_error == []
+            assert release_result and release_result[0]["ok"] is True
+            released = True
+            assert bridge_future.done()
+            if not bridge_future.cancelled():
+                assert isinstance(bridge_future.exception(timeout=0), RuntimeError)
+            assert not any(
+                "destroyed" in str(context.get("message", "")).lower()
+                and "pending" in str(context.get("message", "")).lower()
+                for context in loop_errors
+            )
+        finally:
+            release_loop.set()
+            if release_thread is not None and release_thread.is_alive():
+                release_thread.join(timeout=5)
+            if not released:
+                if fenced:
+                    _close_fenced_runtime(runtime)
+                else:
+                    runtime.close()
+
+        reopened = SQLiteStore(db_path)
+        try:
+            assert reopened.get_object_task(task.task_id) == queued
+            assert reopened.get_process(str(queued.runner_pid)) == runner
+            assert reopened.list_audit() == before_audit
+            assert reopened.list_events() == before_events
+        finally:
+            reopened.close()
+
+    def test_recovery_release_retries_after_transient_executor_drain(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            object_tasks=replace(
+                DEFAULT_CONFIG.object_tasks,
+                shutdown_join_timeout_s=0.01,
+            ),
+        )
+        db_path = tmp_path / "object-task-recovery-release-retry.sqlite"
+        runtime = Runtime.open(db_path, config=config)
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        released = False
+        fenced = False
+        transient_future: Future[None] | None = None
+        try:
+            def blocking_transient_work() -> None:
+                worker_started.set()
+                release_worker.wait(timeout=10)
+
+            async def run_transient_work() -> None:
+                await runtime.object_tasks._loop.run_in_executor(
+                    None,
+                    blocking_transient_work,
+                )
+
+            transient_future = asyncio.run_coroutine_threadsafe(
+                run_transient_work(),
+                runtime.object_tasks._loop,
+            )
+            assert worker_started.wait(timeout=2), "transient executor work did not start"
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.store.list_events()
+
+            with runtime.lifecycle.admit():
+                runtime.lifecycle.mark_recovery_required(
+                    publication_id="publication-object-task-release-retry",
+                )
+            fenced = True
+
+            first = runtime.release_recovery_diagnostics()
+
+            assert first == {
+                "ok": False,
+                "already_released": False,
+                "reason": (
+                    "runtime.recovery_required:"
+                    "publication-object-task-release-retry"
+                ),
+                "recovery_required": True,
+                "object_tasks_released": False,
+            }
+            assert runtime.object_tasks._closing is True
+            assert runtime.object_tasks._closed is False
+
+            release_worker.set()
+            deadline = time.monotonic() + 2
+            while runtime.object_tasks._thread.is_alive():
+                if time.monotonic() >= deadline:
+                    pytest.fail("transient executor did not drain after release")
+                time.sleep(0.01)
+
+            retry = runtime.release_recovery_diagnostics()
+            assert retry["ok"] is True
+            released = True
+            assert transient_future.done()
+            if not transient_future.cancelled():
+                transient_future.exception(timeout=0)
+        finally:
+            release_worker.set()
+            if not released:
+                if fenced:
+                    _close_fenced_runtime(runtime)
+                else:
+                    runtime.close()
+
+        reopened = SQLiteStore(db_path)
+        try:
+            assert reopened.list_audit() == before_audit
+            assert reopened.list_events() == before_events
+        finally:
+            reopened.close()
+
+    def test_close_failed_get_does_not_retry_terminal_notification(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            notifications = runtime.object_tasks._notifications
+            original_notify = notifications.notify
+
+            def fail_completion_notification(
+                task: ObjectTask,
+                *,
+                phase: str,
+            ) -> ObjectTask:
+                if phase == "completed":
+                    raise RuntimeError("injected terminal notification failure")
+                return original_notify(task, phase=phase)
+
+            monkeypatch.setattr(
+                notifications,
+                "notify",
+                fail_completion_notification,
+            )
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="fence terminal notification retry",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "get_working_directory",
+                {},
+            )
+            deadline = time.monotonic() + 2.0
+            while True:
+                terminal = runtime.store.get_object_task(task.task_id)
+                if (
+                    terminal is not None
+                    and terminal.status == ObjectTaskStatus.SUCCEEDED
+                    and not runtime.object_tasks._has_active_future(task.task_id)
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    pytest.fail("object task terminal notification did not settle")
+                time.sleep(0.01)
+            assert terminal.notification.status == ObjectTaskNotificationStatus.FAILED
+            monkeypatch.setattr(notifications, "notify", original_notify)
+            before_task = terminal
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.store.list_events()
+
+            with runtime.lifecycle.admit():
+                runtime.lifecycle.mark_recovery_required(
+                    publication_id="publication-object-task-notification-fence",
+                )
+
+            with pytest.raises(RuntimeError, match="state=close_failed"):
+                runtime.object_tasks.get(task.task_id)
+
+            assert runtime.store.get_object_task(task.task_id) == before_task
+            assert runtime.store.list_audit() == before_audit
+            assert runtime.store.list_events() == before_events
+        finally:
+            _close_fenced_runtime(runtime)
+
+    def test_close_failed_public_object_task_shutdown_publishes_no_cancellation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "object-task-recovery-release.sqlite"
+        runtime = Runtime.open(db_path)
+        fenced = False
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="fence public object task shutdown",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            task = runtime.object_tasks.start(
+                pid,
+                owner,
+                "receive_process_messages",
+                {"channel": "never"},
+            )
+            waiting = runtime.object_tasks.wait(
+                task.task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            assert waiting.runner_pid is not None
+            before_task = runtime.store.get_object_task(task.task_id)
+            before_runner = runtime.store.get_process(str(waiting.runner_pid))
+            before_audit = runtime.store.list_audit()
+            before_events = runtime.store.list_events()
+
+            with runtime.lifecycle.admit():
+                runtime.lifecycle.mark_recovery_required(
+                    publication_id="publication-object-task-shutdown-fence",
+                )
+            fenced = True
+
+            with pytest.raises(RuntimeError, match="state=close_failed"):
+                runtime.object_tasks.shutdown()
+            with pytest.raises(
+                RuntimeError,
+                match="invalid ObjectTask lifecycle shutdown capability",
+            ):
+                runtime.object_tasks._shutdown_for_lifecycle(object())
+            with pytest.raises(
+                RuntimeError,
+                match="invalid ObjectTask lifecycle shutdown capability",
+            ):
+                runtime.object_tasks._abandon_for_recovery(object())
+
+            assert runtime.store.get_object_task(task.task_id) == before_task
+            assert runtime.store.get_process(str(waiting.runner_pid)) == before_runner
+            assert runtime.store.list_audit() == before_audit
+            assert runtime.store.list_events() == before_events
+        finally:
+            if fenced:
+                _close_fenced_runtime(runtime)
+            else:
+                runtime.close()
+
+        reopened = SQLiteStore(db_path)
+        try:
+            assert reopened.get_object_task(task.task_id) == before_task
+            assert reopened.get_process(str(waiting.runner_pid)) == before_runner
+            assert reopened.list_audit() == before_audit
+            assert reopened.list_events() == before_events
+        finally:
+            reopened.close()
 
     def test_object_task_per_object_concurrency_limit_is_enforced(self) -> None:
         config = replace(

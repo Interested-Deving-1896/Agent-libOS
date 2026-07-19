@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+import pytest
 from pydantic import BaseModel
 
 from agent_libos import Runtime
@@ -61,6 +62,11 @@ def test_skill_activation_acquires_registry_lifecycle_before_store(
             activation_attempted_lifecycle,
         )
         runtime._registry_lifecycle_lock = observed_lifecycle_lock
+        monkeypatch.setattr(
+            runtime.skills,
+            "_lifecycle_lock",
+            observed_lifecycle_lock,
+        )
         monkeypatch.setattr(
             runtime.tools,
             "_registry_lifecycle_lock_value",
@@ -135,4 +141,53 @@ def test_skill_activation_acquires_registry_lifecycle_before_store(
         for thread in threads:
             thread.join(timeout=0.1)
         if not any(thread.is_alive() for thread in threads):
+            runtime.close()
+
+
+def test_skill_activation_failure_releases_registry_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_dir = write_skill_package(tmp_path, "registry-lock-failure", allowed_tools=["echo"])
+    runtime = Runtime.open("local")
+    registration_finished = threading.Event()
+    registration_errors: list[BaseException] = []
+    thread: threading.Thread | None = None
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="verify failed activation unlocks")
+        runtime.skills.register_skill_from_path(skill_dir, actor="test", require_capability=False)
+        original_get_skill = runtime.skills._get_skill
+
+        def fail_after_skill_read(skill_id: str) -> Any:
+            original_get_skill(skill_id)
+            raise RuntimeError("injected activation preflight failure")
+
+        monkeypatch.setattr(runtime.skills, "_get_skill", fail_after_skill_read)
+        with pytest.raises(RuntimeError, match="injected activation preflight failure"):
+            runtime.skills.activate_skill(
+                pid,
+                "registry-lock-failure",
+                actor=pid,
+                require_capability=False,
+            )
+
+        def register_after_failure() -> None:
+            try:
+                runtime.tools.register_tool(_ConcurrentRegistrationTool())
+            except BaseException as exc:
+                registration_errors.append(exc)
+            finally:
+                registration_finished.set()
+
+        thread = threading.Thread(target=register_after_failure, daemon=True)
+        thread.start()
+        assert registration_finished.wait(timeout=2)
+        thread.join(timeout=1)
+        assert not thread.is_alive()
+        assert registration_errors == []
+        assert runtime.tools.resolve("concurrent_registration_tool").name == "concurrent_registration_tool"
+    finally:
+        if thread is not None:
+            thread.join(timeout=0.1)
+        if thread is None or not thread.is_alive():
             runtime.close()

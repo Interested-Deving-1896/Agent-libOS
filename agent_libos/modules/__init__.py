@@ -4,6 +4,7 @@ from agent_libos.modules.journal import RegistrationJournal, RegistrationRollbac
 from agent_libos.modules.loader import ModuleLoader
 from agent_libos.modules.registry import RuntimeModuleRegistry
 from agent_libos.modules.schema import LoadedModule, ModuleManifest, ModuleProvides, ModuleSource
+from agent_libos.models import RuntimeModule, RuntimeModuleRegistration, RuntimeModuleStatus
 
 __all__ = [
     "LoadedModule",
@@ -20,6 +21,9 @@ __all__ = [
     "RegistrationJournal",
     "RegistrationRollbackError",
     "RuntimeModuleRegistry",
+    "RuntimeModule",
+    "RuntimeModuleRegistration",
+    "RuntimeModuleStatus",
     "StartupHook",
     "SyscallHandler",
 ]

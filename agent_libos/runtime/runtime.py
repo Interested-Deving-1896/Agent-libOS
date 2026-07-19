@@ -14,25 +14,39 @@ from agent_libos.llm.client import LLMClient
 from agent_libos.models import (
     AgentImage,
     CapabilityRight,
+    CapabilityUseReservationRecoverySummary,
     DataFlowContext,
     DataLabels,
+    ExternalEffectRecoverySummary,
     ForkMode,
     MemoryView,
     MemoryViewSpec,
     ObjectHandle,
     ObjectMetadata,
+    ObjectPayloadRecoverySummary,
+    ObjectTaskRecoverySummary,
     SinkTrustRule,
     SinkTrustSpec,
-    ViewMode,
+    ResourceUsageReservationRecoverySummary,
+    StaleExecutionRecoverySummary,
+    StaleOperationRecoverySummary,
     WorkflowRunResult,
 )
-from agent_libos.models.exceptions import HumanApprovalRequired, NotFound, ProcessMessageWaitRequired, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import (
+    HumanApprovalRequired,
+    NotFound,
+    ProcessMessageWaitRequired,
+    ProcessWaitRequired,
+    RuntimeRecoveryRequired,
+    ValidationError,
+)
+from agent_libos.process_execution import current_process_execution_token
 from agent_libos.storage import RuntimeStore
 from agent_libos.substrate import ResourceProviderSubstrate
-from agent_libos.utils.ids import utc_now
 
 if TYPE_CHECKING:
     from agent_libos.capability.manager import CapabilityManager
+    from agent_libos.evidence import PayloadRetentionMaintenance
     from agent_libos.human.manager import HumanObjectManager
     from agent_libos.llm.executor import LLMProcessExecutor
     from agent_libos.llm.profiles import LLMProfileRegistry
@@ -63,6 +77,7 @@ if TYPE_CHECKING:
     from agent_libos.runtime.operation_manager import OperationManager
     from agent_libos.runtime.process_launch import ProcessLaunchService
     from agent_libos.runtime.process_manager import ProcessManager
+    from agent_libos.process_transition import ProcessTransitionService
     from agent_libos.runtime.ratings import AgentRatingManager
     from agent_libos.runtime.resource_manager import ResourceManager
     from agent_libos.runtime.scheduler import SimpleScheduler
@@ -126,6 +141,7 @@ class Runtime:
     protected_operations: ProtectedOperationSDK
     external_primitive_boundary_names: frozenset[str]
     process: ProcessManager
+    process_transitions: ProcessTransitionService
     messages: ProcessMessageManager
     human: HumanObjectManager
     clock: ClockPrimitive
@@ -147,13 +163,33 @@ class Runtime:
     modules: RuntimeModuleRegistry
     image_boot: ImageBootService
     llm: LLMProcessExecutor
-    recovered_prepared_operations: list[str]
-    recovered_resource_usage_reservations: list[str]
+    recovered_prepared_operations: ExternalEffectRecoverySummary
+    recovered_missing_object_payloads: ObjectPayloadRecoverySummary
+    recovered_object_tasks: ObjectTaskRecoverySummary
+    recovered_capability_use_reservations: CapabilityUseReservationRecoverySummary
+    recovered_resource_usage_reservations: ResourceUsageReservationRecoverySummary
     recovered_exec_publications: list[str]
     recovered_runtime_publications: list[str]
-    recovered_stale_executions: list[str]
-    reconciled_external_effects: list[Any]
+    recovered_checkpoint_restore_publications: list[str]
+    recovered_stale_operations: StaleOperationRecoverySummary
+    recovered_stale_executions: StaleExecutionRecoverySummary
+    reconciled_external_effects: ExternalEffectRecoverySummary
+    payload_retention: PayloadRetentionMaintenance
     explainable_boundary_names: frozenset[str]
+    mutation_admission_boundary_names: frozenset[str]
+    _recovery_diagnostics_release_capability: object
+
+    @classmethod
+    def allocate_unassembled(cls) -> "Runtime":
+        """Allocate a builder-owned host without running Runtime assembly.
+
+        RuntimeBuilder uses this hook for both synchronous and asynchronous
+        construction. Subclasses that override ``__init__`` must override this
+        hook as well and initialize subclass-only fields here; builder assembly
+        intentionally never calls a custom constructor around a live Runtime.
+        """
+
+        return cls.__new__(cls)
 
     def __init__(
         self,
@@ -199,6 +235,29 @@ class Runtime:
             trusted_module_sha256=trusted_module_sha256,
         ).open(target)
 
+    @classmethod
+    async def aopen(
+        cls,
+        target: str | Path | None = None,
+        substrate: ResourceProviderSubstrate | None = None,
+        config: AgentLibOSConfig | None = None,
+        module_manifests: list[str | Path] | tuple[str | Path, ...] | None = None,
+        trusted_modules: list[str] | tuple[str, ...] | None = None,
+        trusted_module_sha256: list[str] | tuple[str, ...] | None = None,
+    ) -> "Runtime":
+        """Assemble a Runtime on the caller loop with loop-affine cleanup."""
+
+        from agent_libos.runtime.builder import RuntimeBuilder
+
+        return await RuntimeBuilder.configured(
+            cls,
+            config=config,
+            substrate=substrate,
+            module_manifests=module_manifests,
+            trusted_modules=trusted_modules,
+            trusted_module_sha256=trusted_module_sha256,
+        ).aopen(target)
+
     def shutdown(self, *, actor: str = "runtime", reason: str = "runtime.shutdown") -> dict[str, Any]:
         """Shut down this host Runtime instance.
 
@@ -217,6 +276,25 @@ class Runtime:
     def close(self) -> dict[str, Any]:
         """Compatibility alias for shutdown(); prefer Runtime.shutdown()."""
         return self.shutdown(actor="runtime.close", reason="runtime.close")
+
+    def release_recovery_diagnostics(self) -> dict[str, Any]:
+        """Release a recovery-fenced Runtime for same-process reopen.
+
+        Ordinary shutdown remains fail-closed while recovery is required. This
+        explicit handoff preserves durable diagnostics and releases only the
+        current Runtime instance's transient workers and store ownership.
+        """
+
+        return self.lifecycle.release_recovery_diagnostics(
+            capability=self._recovery_diagnostics_release_capability,
+        )
+
+    async def arelease_recovery_diagnostics(self) -> dict[str, Any]:
+        """Async recovery diagnostics handoff variant."""
+
+        return await self.lifecycle.arelease_recovery_diagnostics(
+            capability=self._recovery_diagnostics_release_capability,
+        )
 
     def _shutdown_component(self, component: Any) -> bool:
         return self.lifecycle.shutdown_component(component)
@@ -643,17 +721,7 @@ class Runtime:
         )
 
     def _add_handle_to_process_view(self, pid: str, handle: ObjectHandle) -> None:
-        process = self.process.get(pid)
-        if process.memory_view is None:
-            process.memory_view = self.memory.create_view(pid, [handle], mode=ViewMode.READ_ONLY)
-            process.updated_at = utc_now()
-            self.store.patch_process(
-                pid,
-                {"memory_view": process.memory_view, "updated_at": process.updated_at},
-                expected_revision=process.revision,
-            )
-        else:
-            self.store.append_process_memory_roots(pid, [handle])
+        self.process.add_handle_to_process_view(pid, handle)
 
     def add_handle_to_process_view(self, pid: str, handle: ObjectHandle) -> None:
         """Publish an object handle into a process view."""
@@ -783,18 +851,28 @@ class Runtime:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
     ) -> Any:
-        return self.image_boot.exec(
-            pid,
-            image,
-            args=args,
-            goal=goal,
-            preserve_memory=preserve_memory,
-            preserve_capabilities=preserve_capabilities,
-            llm_profile_id=llm_profile_id,
-            source_oids=source_oids,
-            source_labels=source_labels,
-            source_context=source_context,
-        )
+        with self.lifecycle.admit():
+            try:
+                return self.image_boot.exec(
+                    pid,
+                    image,
+                    execution_token=current_process_execution_token(),
+                    args=args,
+                    goal=goal,
+                    preserve_memory=preserve_memory,
+                    preserve_capabilities=preserve_capabilities,
+                    llm_profile_id=llm_profile_id,
+                    source_oids=source_oids,
+                    source_labels=source_labels,
+                    source_context=source_context,
+                )
+            except RuntimeRecoveryRequired as error:
+                if self.image_boot.fence_recovery_required_signal(
+                    error,
+                    pid=pid,
+                ):
+                    assert self.lifecycle.state == "close_failed"
+                raise
 
     def spawn_child_process(
         self,

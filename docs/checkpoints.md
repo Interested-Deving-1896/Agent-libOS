@@ -165,6 +165,12 @@ Default images expose low-risk create/list/inspect/diff tools. Restore and fork
 tools are registered but require explicit tool visibility plus checkpoint
 authority.
 
+Checkpoint inspect process rows expose the snapshot's canonical tagged
+`wait_state` and `outcome` mappings together with `state_generation`. The
+manager strictly decodes the persisted snapshot JSON before projecting these
+fields; CLI, GUI, Tool, and JIT callers therefore observe the frozen snapshot
+state rather than a reconstructed compatibility message or current live state.
+
 JIT syscalls:
 
 - `checkpoint.create`
@@ -222,31 +228,144 @@ Restore has three explicit phases:
 
 1. **Preflight** validates checkpoint authority, required Runtime Modules,
    image artifacts, JIT metadata, and the absence of active scoped ObjectTasks.
-   Checkpoint `admin` and all changed-image rights are reserved as one
-   deduplicated set. Restoring over an image id that is already registered
+   Checkpoint `admin` and all changed-image rights are collected as one
+   deduplicated decision set. Restoring over an image id that is already registered
    requires `admin` on that exact `image:<image_id>` resource; reintroducing a
-   missing image requires `write`. A preflight failure restores those exact
-   reservations and makes no reconstructable-state changes.
+   missing image requires `write`.
 2. **Commit** replaces scoped SQL rows and in-memory Object payloads in one
    transaction. Only owned Objects/namespaces are deleted or replaced; borrowed
-   roots remain references to current lender state. The composite finite-use
-   set is settled in this transaction; a commit failure rolls back both state
-   and authority settlement.
-3. **Post-commit reconciliation** atomically reconciles captured image cache,
-   image rows, and artifact rows, then restores and prunes process-local JIT
-   registries while still holding the lifecycle lock. It never applies captured
-   global Skill rows. The lifecycle lock is released before running release
-   finalizers for scoped Objects removed by the commit, because finalizers may
-   call host code. These operations cannot undo the committed process-state
-   transaction. The restore event and final restore audit are also post-commit
-   observability sinks; their failure cannot undo that transaction either.
+   roots remain references to current lender state. The complete decision set is
+   reauthorized and any finite-use authority is reserved inside the same outer
+   AuthorityTransaction. Main state, the core restore event/audit, authority
+   settlement, an exact `checkpoint_restore` runtime-publication plan, and its
+   one-to-one `checkpoint.restore` operation binding commit together. The plan
+   records the immutable checkpoint digest, scoped process ids, stale JIT ids,
+   ordered phases, and bounded release-finalizer intents. The publication moves
+   from `planning/planned` to
+   `reconciliation_pending/main_state_committed` in that same transaction. A
+   prepare, evidence, link, publication, or settlement failure rolls back all
+   of them without a separate compensation transaction. If the authority/UoW
+   exit reports an exception after that transaction actually committed, restore
+   confirms the durable publication before handling the exception. A confirmed
+   main commit is fenced and terminalized as recoverable failure; an uncertain
+   confirmation remains nonterminal and fail-closed for startup recovery.
+3. **Durable post-commit reconciliation** uses the version-2 ordered program
+   `object_payload_reconciliation`, `image_reconciliation`,
+   `jit_source_reconciliation`, `jit_pruning`, and
+   `object_release_finalizers`. The first receipt records that the payload-aware
+   main transaction published the restored Object markers and process-local
+   payload cache. The remaining registry phases atomically reconcile captured
+   image cache, image rows, artifact rows, and process-local JIT state while
+   still holding the lifecycle lock. It never applies captured global Skill
+   rows. The lifecycle lock is released before running release finalizers for
+   scoped Objects removed by the commit, because finalizers may call host code.
+   These operations cannot undo the committed process-state transaction. Every
+   completed phase, and every completed finalizer work item, receives an ordered
+   durable receipt before the next phase. Existing image artifacts must exactly
+   match the captured payload, kind, digest, and metadata.
+   Registry/JIT/prune/finalizer failures cannot undo the committed transaction:
+   the publication remains recoverable, the linked operation is `unknown`, and
+   mutation admission is fenced until the Runtime is reopened.
 
 A successful commit returns `main_state_committed: true`. If every
 post-commit phase succeeds, `status` is `restored`; otherwise `status` is
 `restored_with_warnings` and `post_commit_failures` identifies each failed
-reconciliation/event/audit phase and error. Each recordable failure appends a
+reconciliation/finalizer phase and error. Each recordable failure appends a
 `checkpoint.restore.post_commit_failure` audit record. Callers must not retry a
 `restored_with_warnings` result as though the main restore had rolled back.
+The result also returns `publication_id` and `reconciliation_pending: true`;
+the current Runtime is in `close_failed`. Ordinary `close()`/`shutdown()` stays
+fail closed and deliberately retains the diagnostic store and backend lease.
+After diagnostics have been captured, the owner must call
+`Runtime.release_recovery_diagnostics()` (or await
+`Runtime.arelease_recovery_diagnostics()`) before a fresh Runtime can reopen the
+target and perform authoritative startup recovery.
+Post-commit control-flow interruptions are re-raised without type conversion
+after the recovery fence is installed. If reporting that fence also fails, the
+primary interruption and secondary fence error are preserved together in a
+`BaseExceptionGroup`. A secondary diagnostic failure is grouped with the
+primary interruption and the exact pending-publication signal, so the operation
+wrapper cannot independently finalize a still-recoverable restore. Conversely,
+an exception reported after the final publication/operation transaction commits
+is re-raised without installing a recovery fence only after strict read-only
+confirmation of the complete receipt transcript, plan anchor, exact binding,
+and terminal successful operation.
+
+Startup claims incomplete checkpoint-restore publications only while the
+lifecycle is `recovering` and the calling context holds its opaque internal
+recovery lease. The recovery entry point fails before reading or claiming a
+publication when called on an open Runtime; online restore and startup recovery
+therefore cannot compete for the same phase lease. With the backend's exclusive
+Runtime lease, startup recovery also takes a durable per-attempt publication
+lease. It resumes only missing receipts, then commits the publication and
+changes the exact linked operation from `unknown` to `succeeded` in one
+transaction. Before the general missing-payload sweep, recovery reloads the
+hash-bound checkpoint and rehydrates volatile payloads only for an exact live
+Object row produced by that restore. A row with the same immutable creation
+identity and a strictly higher version, including a versioned ownership
+transfer, or an explicitly released row is treated as superseding the old
+delivery and is not overwritten. A missing row, lower version, same-version
+drift, creation-identity drift, or malformed payload marker fails startup
+closed. A skipped newer row remains cache-missing after reopen, so the ordinary
+recovery sweep releases it, removes its links, and revokes its Object
+capabilities.
+
+The terminal receipt then carries a `payload_delivery` handshake. Recovery
+publishes `pending` after selective hydration. Once startup hooks and workers
+are ready, startup creates one durable `preparing` delivery attempt and moves
+the backlog through hard-bounded, indexed keyset pages from `pending` to
+`confirmed` and then `completed`. Each page retains the exact attempt identity;
+ordinary page transactions do not hold the lifecycle condition. Delivery state
+and operation reconciliation are independent projections: delivery transitions
+preserve `operation_reconciled`, and the separate terminal-repair pass repairs
+any false marker in `pending`, `confirmed`, or `completed` before OPEN.
+
+After every page completes, one outer Store transaction changes the exact
+attempt from `preparing` to `acked`. The lifecycle commit guard publishes OPEN
+while holding admission closed through that same commit, so the durable ACK and
+the in-memory OPEN transition have one linearization point. If the backend
+reports a commit error, startup performs an exact typed readback of that attempt
+identity. `acked` means the commit crossed the linearization point: the current
+cache-holding Runtime repairs its in-memory lifecycle to OPEN and succeeds,
+without compensating or replaying payloads. `preparing` proves that compensation
+is still authorized, so its `confirmed` or `completed` rows return to `pending`
+and the attempt becomes `aborted`. A missing, `aborted`, malformed, mismatched,
+or unreadable control row fails closed without changing publication rows. A
+process crash after an `acked` attempt is likewise treated as a previously
+completed OPEN; a later startup does not replay that consumed delivery.
+
+When there is no payload backlog, startup has no durable ACK to publish and uses
+the rollback-safe `in_memory_open_scope` under the exact startup lease. A late
+failure before ACK compensates the active attempt so the next startup can replay
+the checkpoint payloads. If compensation cannot be confirmed, failed-assembly
+cleanup retains exact Store ownership and exposes an explicit cleanup-required
+handle instead of allowing an ambiguous reopen.
+
+This runs after process launch/exec publication recovery but before general JIT
+rehydration, so a stale ephemeral tool cannot be loaded between reopen and
+pruning. Committed restore receipts whose operation-reconciliation marker is
+false are revalidated through exact, indexed keyset pages before generic
+stale-operation interruption. Their strict plan, immutable receipt-side plan
+digest, complete ordered phase/finalizer transcript, checkpoint snapshot
+identity, publication PID, and exact operation binding must all still agree.
+The reader accepts the exact legacy version-1 phase program as well as version
+2; it verifies a version-1 anchor with the original version-1 bytes and never
+rewrites that immutable plan or anchor during recovery. Any mixed version/order
+shape is rejected before a recovery claim or callback. Generic Host publication
+APIs reject checkpoint-restore insert, transition, recovery-claim, artifact,
+plan, and operation-marker writes; only the storage-owned writer injected into
+the reconciler can advance this state machine. Even out-of-band plan or receipt
+corruption on a marker-false row is caught before replay or terminal operation
+repair. Direct database writes that also forge or preserve a completed marker
+remain outside the application-integrity boundary.
+Failed/manual receipts remain in forward recovery. A second reopen observes a
+terminal publication and performs no work.
+Corrupt plans, invalid receipts, changed checkpoint artifacts, lost recovery
+leases, and exhausted attempts fail startup closed rather than guessing.
+Authorized recovery calls on one Runtime are single-flight, preventing two
+internal startup workers from reusing the same recovery lease and running
+finalizer work twice.
+Cross-Runtime concurrency remains outside the documented one-writer boundary.
 
 Legacy flow carriers are normalized while snapshot rows are prepared. A valid
 minimal pending/message label object is written back in canonical form so later
@@ -304,10 +423,21 @@ hash-bound resume metadata. It can resume only while the matching prepared
 request is still held by the current executor; a reopen, or a restore that
 discards that in-memory generation, fails closed before provider dispatch.
 
-Scoped Object Memory rows removed by restore run registered release finalizers
-after the main state commit. A finalizer failure is surfaced through the
-post-commit warning contract above so operators can reconcile host resources
-such as PTY sessions without confusing that failure with a rolled-back restore.
+Scoped Object Memory rows removed by restore use restart-safe release
+finalizers. A trusted module declares stable handler ids in
+`provides.durable_object_release_finalizers` and buffers each
+`bind_durable_object_release_finalizer(id, prepare, finalize)` registration at
+module entrypoint time, before startup publication recovery. Before deleting an
+Object, the side-effect-free `prepare` callback freezes a bounded JSON intent,
+Object id/version, digest, and stable idempotency key into the publication.
+`finalize` may run at least once and always receives that same key. Per-item
+receipts prevent already-acknowledged work from running again.
+
+An anonymous `bind_object_release_finalizer` cannot safely survive a crash, so
+restore rejects deletion while one is registered. If a persisted stable handler
+cannot be reconstructed on reopen, the publication moves to `manual` while
+retaining the exact work item and the linked operation remains `unknown`; it is
+never silently marked committed.
 
 If irreversible provider effects exist after the checkpoint, restore still
 continues by default. The irreversible effects stay in append-only history and
@@ -446,6 +576,10 @@ Checkpoint defaults live in `CheckpointDefaults`:
 - payload capture limit,
 - snapshot hard byte limit,
 - diff preview size.
+
+The current checkpoint snapshot codec is version 4. Version 4 adds canonical
+typed process wait/outcome fields and their state generation; earlier snapshot
+shapes are rejected rather than interpreted using `status_message` strings.
 
 Checkpoint list callers may request only positive integer limits no larger
 than `CheckpointDefaults.list_limit`; `0`, negative values, booleans, and larger

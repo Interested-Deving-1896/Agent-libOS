@@ -70,6 +70,97 @@ class ToolHandle:
     scope: str = "ephemeral_process"
 
 
+@dataclass(frozen=True, slots=True)
+class JITRehydrationArtifact:
+    """Exact durable JIT rows needed to validate one process binding."""
+
+    tool_id: ToolID
+    name: str
+    scope: str
+    candidate_match_count: int
+    candidate_id: str | None = None
+    candidate_pid: PID | None = None
+    source_code: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("tool_id", "name", "scope"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"JIT rehydration artifact {field_name} must be non-empty")
+        if (
+            isinstance(self.candidate_match_count, bool)
+            or not isinstance(self.candidate_match_count, int)
+            or self.candidate_match_count < 0
+        ):
+            raise ValueError("JIT rehydration candidate count must be non-negative")
+        candidate_values = (self.candidate_id, self.candidate_pid, self.source_code)
+        if self.candidate_match_count == 1:
+            if (
+                not isinstance(self.candidate_id, str)
+                or not self.candidate_id
+                or not isinstance(self.candidate_pid, str)
+                or not self.candidate_pid
+                or not isinstance(self.source_code, str)
+            ):
+                raise ValueError(
+                    "exact JIT rehydration candidate metadata is incomplete"
+                )
+        elif any(value is not None for value in candidate_values):
+            raise ValueError(
+                "ambiguous JIT rehydration candidates cannot expose candidate metadata"
+            )
+
+    @property
+    def rehydratable(self) -> bool:
+        return self.candidate_match_count == 1 and bool(self.source_code)
+
+
+@dataclass(frozen=True, slots=True)
+class JITRehydrationRecord:
+    """Bounded diagnostic identity for one restored or pruned JIT binding."""
+
+    pid: PID
+    tool_id: ToolID
+    name: str
+
+    def __post_init__(self) -> None:
+        for field_name in ("pid", "tool_id", "name"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"JIT rehydration record {field_name} must be non-empty")
+
+    def to_mapping(self) -> dict[str, str]:
+        return {"pid": self.pid, "tool_id": self.tool_id, "name": self.name}
+
+
+@dataclass(frozen=True, slots=True)
+class JITRehydrationSummary:
+    """Exact totals with page-bounded startup recovery diagnostics."""
+
+    restored_total: int
+    pruned_stale_total: int
+    restored_sample: tuple[JITRehydrationRecord, ...] = ()
+    pruned_stale_sample: tuple[JITRehydrationRecord, ...] = ()
+
+    def __post_init__(self) -> None:
+        for field_name in ("restored_total", "pruned_stale_total"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"JIT rehydration {field_name} must be non-negative")
+        if len(self.restored_sample) > self.restored_total:
+            raise ValueError("JIT rehydration restored sample exceeds total")
+        if len(self.pruned_stale_sample) > self.pruned_stale_total:
+            raise ValueError("JIT rehydration pruned sample exceeds total")
+
+    @property
+    def restored_truncated(self) -> bool:
+        return len(self.restored_sample) < self.restored_total
+
+    @property
+    def pruned_stale_truncated(self) -> bool:
+        return len(self.pruned_stale_sample) < self.pruned_stale_total
+
+
 @dataclass(frozen=True)
 class ToolCallResult:
     call_id: str

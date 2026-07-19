@@ -32,6 +32,20 @@ SAFE_PROVIDER_CALLS = frozenset(
 PROVIDER_HANDLE_METHODS = frozenset(
     {"close", "exit_code", "is_alive", "read", "resize", "write"}
 )
+# Recovery diagnostics handoff has one deliberately evidence-free provider
+# action: closing an already-published transient handle while durable state is
+# commit-fenced for same-process reopen.  The runtime guard is opaque and
+# ContextVar-scoped to an explicitly registered recovery-safe callback.  The
+# checker recognizes only this exact leading guard and only handle.close(); it
+# is not a general provider-operation allowlist.
+RECOVERY_CLEANUP_GUARD_PATH = (
+    "self",
+    "host",
+    "require_recovery_cleanup_lease",
+)
+RECOVERY_CLEANUP_PROVIDER_CALLS = frozenset(
+    {("provider handle method", "close")}
+)
 EGRESS_CONTRACTS = frozenset(
     {
         "primitive.filesystem.write_text",
@@ -128,6 +142,28 @@ def _function_name(function: FunctionNode) -> str:
     if isinstance(function, ast.Lambda):
         return f"lambda@{function.lineno}"
     return function.name
+
+
+def _has_leading_recovery_cleanup_guard(function: FunctionNode) -> bool:
+    if isinstance(function, ast.Lambda):
+        return False
+    body = list(function.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    if not body or not isinstance(body[0], ast.Expr):
+        return False
+    call = body[0].value
+    return (
+        isinstance(call, ast.Call)
+        and not call.args
+        and not call.keywords
+        and _attribute_path(call.func) == RECOVERY_CLEANUP_GUARD_PATH
+    )
 
 
 class _CallGraph:
@@ -400,6 +436,11 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
     )
     assigned_contract_names = _assigned_contract_names(tree, parents)
     protected_functions = call_graph.protected_functions(tree)
+    recovery_cleanup_functions = {
+        function
+        for function in call_graph.functions
+        if _has_leading_recovery_cleanup_guard(function)
+    }
     provider_handle_names = _provider_handle_names(tree, parents)
     direct_provider_functions: set[FunctionNode] = set()
     provider_calls: list[tuple[ast.Call, FunctionNode | None, str, str]] = []
@@ -416,7 +457,7 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
         if kind == "provider method" and (relative, method) in SAFE_PROVIDER_CALLS:
             continue
         provider_calls.append((call, owner, kind, method))
-        if owner is not None:
+        if owner is not None and owner not in recovery_cleanup_functions:
             direct_provider_functions.add(owner)
     provider_reaching = call_graph.provider_reaching_functions(direct_provider_functions)
     for node in ast.walk(tree):
@@ -518,6 +559,13 @@ def scan_source(path: Path, *, relative: Path) -> list[str]:
                     "outside an active ProtectedOperation phase"
                 )
     for node, owner, kind, method in provider_calls:
+        if owner in recovery_cleanup_functions:
+            if (kind, method) not in RECOVERY_CLEANUP_PROVIDER_CALLS:
+                errors.append(
+                    f"{relative}:{node.lineno}: recovery cleanup lease permits "
+                    "only provider handle close"
+                )
+            continue
         if owner not in protected_functions:
             errors.append(
                 f"{relative}:{node.lineno}: {kind} {method} is called "

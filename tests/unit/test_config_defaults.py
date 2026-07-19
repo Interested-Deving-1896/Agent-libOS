@@ -163,6 +163,195 @@ class TestConfigDefaults:
         assert DEFAULT_CONFIG.llm.persist_full_io is True
         assert DEFAULT_CONFIG.llm.auto_wait_on_empty_tool_calls is False
 
+    def test_payload_retention_is_explicit_disabled_and_bounded(self) -> None:
+        defaults = DEFAULT_CONFIG.runtime
+        assert defaults.payload_retention_enabled is False
+        assert defaults.payload_retention_summary_after_seconds is None
+        assert defaults.payload_retention_hash_only_after_seconds is None
+
+        configured = RuntimeDefaults(
+            payload_retention_enabled=True,
+            payload_retention_summary_after_seconds=86_400,
+            payload_retention_hash_only_after_seconds=604_800,
+            payload_retention_page_size=25,
+            payload_retention_page_hard_limit=50,
+        )
+        assert configured.payload_retention_enabled is True
+        assert configured.payload_retention_page_size == 25
+
+        with pytest.raises(ValueError, match="requires.*summary"):
+            RuntimeDefaults(payload_retention_enabled=True)
+        with pytest.raises(ValueError, match="must be at least"):
+            RuntimeDefaults(
+                payload_retention_summary_after_seconds=20,
+                payload_retention_hash_only_after_seconds=10,
+            )
+        with pytest.raises(ValueError, match="must not exceed"):
+            RuntimeDefaults(
+                payload_retention_page_size=11,
+                payload_retention_page_hard_limit=10,
+            )
+
+    def test_publication_artifact_lookup_has_an_independent_positive_hard_limit(
+        self,
+    ) -> None:
+        assert DEFAULT_CONFIG.runtime.publication_artifact_lookup_hard_limit == 5_000
+        with pytest.raises(ValueError, match="publication_artifact_lookup_hard_limit"):
+            RuntimeDefaults(publication_artifact_lookup_hard_limit=0)
+
+    @pytest.mark.parametrize(
+        "field_name",
+        (
+            "publication_recovery_max_attempts",
+            "publication_reconciliation_page_size",
+            "publication_reconciliation_page_hard_limit",
+            "publication_artifact_lookup_hard_limit",
+            "resource_usage_reservation_recovery_page_size",
+            "resource_usage_reservation_recovery_page_hard_limit",
+            "capability_use_reservation_recovery_page_size",
+            "capability_use_reservation_recovery_page_hard_limit",
+            "object_payload_recovery_page_size",
+            "object_payload_recovery_page_hard_limit",
+            "object_task_recovery_page_size",
+            "object_task_recovery_page_hard_limit",
+            "jit_rehydration_page_size",
+            "jit_rehydration_page_hard_limit",
+            "external_effect_recovery_page_size",
+            "external_effect_recovery_page_hard_limit",
+            "operation_recovery_page_size",
+            "operation_recovery_page_hard_limit",
+            "payload_retention_summary_after_seconds",
+            "payload_retention_hash_only_after_seconds",
+            "payload_retention_page_size",
+            "payload_retention_page_hard_limit",
+        ),
+    )
+    @pytest.mark.parametrize("value", (True, False))
+    def test_runtime_recovery_and_retention_integers_reject_python_bool(
+        self,
+        field_name: str,
+        value: bool,
+    ) -> None:
+        with pytest.raises(PydanticValidationError) as exc_info:
+            RuntimeDefaults(**{field_name: value})
+
+        assert any(
+            error["loc"] == (field_name,) and error["type"] == "int_type"
+            for error in exc_info.value.errors()
+        )
+
+    @pytest.mark.parametrize(
+        "field_name",
+        (
+            "publication_recovery_max_attempts",
+            "publication_reconciliation_page_size",
+            "publication_reconciliation_page_hard_limit",
+            "publication_artifact_lookup_hard_limit",
+            "resource_usage_reservation_recovery_page_size",
+            "resource_usage_reservation_recovery_page_hard_limit",
+            "capability_use_reservation_recovery_page_size",
+            "capability_use_reservation_recovery_page_hard_limit",
+            "object_payload_recovery_page_size",
+            "object_payload_recovery_page_hard_limit",
+            "object_task_recovery_page_size",
+            "object_task_recovery_page_hard_limit",
+            "jit_rehydration_page_size",
+            "jit_rehydration_page_hard_limit",
+            "external_effect_recovery_page_size",
+            "external_effect_recovery_page_hard_limit",
+            "operation_recovery_page_size",
+            "operation_recovery_page_hard_limit",
+            "payload_retention_summary_after_seconds",
+            "payload_retention_hash_only_after_seconds",
+            "payload_retention_page_size",
+            "payload_retention_page_hard_limit",
+        ),
+    )
+    @pytest.mark.parametrize("yaml_bool", ("true", "false"))
+    def test_runtime_recovery_and_retention_integers_reject_yaml_bool(
+        self,
+        tmp_path: Path,
+        field_name: str,
+        yaml_bool: str,
+    ) -> None:
+        path = tmp_path / f"invalid-{field_name}-{yaml_bool}.yaml"
+        path.write_text(
+            f"runtime:\n  {field_name}: {yaml_bool}\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(PydanticValidationError) as exc_info:
+            load_config_file(path)
+
+        assert any(
+            error["loc"] == ("runtime", field_name)
+            and error["type"] == "int_type"
+            for error in exc_info.value.errors()
+        )
+
+    def test_runtime_recovery_and_retention_strict_integers_overlay_from_yaml(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "strict-runtime-integers.yaml"
+        path.write_text(
+            "\n".join(
+                (
+                    "runtime:",
+                    "  publication_recovery_max_attempts: 4",
+                    "  publication_reconciliation_page_size: 125",
+                    "  publication_reconciliation_page_hard_limit: 250",
+                    "  publication_artifact_lookup_hard_limit: 300",
+                    "  resource_usage_reservation_recovery_page_size: 40",
+                    "  resource_usage_reservation_recovery_page_hard_limit: 80",
+                    "  capability_use_reservation_recovery_page_size: 30",
+                    "  capability_use_reservation_recovery_page_hard_limit: 60",
+                    "  object_payload_recovery_page_size: 24",
+                    "  object_payload_recovery_page_hard_limit: 48",
+                    "  object_task_recovery_page_size: 18",
+                    "  object_task_recovery_page_hard_limit: 36",
+                    "  jit_rehydration_page_size: 20",
+                    "  jit_rehydration_page_hard_limit: 40",
+                    "  external_effect_recovery_page_size: 250",
+                    "  external_effect_recovery_page_hard_limit: 500",
+                    "  operation_recovery_page_size: 50",
+                    "  operation_recovery_page_hard_limit: 100",
+                    "  payload_retention_enabled: true",
+                    "  payload_retention_summary_after_seconds: 60",
+                    "  payload_retention_hash_only_after_seconds: null",
+                    "  payload_retention_page_size: 25",
+                    "  payload_retention_page_hard_limit: 50",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        configured = load_config_file(path)
+
+        assert configured.runtime.publication_recovery_max_attempts == 4
+        assert configured.runtime.publication_reconciliation_page_size == 125
+        assert configured.runtime.publication_reconciliation_page_hard_limit == 250
+        assert configured.runtime.publication_artifact_lookup_hard_limit == 300
+        assert configured.runtime.resource_usage_reservation_recovery_page_size == 40
+        assert configured.runtime.resource_usage_reservation_recovery_page_hard_limit == 80
+        assert configured.runtime.capability_use_reservation_recovery_page_size == 30
+        assert configured.runtime.capability_use_reservation_recovery_page_hard_limit == 60
+        assert configured.runtime.object_payload_recovery_page_size == 24
+        assert configured.runtime.object_payload_recovery_page_hard_limit == 48
+        assert configured.runtime.object_task_recovery_page_size == 18
+        assert configured.runtime.object_task_recovery_page_hard_limit == 36
+        assert configured.runtime.jit_rehydration_page_size == 20
+        assert configured.runtime.jit_rehydration_page_hard_limit == 40
+        assert configured.runtime.external_effect_recovery_page_size == 250
+        assert configured.runtime.external_effect_recovery_page_hard_limit == 500
+        assert configured.runtime.operation_recovery_page_size == 50
+        assert configured.runtime.operation_recovery_page_hard_limit == 100
+        assert configured.runtime.payload_retention_summary_after_seconds == 60
+        assert configured.runtime.payload_retention_hash_only_after_seconds is None
+        assert configured.runtime.payload_retention_page_size == 25
+        assert configured.runtime.payload_retention_page_hard_limit == 50
+        assert configured.runtime.default_image_id == DEFAULT_CONFIG.runtime.default_image_id
+
     def test_load_config_file_accepts_openai_llm_options(self, tmp_path: Path) -> None:
         path = tmp_path / 'config.yaml'
         path.write_text(
@@ -218,6 +407,108 @@ class TestConfigDefaults:
         invalid.write_text('runtime:\n  launcher_max_quanta: 0\n', encoding='utf-8')
         with pytest.raises(PydanticValidationError, match='launcher_max_quanta'):
             load_config_file(invalid)
+
+        invalid_recovery = tmp_path / 'invalid-recovery.yaml'
+        invalid_recovery.write_text(
+            'runtime:\n  publication_recovery_max_attempts: 0\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='publication_recovery_max_attempts',
+        ):
+            load_config_file(invalid_recovery)
+
+        oversized_publication_page = tmp_path / 'oversized-publication-page.yaml'
+        oversized_publication_page.write_text(
+            'runtime:\n'
+            '  publication_reconciliation_page_size: 11\n'
+            '  publication_reconciliation_page_hard_limit: 10\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='publication_reconciliation_page_size',
+        ):
+            load_config_file(oversized_publication_page)
+
+        oversized_capability_reservation_page = (
+            tmp_path / 'oversized-capability-reservation-page.yaml'
+        )
+        oversized_capability_reservation_page.write_text(
+            'runtime:\n'
+            '  capability_use_reservation_recovery_page_size: 11\n'
+            '  capability_use_reservation_recovery_page_hard_limit: 10\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='capability_use_reservation_recovery_page_size',
+        ):
+            load_config_file(oversized_capability_reservation_page)
+
+        oversized_object_task_page = tmp_path / 'oversized-object-task-page.yaml'
+        oversized_object_task_page.write_text(
+            'runtime:\n'
+            '  object_task_recovery_page_size: 11\n'
+            '  object_task_recovery_page_hard_limit: 10\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='object_task_recovery_page_size',
+        ):
+            load_config_file(oversized_object_task_page)
+
+        oversized_jit_page = tmp_path / 'oversized-jit-page.yaml'
+        oversized_jit_page.write_text(
+            'runtime:\n'
+            '  jit_rehydration_page_size: 11\n'
+            '  jit_rehydration_page_hard_limit: 10\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='jit_rehydration_page_size',
+        ):
+            load_config_file(oversized_jit_page)
+
+        invalid_effect_page = tmp_path / 'invalid-effect-page.yaml'
+        invalid_effect_page.write_text(
+            'runtime:\n  external_effect_recovery_page_size: 0\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='external_effect_recovery_page_size',
+        ):
+            load_config_file(invalid_effect_page)
+
+        oversized_effect_page = tmp_path / 'oversized-effect-page.yaml'
+        oversized_effect_page.write_text(
+            'runtime:\n'
+            '  external_effect_recovery_page_size: 11\n'
+            '  external_effect_recovery_page_hard_limit: 10\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='external_effect_recovery_page_size',
+        ):
+            load_config_file(oversized_effect_page)
+
+        oversized_operation_page = tmp_path / 'oversized-operation-page.yaml'
+        oversized_operation_page.write_text(
+            'runtime:\n'
+            '  operation_recovery_page_size: 11\n'
+            '  operation_recovery_page_hard_limit: 10\n',
+            encoding='utf-8',
+        )
+        with pytest.raises(
+            PydanticValidationError,
+            match='operation_recovery_page_size',
+        ):
+            load_config_file(oversized_operation_page)
 
         bad_retention = tmp_path / 'bad-retention.yaml'
         bad_retention.write_text('llm:\n  prompt_cache_retention: forever\n', encoding='utf-8')

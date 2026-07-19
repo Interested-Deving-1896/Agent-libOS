@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import pytest
 import http.client
 import json
@@ -45,11 +46,15 @@ from agent_libos.models import (
     ProcessStatus,
     SinkTrustLevel,
     SinkTrustRule,
+    process_outcome_to_mapping,
+    process_wait_state_to_mapping,
 )
-from agent_libos.models.exceptions import HumanApprovalRequired, ValidationError
+from agent_libos.models.exceptions import HumanApprovalRequired, ProcessWaitRequired, ValidationError
 from agent_libos.utils.ids import utc_now
 from agent_libos.utils.serde import to_jsonable
 from agent_libos.runtime.runtime import Runtime
+from agent_libos.runtime.syscalls import LibOSSyscallSession
+from tests.support.checkpoints import checkpoint_cli_json
 from tests.support.skills import write_skill_package
 
 
@@ -260,6 +265,78 @@ class TestGuiServer:
         assert 'images' in snapshot
         assert any((profile['profile_id'] == 'gui-spawn' for profile in snapshot['llm_profiles']))
         assert any((image['image_id'] == 'base-agent:v0' for image in snapshot['images']))
+
+    def test_process_handlers_preserve_typed_wait_and_outcome_discriminators(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = self.server.service.runtime
+        status, spawned = self.request(
+            "POST",
+            "/api/processes",
+            {"goal": "typed GUI state", "auto_run": False},
+        )
+        assert status == 200
+        waiting_pid = spawned["pid"]
+        runtime.process.pause(waiting_pid, "review")
+
+        status, listed = self.request("GET", "/api/processes")
+        assert status == 200
+        waiting = next(process for process in listed if process["pid"] == waiting_pid)
+        assert waiting["wait_state"]["schema_version"] == 1
+        assert waiting["wait_state"]["kind"] == "paused"
+        assert waiting["outcome"] is None
+
+        monkeypatch.setattr(
+            runtime,
+            "set_process_working_directory",
+            lambda *args, **kwargs: runtime.process.get(waiting_pid),
+        )
+        status, changed_directory = self.request(
+            "POST",
+            f"/api/processes/{waiting_pid}/cd",
+            {"path": "."},
+        )
+        assert status == 200
+        assert changed_directory["wait_state"]["schema_version"] == 1
+        assert changed_directory["wait_state"]["kind"] == "paused"
+
+        monkeypatch.setattr(
+            runtime,
+            "exec_process",
+            lambda *args, **kwargs: runtime.process.get(waiting_pid),
+        )
+        status, executed = self.request(
+            "POST",
+            f"/api/processes/{waiting_pid}/exec",
+            {
+                "image": "base-agent:v0",
+                "goal": "typed exec response",
+                "confirmed": True,
+                "auto_run": False,
+            },
+        )
+        assert status == 200
+        assert executed["process"]["wait_state"]["schema_version"] == 1
+        assert executed["process"]["wait_state"]["kind"] == "paused"
+
+        status, terminal_spawned = self.request(
+            "POST",
+            "/api/processes",
+            {"goal": "typed GUI outcome", "auto_run": False},
+        )
+        assert status == 200
+        terminal_pid = terminal_spawned["pid"]
+        runtime.process.exit(terminal_pid, message="done")
+        status, terminal = self.request("GET", f"/api/processes/{terminal_pid}")
+        assert status == 200
+        assert terminal["wait_state"] is None
+        assert terminal["outcome"] == {
+            "schema_version": 1,
+            "kind": "exited",
+            "result_oid": terminal["outcome"]["result_oid"],
+        }
+        assert terminal["outcome"]["result_oid"]
 
     def test_operation_list_detail_and_evidence_resolution_endpoints(self) -> None:
         status, created = self.request(
@@ -2280,6 +2357,17 @@ class TestGuiServer:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'signal target', 'auto_run': False})
         pid = spawned['pid']
 
+        status, paused = self.request(
+            'POST',
+            f'/api/processes/{pid}/signal',
+            {'signal': ProcessSignal.PAUSE.value},
+        )
+        assert status == 200
+        assert paused['status'] == ProcessStatus.PAUSED.value
+        assert paused['wait_state']['kind'] == 'paused'
+        assert paused['outcome'] is None
+        paused_generation = paused['state_generation']
+
         status, denied = self.request('POST', f'/api/processes/{pid}/signal', {'signal': ProcessSignal.TERMINATE.value})
         assert status == 409
         assert denied['error']['confirmation_required']
@@ -2300,6 +2388,172 @@ class TestGuiServer:
         )
         assert status == 200
         assert allowed['status'] == ProcessStatus.KILLED.value
+        assert allowed['wait_state'] is None
+        assert allowed['outcome']['schema_version'] == 1
+        assert allowed['outcome']['kind'] == 'killed'
+        assert allowed['state_generation'] > paused_generation
+
+    def test_checkpoint_inspect_typed_state_survives_sqlite_restart_across_boundaries(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = str(tmp_path / 'typed-checkpoint.sqlite')
+        runtime = Runtime.open(db_path)
+        try:
+            parent = runtime.process.spawn(image='base-agent:v0', goal='checkpoint parent')
+            runtime.capability.grant(
+                parent,
+                'process:spawn',
+                [CapabilityRight.WRITE],
+                issued_by='test',
+            )
+            child = runtime.spawn_child_process(parent, 'checkpoint child')
+            with pytest.raises(ProcessWaitRequired):
+                runtime.process.wait(parent, child)
+            waiting = runtime.process.get(parent)
+            expected_wait = process_wait_state_to_mapping(waiting.wait_state)
+            waiting_generation = waiting.state_generation
+            waiting_checkpoint = runtime.checkpoint.create(
+                parent,
+                'typed waiting snapshot',
+                actor=parent,
+            )
+
+            runtime.process.signal_child(
+                parent,
+                child,
+                ProcessSignal.TERMINATE,
+                reason='typed terminal snapshot',
+            )
+            terminal = runtime.process.get(child)
+            expected_outcome = process_outcome_to_mapping(terminal.outcome)
+            terminal_generation = terminal.state_generation
+            terminal_checkpoint = runtime.checkpoint.create(
+                parent,
+                'typed terminal snapshot',
+                actor=parent,
+            )
+        finally:
+            runtime.close()
+
+        reopened = Runtime.open(db_path)
+        try:
+            manager_waiting = reopened.checkpoint.inspect(waiting_checkpoint, actor=parent)
+            waiting_row = next(
+                row for row in manager_waiting['processes'] if row['pid'] == parent
+            )
+            assert waiting_row['wait_state'] == expected_wait
+            assert waiting_row['outcome'] is None
+            assert waiting_row['state_generation'] == waiting_generation
+
+            manager_terminal = reopened.checkpoint.inspect(terminal_checkpoint, actor=parent)
+            terminal_row = next(
+                row for row in manager_terminal['processes'] if row['pid'] == child
+            )
+            assert terminal_row['wait_state'] is None
+            assert terminal_row['outcome'] == expected_outcome
+            assert terminal_row['state_generation'] == terminal_generation
+
+            tool_waiting = reopened.tools.call(
+                parent,
+                'inspect_checkpoint',
+                {'checkpoint_id': waiting_checkpoint},
+            )
+            assert tool_waiting.ok, tool_waiting.error
+            tool_waiting_row = next(
+                row for row in tool_waiting.payload['processes'] if row['pid'] == parent
+            )
+            assert tool_waiting_row['wait_state'] == expected_wait
+            assert tool_waiting_row['outcome'] is None
+            assert tool_waiting_row['state_generation'] == waiting_generation
+
+            tool_terminal = reopened.tools.call(
+                parent,
+                'inspect_checkpoint',
+                {'checkpoint_id': terminal_checkpoint},
+            )
+            assert tool_terminal.ok, tool_terminal.error
+            tool_terminal_row = next(
+                row for row in tool_terminal.payload['processes'] if row['pid'] == child
+            )
+            assert tool_terminal_row['wait_state'] is None
+            assert tool_terminal_row['outcome'] == expected_outcome
+            assert tool_terminal_row['state_generation'] == terminal_generation
+
+            syscall_terminal = asyncio.run(
+                LibOSSyscallSession(reopened, parent).handle(
+                    'checkpoint.inspect',
+                    {'checkpoint_id': terminal_checkpoint},
+                )
+            )
+            syscall_terminal_row = next(
+                row for row in syscall_terminal['processes'] if row['pid'] == child
+            )
+            assert syscall_terminal_row['outcome'] == expected_outcome
+            assert syscall_terminal_row['state_generation'] == terminal_generation
+        finally:
+            reopened.close()
+
+        cli_waiting = checkpoint_cli_json(
+            ['--db', db_path, 'checkpoint', 'inspect', waiting_checkpoint]
+        )
+        cli_waiting_row = next(
+            row for row in cli_waiting['processes'] if row['pid'] == parent
+        )
+        assert cli_waiting_row['wait_state'] == expected_wait
+        assert cli_waiting_row['state_generation'] == waiting_generation
+        cli_terminal = checkpoint_cli_json(
+            ['--db', db_path, 'checkpoint', 'inspect', terminal_checkpoint]
+        )
+        cli_terminal_row = next(
+            row for row in cli_terminal['processes'] if row['pid'] == child
+        )
+        assert cli_terminal_row['outcome'] == expected_outcome
+        assert cli_terminal_row['state_generation'] == terminal_generation
+
+        typed_server = create_gui_http_server(
+            db=db_path,
+            port=0,
+            token='typed-checkpoint-token',
+            auto_run=False,
+            llm_profiles_file=tmp_path / 'typed-llm-profiles.json',
+        )
+        typed_thread = threading.Thread(target=typed_server.serve_forever, daemon=True)
+        typed_thread.start()
+        try:
+            host, port = typed_server.server_address
+            def gui_inspect(checkpoint_id: str) -> dict[str, Any]:
+                conn = http.client.HTTPConnection(host, port, timeout=10)
+                conn.request(
+                    'GET',
+                    f'/api/checkpoints/{checkpoint_id}',
+                    headers={'Authorization': 'Bearer typed-checkpoint-token'},
+                )
+                response = conn.getresponse()
+                payload = json.loads(response.read().decode('utf-8'))
+                conn.close()
+                assert response.status == 200
+                return payload
+
+            gui_waiting = gui_inspect(waiting_checkpoint)
+            gui_waiting_row = next(
+                row for row in gui_waiting['processes'] if row['pid'] == parent
+            )
+            assert gui_waiting_row['wait_state'] == expected_wait
+            assert gui_waiting_row['state_generation'] == waiting_generation
+
+            gui_terminal = gui_inspect(terminal_checkpoint)
+            gui_terminal_row = next(
+                row for row in gui_terminal['processes'] if row['pid'] == child
+            )
+            assert gui_terminal_row['wait_state'] is None
+            assert gui_terminal_row['outcome'] == expected_outcome
+            assert gui_terminal_row['state_generation'] == terminal_generation
+        finally:
+            typed_server.shutdown()
+            typed_thread.join(timeout=5)
+            typed_server.service.shutdown()
+            typed_server.server_close()
 
     def test_invalid_process_signal_is_a_bad_request_without_mutation(self) -> None:
         _status, spawned = self.request('POST', '/api/processes', {'goal': 'invalid signal target', 'auto_run': False})

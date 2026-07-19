@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Protocol
 
-from agent_libos.models import ProcessMessage, ProcessMessageKind
+from agent_libos.models import ProcessMessage, ProcessMessageKind, ProcessWaitState
 
 
 class ProcessMessagePort(Protocol):
@@ -55,6 +55,6 @@ class CheckpointMessagePort(Protocol):
     def has_matching_unread_wait(
         self,
         pid: str,
-        status_message: str | None,
+        wait_state: ProcessWaitState | None,
     ) -> bool:
         ...

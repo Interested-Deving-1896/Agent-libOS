@@ -1,0 +1,48 @@
+name: external-effect-recovery-scale
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 18 * * *"
+
+jobs:
+  million-record-recovery:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Run one-million-record recovery scale benchmark
+        run: >-
+          uv run python experiments/run_external_effect_recovery_scale.py
+          --profile million
+          --output .benchmark_runs/external-effect-recovery-million.json
+
+      - name: Run 10k runtime-publication handler scale benchmark
+        run: >-
+          uv run python experiments/run_publication_reconciliation_scale.py
+          --profile ci
+          --output .benchmark_runs/publication-reconciliation-ci.json
+
+      - name: Preserve structural metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-effect-recovery-million
+          path: |
+            .benchmark_runs/external-effect-recovery-million.json
+            .benchmark_runs/publication-reconciliation-ci.json
+          if-no-files-found: error

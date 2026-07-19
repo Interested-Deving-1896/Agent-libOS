@@ -12,6 +12,11 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.llm.client import LLMCompletion
 from agent_libos.models import CapabilityRight, ProcessStatus
 
+if __package__:  # pragma: no branch - depends on module versus file execution
+    from scripts.runtime_assembly import aopen_runtime
+else:  # pragma: no cover - exercised by direct-entrypoint subprocess tests
+    from runtime_assembly import aopen_runtime
+
 _RUNTIME_DEFAULTS = DEFAULT_CONFIG.runtime
 _SCRIPT_DEFAULTS = DEFAULT_CONFIG.scripts
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -40,7 +45,7 @@ def main() -> None:
 
 
 async def amain(args: argparse.Namespace) -> None:
-    runtime = Runtime.open(args.db)
+    runtime = await aopen_runtime(args.db)
     try:
         source = _workspace_relative(args.source, runtime.workspace_root)
         target = _workspace_relative(args.target, runtime.workspace_root)
@@ -121,7 +126,7 @@ async def amain(args: argparse.Namespace) -> None:
         if args.trace:
             print(f"source_text_chars={len(source_text)}", file=sys.stderr)
     finally:
-        runtime.shutdown(actor="script", reason="script.complete")
+        await runtime.ashutdown(actor="script", reason="script.complete")
 
 
 def _workspace_relative(raw_path: str, workspace: Path) -> str:

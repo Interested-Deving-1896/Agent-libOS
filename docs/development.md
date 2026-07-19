@@ -125,15 +125,17 @@ tests, and documentation. Electron sources remain repository-checkout assets
 validated by the separate GUI lane. Validate that contract before a release:
 
 ```bash
-uv build --out-dir dist
+uv build --clear --out-dir dist
 uv run python scripts/check_release_artifacts.py dist
 ```
 
 The artifact checker requires the Python package, project metadata, and
 lockfile versions to agree; when GUI sources are present, both GUI package
-versions must agree as well. CI installs the built wheel into a fresh
-environment, runs both entrypoint help commands from outside the source tree,
-and executes the deterministic demo against an in-memory store.
+versions must agree as well. CI installs the built wheel and source
+distribution into fresh environments, checks dependency consistency, runs both
+wheel entrypoint help commands from outside the source tree, executes the
+deterministic demo against an in-memory store, and preserves the validated
+distributions for release use.
 
 The deterministic matrix is not the full platform release matrix. See
 [support_matrix.md](support_matrix.md) before claiming Windows/macOS, packaged
@@ -473,8 +475,8 @@ Preserve the boundary:
   process exec, checkpoint forks, child processes, and JSON-RPC endpoint
   visibility must not imply resource authority or additional resource budget;
 - Runtime Modules are trusted startup TCB extensions; they may register tools,
-  images, syscalls, and provider hooks but must not be treated as process
-  capabilities;
+  images, syscalls, provider hooks, and manifest-declared durable Object-release
+  handlers, but must not be treated as process capabilities;
 - JSON-RPC remote calls use registered endpoints and primitive capabilities
   rather than model-supplied URLs or secrets. Calls perform an exact
   endpoint/method capability gate before loading manifest metadata or schemas;

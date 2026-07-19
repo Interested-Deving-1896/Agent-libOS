@@ -30,6 +30,7 @@ class CapabilityStatus(StrEnum):
     ACTIVE = "active"
     REVOKED = "revoked"
     DISABLED = "disabled"
+    EXEC_REVOKED = "exec_revoked"
 
 
 class AuthorityRisk(StrEnum):
@@ -168,8 +169,41 @@ class Capability:
 
     @property
     def revoked(self) -> bool:
-        return self.status == CapabilityStatus.REVOKED
+        return self.status in {
+            CapabilityStatus.REVOKED,
+            CapabilityStatus.EXEC_REVOKED,
+        }
 
     @property
     def active(self) -> bool:
         return self.status == CapabilityStatus.ACTIVE
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityUseReservationRecoverySummary:
+    """Bounded diagnostics for stale capability-use reservations."""
+
+    total_count: int
+    sample_reservation_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.total_count, bool)
+            or not isinstance(self.total_count, int)
+            or self.total_count < 0
+        ):
+            raise ValueError("capability reservation recovery total_count must be non-negative")
+        if len(self.sample_reservation_ids) > self.total_count:
+            raise ValueError("capability reservation recovery sample exceeds total")
+        if any(
+            not isinstance(reservation_id, str) or not reservation_id
+            for reservation_id in self.sample_reservation_ids
+        ):
+            raise ValueError("capability reservation recovery sample IDs must not be empty")
+
+    @property
+    def truncated(self) -> bool:
+        return len(self.sample_reservation_ids) < self.total_count
+
+    def __len__(self) -> int:
+        return self.total_count

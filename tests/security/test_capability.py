@@ -1,5 +1,6 @@
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from threading import Barrier
 import pytest
 import contextlib
@@ -9,7 +10,7 @@ import tempfile
 from pathlib import Path
 from agent_libos import Runtime
 from agent_libos.api.cli import main as cli_main
-from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilitySpec, EventType
+from agent_libos.models import CapabilityEffect, CapabilityRight, CapabilitySpec, CapabilityStatus, EventType
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 
@@ -1104,6 +1105,225 @@ class TestCapabilityManager:
                 runtime.capability.revoke(cap.cap_id, revoked_by=stranger)
             runtime.capability.revoke(cap.cap_id, revoked_by=owner, reason='holder abandoned')
             assert not runtime.capability.check(owner, 'object:revocable', CapabilityRight.READ)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        'defensive_status',
+        [CapabilityStatus.REVOKED, CapabilityStatus.DISABLED],
+    )
+    def test_exec_revocation_staging_preserves_newer_defensive_state(
+        self,
+        defensive_status: CapabilityStatus,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            subject = runtime.process.spawn(goal='exec revocation defensive state')
+            cap = runtime.capability.grant(
+                subject,
+                'shell:defensive-state',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            if defensive_status == CapabilityStatus.REVOKED:
+                runtime.capability.revoke(
+                    cap.cap_id,
+                    revoked_by='defender',
+                    require_authority=False,
+                )
+            else:
+                runtime.capability.disable_subject_capability(
+                    cap.cap_id,
+                    actor='defender',
+                    reason='defensive disable',
+                )
+            defended = runtime.store.get_capability(cap.cap_id)
+            assert defended is not None and defended.status == defensive_status
+            before_event_ids = [event.event_id for event in runtime.events.list()]
+            before_audit_ids = [record.record_id for record in runtime.audit.trace()]
+
+            staged = runtime.capability.stage_exec_revocation(
+                cap.cap_id,
+                rollback_token='exec-publication-token',
+            )
+
+            assert staged == defended
+            assert runtime.store.get_capability(cap.cap_id) == defended
+            assert [event.event_id for event in runtime.events.list()] == before_event_ids
+            assert [record.record_id for record in runtime.audit.trace()] == before_audit_ids
+        finally:
+            runtime.close()
+
+    def test_exec_revocation_staging_transitions_active_capability(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            subject = runtime.process.spawn(goal='exec revocation active control')
+            cap = runtime.capability.grant(
+                subject,
+                'shell:active-control',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            before_event_ids = {event.event_id for event in runtime.events.list()}
+            before_audit_ids = {record.record_id for record in runtime.audit.trace()}
+
+            staged = runtime.capability.stage_exec_revocation(
+                cap.cap_id,
+                rollback_token='exec-publication-token',
+            )
+
+            assert staged.status == CapabilityStatus.EXEC_REVOKED
+            assert staged.metadata['_agent_libos_exec_rollback_token'] == 'exec-publication-token'
+            assert runtime.store.get_capability(cap.cap_id) == staged
+            new_events = [
+                event
+                for event in runtime.events.list()
+                if event.event_id not in before_event_ids
+            ]
+            new_audits = [
+                record
+                for record in runtime.audit.trace()
+                if record.record_id not in before_audit_ids
+            ]
+            assert len(new_events) == 1
+            assert new_events[0].type == EventType.CAPABILITY_REVOKED
+            assert new_events[0].source == 'process.exec'
+            assert new_events[0].target == subject
+            assert len(new_audits) == 1
+            assert new_audits[0].actor == 'process.exec'
+            assert new_audits[0].action == 'capability.revoke'
+            assert new_audits[0].capability_refs == [cap.cap_id]
+        finally:
+            runtime.close()
+
+    def test_exec_revocation_staging_loses_exact_state_cas_to_defensive_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            subject = runtime.process.spawn(goal='exec revocation CAS race')
+            cap = runtime.capability.grant(
+                subject,
+                'shell:cas-race',
+                [CapabilityRight.EXECUTE],
+                issued_by='test',
+            )
+            original_require = runtime.capability.mutations._require_revocable
+
+            def disable_after_read(cap_id: str):
+                current = original_require(cap_id)
+                runtime.store.update_capability(
+                    replace(
+                        current,
+                        status=CapabilityStatus.DISABLED,
+                        metadata={**current.metadata, 'disabled_by': 'defender'},
+                    )
+                )
+                return current
+
+            monkeypatch.setattr(
+                runtime.capability.mutations,
+                '_require_revocable',
+                disable_after_read,
+            )
+            before_event_ids = [event.event_id for event in runtime.events.list()]
+            before_audit_ids = [record.record_id for record in runtime.audit.trace()]
+
+            staged = runtime.capability.stage_exec_revocation(
+                cap.cap_id,
+                rollback_token='exec-publication-token',
+            )
+
+            assert staged.status == CapabilityStatus.DISABLED
+            assert staged.metadata['disabled_by'] == 'defender'
+            assert runtime.store.get_capability(cap.cap_id) == staged
+            assert [event.event_id for event in runtime.events.list()] == before_event_ids
+            assert [record.record_id for record in runtime.audit.trace()] == before_audit_ids
+        finally:
+            runtime.close()
+
+    def test_issue_reauthorizes_unlimited_grant_inside_mutation_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(goal='issue authority race actor')
+            subject = runtime.process.spawn(goal='issue authority race subject')
+            authority = runtime.capability.issue_trusted(
+                actor,
+                'object:authority-race',
+                [CapabilityRight.ADMIN],
+                issued_by='test.host',
+            )
+            original = runtime.capability._require_issue_authority
+
+            def revoke_after_preflight(who: str, spec: CapabilitySpec):
+                decision = original(who, spec)
+                runtime.capability.revoke(
+                    authority.cap_id,
+                    revoked_by='test.host',
+                    require_authority=False,
+                )
+                return decision
+
+            monkeypatch.setattr(
+                runtime.capability,
+                '_require_issue_authority',
+                revoke_after_preflight,
+            )
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                runtime.capability.issue(
+                    actor,
+                    subject,
+                    CapabilitySpec(
+                        resource='object:authority-race',
+                        rights={CapabilityRight.READ.value},
+                    ),
+                )
+
+            assert not runtime.capability.check(
+                subject,
+                'object:authority-race',
+                CapabilityRight.READ,
+            )
+        finally:
+            runtime.close()
+
+    def test_authority_transaction_rejects_new_deny_after_preflight(self) -> None:
+        runtime = Runtime.open('local')
+        try:
+            actor = runtime.process.spawn(goal='new deny authority race actor')
+            resource = 'object:new-deny-race'
+            runtime.capability.issue_trusted(
+                actor,
+                resource,
+                [CapabilityRight.ADMIN],
+                issued_by='test.host',
+            )
+            preflight = runtime.capability.require(
+                actor,
+                resource,
+                CapabilityRight.ADMIN,
+                consume=False,
+            )
+            runtime.capability.issue_trusted(
+                actor,
+                resource,
+                [CapabilityRight.ADMIN],
+                issued_by='test.host',
+                effect=CapabilityEffect.DENY,
+            )
+
+            with pytest.raises(CapabilityDenied, match='authority changed'):
+                with runtime.capability.authority_transaction(
+                    [preflight],
+                    actor=actor,
+                    operation='new deny race regression',
+                ):
+                    pytest.fail('mutation body must not run after a new deny')
         finally:
             runtime.close()
 

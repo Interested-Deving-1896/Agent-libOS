@@ -5,7 +5,12 @@ from pathlib import Path
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, get_project_root
-from agent_libos.models import EventType
+from agent_libos.models import (
+    EventType,
+    RuntimeModule,
+    RuntimeModuleRegistration,
+    RuntimeModuleStatus,
+)
 from agent_libos.models.exceptions import CapabilityDenied, NotFound, ValidationError
 from agent_libos.modules.context import ModuleContext, ModuleRuntimeView, StartupHook
 from agent_libos.modules.host import ModuleHookContext, ModuleHookServices
@@ -13,7 +18,7 @@ from agent_libos.modules.journal import RegistrationJournal
 from agent_libos.modules.loader import ModuleLoader
 from agent_libos.modules.schema import ModuleManifest, ModuleProvides, ModuleSource
 from agent_libos.ports import AuditPort, EventPort
-from agent_libos.storage import ExtensionRepository
+from agent_libos.storage import ExtensionRepository, RuntimeModuleRepositoryProtocol
 from agent_libos.utils.ids import utc_now
 
 class RuntimeModuleRegistry:
@@ -22,6 +27,7 @@ class RuntimeModuleRegistry:
     def __init__(
         self,
         extensions: ExtensionRepository,
+        module_publications: RuntimeModuleRepositoryProtocol,
         tools: Any,
         images: dict[str, Any],
         image_registry: Any,
@@ -32,9 +38,11 @@ class RuntimeModuleRegistry:
         hook_services: ModuleHookServices,
         lifecycle_lock: Any,
         *,
+        lifecycle: Any,
         config: AgentLibOSConfig | None = None,
     ) -> None:
         self._extensions = extensions
+        self._module_publications = module_publications
         self._tools = tools
         self._images = images
         self._image_registry = image_registry
@@ -45,6 +53,7 @@ class RuntimeModuleRegistry:
         self._hook_services = hook_services
         self.config = config or DEFAULT_CONFIG
         self._lifecycle_lock = lifecycle_lock
+        self._lifecycle = lifecycle
         self._provider_hooks: list[tuple[str, str, StartupHook]] = []
         self._startup_hooks: list[tuple[str, str, StartupHook]] = []
         self._loaded_modules: dict[str, dict[str, Any]] = {}
@@ -55,7 +64,7 @@ class RuntimeModuleRegistry:
         self._startup_hooks_ran = False
 
     def load_core_module(self) -> dict[str, Any]:
-        with self._lifecycle_lock:
+        with self._lifecycle.admit(), self._lifecycle_lock:
             return self._load_core_module_locked()
 
     def _load_core_module_locked(self) -> dict[str, Any]:
@@ -88,7 +97,7 @@ class RuntimeModuleRegistry:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> list[dict[str, Any]]:
-        with self._lifecycle_lock:
+        with self._lifecycle.admit(), self._lifecycle_lock:
             return self._load_startup_modules_locked(
                 manifests,
                 trusted_modules=trusted_modules,
@@ -136,7 +145,7 @@ class RuntimeModuleRegistry:
         trusted_modules: list[str] | tuple[str, ...] | None = None,
         trusted_sha256: list[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
-        with self._lifecycle_lock:
+        with self._lifecycle.admit(), self._lifecycle_lock:
             return self._load_module_manifest_locked(
                 manifest_path,
                 trusted_modules=trusted_modules,
@@ -190,7 +199,12 @@ class RuntimeModuleRegistry:
     def list_modules(self, limit: int | None = None) -> list[dict[str, Any]]:
         with self._lifecycle_lock:
             selected_limit = self._bounded_discover_limit(limit)
-            return self._extensions.list_runtime_modules(limit=selected_limit)
+            return [
+                module.to_public_dict()
+                for module in self._module_publications.list_runtime_modules(
+                    limit=selected_limit
+                )
+            ]
 
     def _bounded_discover_limit(self, limit: int | None) -> int:
         selected = self.config.modules.discover_limit if limit is None else limit
@@ -206,10 +220,10 @@ class RuntimeModuleRegistry:
 
     def inspect_module(self, module_id: str) -> dict[str, Any]:
         with self._lifecycle_lock:
-            found = self._extensions.get_runtime_module(module_id)
+            found = self._module_publications.get_runtime_module(module_id)
             if found is None:
                 raise NotFound(f"runtime module not found: {module_id}")
-            return found
+            return found.to_public_dict()
 
     def is_loaded(self, module_id: str, source_sha256: str | None = None) -> bool:
         with self._lifecycle_lock:
@@ -228,7 +242,7 @@ class RuntimeModuleRegistry:
             return [dict(item) for item in selected]
 
     def run_startup_hooks(self) -> None:
-        with self._lifecycle_lock:
+        with self._lifecycle.admit(), self._lifecycle_lock:
             self._run_startup_hooks_locked()
 
     def _run_startup_hooks_locked(self) -> None:
@@ -236,7 +250,9 @@ class RuntimeModuleRegistry:
             return
         failed_hook: tuple[str, str] | None = None
         try:
-            with self._extensions.transaction(include_object_payloads=True):
+            with self._module_publications.transaction(
+                include_object_payloads=True
+            ):
                 for module_id, hook_name, hook in list(self._provider_hooks):
                     failed_hook = (module_id, hook_name)
                     self._run_module_hook(module_id, hook_name, hook, kind="provider")
@@ -284,7 +300,9 @@ class RuntimeModuleRegistry:
         journal = RegistrationJournal(source.manifest.module_id)
         self._registration_journals[source.manifest.module_id] = journal
         try:
-            with self._extensions.transaction(include_object_payloads=True):
+            with self._module_publications.transaction(
+                include_object_payloads=True
+            ):
                 result = entrypoint(ctx)
                 if inspect.isawaitable(result):
                     raise ValidationError(f"module entrypoint must be synchronous: {source.manifest.module_id}")
@@ -292,20 +310,22 @@ class RuntimeModuleRegistry:
                 self._apply_context(ctx, journal)
                 now = utc_now()
                 summary = ctx.registered_summary()
-                self._extensions.upsert_runtime_module(
-                    module_id=source.manifest.module_id,
-                    name=source.manifest.name,
-                    version=source.manifest.version,
-                    entrypoint=source.manifest.entrypoint,
-                    manifest_path=source.manifest_path,
-                    manifest_sha256=source.manifest_sha256,
-                    source_path=source.source_path,
-                    source_sha256=source.source_sha256,
-                    status="loaded",
-                    loaded_at=now,
-                    registered=summary,
-                    error=None,
-                    metadata=source.manifest.metadata,
+                self._module_publications.upsert_runtime_module(
+                    RuntimeModule(
+                        module_id=source.manifest.module_id,
+                        name=source.manifest.name,
+                        version=source.manifest.version,
+                        entrypoint=source.manifest.entrypoint,
+                        manifest_path=source.manifest_path,
+                        manifest_sha256=source.manifest_sha256,
+                        source_path=source.source_path,
+                        source_sha256=source.source_sha256,
+                        status=RuntimeModuleStatus.LOADED,
+                        loaded_at=now,
+                        registered=RuntimeModuleRegistration.from_mapping(summary),
+                        error=None,
+                        metadata=source.manifest.metadata,
+                    )
                 )
                 self._loaded_modules[source.manifest.module_id] = {
                     "module_id": source.manifest.module_id,
@@ -352,8 +372,15 @@ class RuntimeModuleRegistry:
                 )
                 if self._startup_hooks_ran and not self._is_internal_module(source.manifest.module_id):
                     self._run_context_hooks(ctx)
-                loaded = self._extensions.get_runtime_module(source.manifest.module_id) or {}
-            return loaded
+                loaded = self._module_publications.get_runtime_module(
+                    source.manifest.module_id
+                )
+                if loaded is None:
+                    raise ValidationError(
+                        "runtime module publication disappeared after load: "
+                        f"{source.manifest.module_id}"
+                    )
+            return loaded.to_public_dict()
         except BaseException as exc:
             rollback_error: BaseException | None = None
             try:
@@ -458,6 +485,31 @@ class RuntimeModuleRegistry:
                 target=f"syscall:{name}",
                 decision={"module_id": ctx.module_id, "syscall": name},
             )
+        for finalizer_id, (
+            prepare,
+            finalize,
+        ) in ctx.durable_object_release_finalizers.items():
+            self._hook_services.memory.bind_durable_object_release_finalizer(
+                finalizer_id,
+                prepare,
+                finalize,
+            )
+            journal.record(
+                kind="durable_object_release_finalizer",
+                target=finalizer_id,
+                undo=lambda finalizer_id=finalizer_id: self._hook_services.memory.unbind_durable_object_release_finalizer(
+                    finalizer_id
+                ),
+            )
+            self._audit.record(
+                actor=ctx.actor,
+                action="module.bind_durable_object_release_finalizer",
+                target=f"object_release_finalizer:{finalizer_id}",
+                decision={
+                    "module_id": ctx.module_id,
+                    "finalizer_id": finalizer_id,
+                },
+            )
         for kind, hooks in ctx.provider_hooks.items():
             runtime_hooks = self._provider_hooks_by_kind.setdefault(kind, [])
             for index, hook in enumerate(hooks):
@@ -542,7 +594,9 @@ class RuntimeModuleRegistry:
         ctx = self._applied_contexts.get(module_id)
         journal = self._registration_journals.get(module_id)
         try:
-            with self._extensions.transaction(include_object_payloads=True):
+            with self._module_publications.transaction(
+                include_object_payloads=True
+            ):
                 if journal is not None:
                     journal.rollback()
                 if ctx is not None:
@@ -576,7 +630,7 @@ class RuntimeModuleRegistry:
         source = self._applied_sources.get(module_id)
         ctx = self._applied_contexts.get(module_id)
         registered = ctx.registered_summary() if ctx is not None else {}
-        with self._extensions.transaction(include_object_payloads=True):
+        with self._module_publications.transaction(include_object_payloads=True):
             for row in self._extensions.list_tools():
                 if row.get("registered_by") == actor:
                     self._extensions.delete_tool(
@@ -590,23 +644,27 @@ class RuntimeModuleRegistry:
                         registered_by=actor,
                     )
             if source is not None:
-                self._extensions.upsert_runtime_module(
-                    module_id=source.manifest.module_id,
-                    name=source.manifest.name,
-                    version=source.manifest.version,
-                    entrypoint=source.manifest.entrypoint,
-                    manifest_path=source.manifest_path,
-                    manifest_sha256=source.manifest_sha256,
-                    source_path=source.source_path,
-                    source_sha256=source.source_sha256,
-                    status="failed",
-                    loaded_at=None,
-                    registered=registered,
-                    error=(
-                        "durable rollback recovery after "
-                        f"{type(rollback_exc).__name__}: {rollback_exc}"
-                    ),
-                    metadata=source.manifest.metadata,
+                self._module_publications.upsert_runtime_module(
+                    RuntimeModule(
+                        module_id=source.manifest.module_id,
+                        name=source.manifest.name,
+                        version=source.manifest.version,
+                        entrypoint=source.manifest.entrypoint,
+                        manifest_path=source.manifest_path,
+                        manifest_sha256=source.manifest_sha256,
+                        source_path=source.source_path,
+                        source_sha256=source.source_sha256,
+                        status=RuntimeModuleStatus.FAILED,
+                        loaded_at=None,
+                        registered=RuntimeModuleRegistration.from_mapping(
+                            registered
+                        ),
+                        error=(
+                            "durable rollback recovery after "
+                            f"{type(rollback_exc).__name__}: {rollback_exc}"
+                        ),
+                        metadata=source.manifest.metadata,
+                    )
                 )
 
         # The original failure may be the audit sink itself. Durable cleanup
@@ -707,20 +765,22 @@ class RuntimeModuleRegistry:
                 },
             )
             return
-        self._extensions.upsert_runtime_module(
-            module_id=module_id,
-            name=name,
-            version=version,
-            entrypoint=entrypoint,
-            manifest_path=path,
-            manifest_sha256=manifest_sha256,
-            source_path=source_path,
-            source_sha256=source_sha256,
-            status="failed",
-            loaded_at=None,
-            registered={},
-            error=str(exc),
-            metadata=metadata,
+        self._module_publications.upsert_runtime_module(
+            RuntimeModule(
+                module_id=module_id,
+                name=name,
+                version=version,
+                entrypoint=entrypoint,
+                manifest_path=path,
+                manifest_sha256=manifest_sha256,
+                source_path=source_path,
+                source_sha256=source_sha256,
+                status=RuntimeModuleStatus.FAILED,
+                loaded_at=None,
+                registered=RuntimeModuleRegistration(),
+                error=str(exc),
+                metadata=metadata,
+            )
         )
         self._audit.record(
             actor="runtime",
@@ -736,20 +796,24 @@ class RuntimeModuleRegistry:
         *,
         registered: dict[str, Any] | None = None,
     ) -> None:
-        self._extensions.upsert_runtime_module(
-            module_id=source.manifest.module_id,
-            name=source.manifest.name,
-            version=source.manifest.version,
-            entrypoint=source.manifest.entrypoint,
-            manifest_path=source.manifest_path,
-            manifest_sha256=source.manifest_sha256,
-            source_path=source.source_path,
-            source_sha256=source.source_sha256,
-            status="failed",
-            loaded_at=None,
-            registered=registered or {},
-            error=str(exc),
-            metadata=source.manifest.metadata,
+        self._module_publications.upsert_runtime_module(
+            RuntimeModule(
+                module_id=source.manifest.module_id,
+                name=source.manifest.name,
+                version=source.manifest.version,
+                entrypoint=source.manifest.entrypoint,
+                manifest_path=source.manifest_path,
+                manifest_sha256=source.manifest_sha256,
+                source_path=source.source_path,
+                source_sha256=source.source_sha256,
+                status=RuntimeModuleStatus.FAILED,
+                loaded_at=None,
+                registered=RuntimeModuleRegistration.from_mapping(
+                    registered or {}
+                ),
+                error=str(exc),
+                metadata=source.manifest.metadata,
+            )
         )
         self._audit.record(
             actor="runtime",

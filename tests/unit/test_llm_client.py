@@ -538,6 +538,31 @@ class TestLLMClient:
 
         assert asyncio.run(run()) == (True, True)
 
+    def test_aclose_offloads_cached_sync_client_timer_barrier(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        close_threads: list[int] = []
+
+        class BlockingSyncClient:
+            def close(self) -> None:
+                close_threads.append(threading.get_ident())
+                entered.set()
+                assert release.wait(timeout=1)
+
+        async def run() -> None:
+            client = LLMClient(model="gpt-test", api_key="key")
+            client._client = BlockingSyncClient()
+            caller_thread = threading.get_ident()
+            asyncio.get_running_loop().call_later(0.01, release.set)
+
+            await client.aclose()
+
+            assert entered.is_set()
+            assert close_threads and close_threads[0] != caller_thread
+            assert client._client is None
+
+        asyncio.run(run())
+
 class FakeAsyncOpenAI:
 
     def __init__(self, responses: Any | None=None, chat: Any | None=None):

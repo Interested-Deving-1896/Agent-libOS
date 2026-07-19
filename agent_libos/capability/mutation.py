@@ -4,6 +4,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any
 
+from agent_libos.capability.admission import (
+    CapabilityAdmissionPort,
+    install_instance_admission_guards,
+    revalidate_admission,
+)
 from agent_libos.capability.lease import CapabilityLeaseService
 from agent_libos.models import (
     Capability,
@@ -15,6 +20,22 @@ from agent_libos.models import (
 from agent_libos.models.exceptions import CapabilityDenied, NotFound
 from agent_libos.ports import AuditPort, CapabilityStorePort, EventPort
 from agent_libos.utils.ids import new_id, utc_now
+
+
+EXEC_ROLLBACK_TOKEN_KEY = "_agent_libos_exec_rollback_token"
+
+CAPABILITY_MUTATION_SERVICE_PUBLIC_METHODS = frozenset(
+    {
+        "disable",
+        "finalize_exec_revocations",
+        "issue",
+        "publish",
+        "record_delegation",
+        "revoke",
+        "revoke_resource",
+        "stage_exec_revocation",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,11 +66,19 @@ class CapabilityMutationService:
         audit: AuditPort,
         events: EventPort,
         leases: CapabilityLeaseService,
+        *,
+        admission: CapabilityAdmissionPort | None = None,
     ) -> None:
         self.store = store
         self.audit = audit
         self.events = events
         self.leases = leases
+        self._admission = admission
+        install_instance_admission_guards(
+            self,
+            admission=admission,
+            mutation_methods=CAPABILITY_MUTATION_SERVICE_PUBLIC_METHODS,
+        )
 
     def issue(
         self,
@@ -60,6 +89,7 @@ class CapabilityMutationService:
         attach_to_process: Callable[[str, str], None],
     ) -> Capability:
         with self.store.transaction():
+            revalidate_admission(self._admission)
             reservation = self.leases.reserve_decision(
                 authority_decision,
                 used_by=actor,
@@ -83,6 +113,7 @@ class CapabilityMutationService:
                     "delegable": cap.delegable,
                 },
             )
+            revalidate_admission(self._admission)
         return cap
 
     def publish(
@@ -91,40 +122,43 @@ class CapabilityMutationService:
         *,
         attach_to_process: Callable[[str, str], None],
     ) -> Capability:
-        cap = Capability(
-            cap_id=new_id("cap"),
-            subject=draft.subject,
-            resource=draft.resource,
-            rights=set(draft.rights),
-            constraints=dict(draft.constraints),
-            issued_by=draft.issued_by,
-            issued_at=utc_now(),
-            expires_at=draft.expires_at,
-            delegable=draft.delegable,
-            revocable=draft.revocable,
-            effect=draft.effect,
-            issuer_cap_id=draft.issuer_cap_id,
-            parent_cap_id=draft.parent_cap_id,
-            delegation_depth=draft.delegation_depth,
-            max_delegation_depth=draft.max_delegation_depth,
-            uses_remaining=draft.uses_remaining,
-            status=CapabilityStatus.ACTIVE,
-            metadata=dict(draft.metadata),
-        )
-        self.store.insert_capability(cap)
-        attach_to_process(cap.subject, cap.cap_id)
-        self.events.emit(
-            EventType.CAPABILITY_GRANTED,
-            source=cap.issued_by,
-            target=cap.subject,
-            payload={
-                "capability_id": cap.cap_id,
-                "resource": cap.resource,
-                "rights": sorted(cap.rights),
-                "effect": cap.effect.value,
-                "uses_remaining": cap.uses_remaining,
-            },
-        )
+        with self.store.transaction():
+            revalidate_admission(self._admission)
+            cap = Capability(
+                cap_id=new_id("cap"),
+                subject=draft.subject,
+                resource=draft.resource,
+                rights=set(draft.rights),
+                constraints=dict(draft.constraints),
+                issued_by=draft.issued_by,
+                issued_at=utc_now(),
+                expires_at=draft.expires_at,
+                delegable=draft.delegable,
+                revocable=draft.revocable,
+                effect=draft.effect,
+                issuer_cap_id=draft.issuer_cap_id,
+                parent_cap_id=draft.parent_cap_id,
+                delegation_depth=draft.delegation_depth,
+                max_delegation_depth=draft.max_delegation_depth,
+                uses_remaining=draft.uses_remaining,
+                status=CapabilityStatus.ACTIVE,
+                metadata=dict(draft.metadata),
+            )
+            self.store.insert_capability(cap)
+            attach_to_process(cap.subject, cap.cap_id)
+            self.events.emit(
+                EventType.CAPABILITY_GRANTED,
+                source=cap.issued_by,
+                target=cap.subject,
+                payload={
+                    "capability_id": cap.cap_id,
+                    "resource": cap.resource,
+                    "rights": sorted(cap.rights),
+                    "effect": cap.effect.value,
+                    "uses_remaining": cap.uses_remaining,
+                },
+            )
+            revalidate_admission(self._admission)
         return cap
 
     def record_delegation(
@@ -136,13 +170,16 @@ class CapabilityMutationService:
         child_subject: str,
         actor: str,
     ) -> None:
-        self.audit.record(
-            actor=actor,
-            action="capability.delegate",
-            target=f"{parent_subject}->{child_subject}:{cap.resource}",
-            capability_refs=[parent_cap.cap_id, cap.cap_id],
-            decision={"rights": sorted(cap.rights), "effect": cap.effect.value},
-        )
+        with self.store.transaction():
+            revalidate_admission(self._admission)
+            self.audit.record(
+                actor=actor,
+                action="capability.delegate",
+                target=f"{parent_subject}->{child_subject}:{cap.resource}",
+                capability_refs=[parent_cap.cap_id, cap.cap_id],
+                decision={"rights": sorted(cap.rights), "effect": cap.effect.value},
+            )
+            revalidate_admission(self._admission)
 
     def revoke(
         self,
@@ -153,13 +190,18 @@ class CapabilityMutationService:
         authority_decision: CapabilityDecision | None,
     ) -> Capability:
         with self.store.transaction():
+            revalidate_admission(self._admission)
             current = self._require_revocable(cap_id)
             reservation = self.leases.reserve_decision(
                 authority_decision,
                 used_by=revoked_by,
                 reason="one-time revoke authority reserved",
             )
-            revoked = replace(current, status=CapabilityStatus.REVOKED)
+            revoked = replace(
+                current,
+                status=CapabilityStatus.REVOKED,
+                metadata=self._without_exec_rollback_token(current.metadata),
+            )
             self.store.update_capability(revoked)
             self.leases.commit(
                 reservation,
@@ -179,19 +221,108 @@ class CapabilityMutationService:
                 capability_refs=[cap_id],
                 decision={"revoked": True, "reason": reason, "subject": current.subject},
             )
+            revalidate_admission(self._admission)
         return revoked
 
+    def stage_exec_revocation(
+        self,
+        cap_id: str,
+        *,
+        rollback_token: str,
+    ) -> Capability:
+        """Revoke under an exec-owned token until publication commits."""
+
+        selected_token = str(rollback_token).strip()
+        if not selected_token:
+            raise ValueError("exec capability rollback token must not be empty")
+        with self.store.transaction():
+            revalidate_admission(self._admission)
+            current = self._require_revocable(cap_id)
+            if not current.active:
+                revalidate_admission(self._admission)
+                return current
+            metadata = self._without_exec_rollback_token(current.metadata)
+            metadata[EXEC_ROLLBACK_TOKEN_KEY] = selected_token
+            staged = self.store.transition_capability_status(
+                cap_id,
+                expected_status=CapabilityStatus.ACTIVE,
+                status=CapabilityStatus.EXEC_REVOKED,
+                metadata=metadata,
+            )
+            if staged is None:
+                latest = self.store.get_capability(cap_id)
+                if latest is None:
+                    raise NotFound(f"capability not found: {cap_id}")
+                revalidate_admission(self._admission)
+                return latest
+            self.events.emit(
+                EventType.CAPABILITY_REVOKED,
+                source="process.exec",
+                target=staged.subject,
+                payload={
+                    "capability_id": cap_id,
+                    "reason": "exec capability shrink",
+                },
+            )
+            self.audit.record(
+                actor="process.exec",
+                action="capability.revoke",
+                target=staged.resource,
+                capability_refs=[cap_id],
+                decision={
+                    "revoked": True,
+                    "reason": "exec capability shrink",
+                    "subject": staged.subject,
+                },
+            )
+            revalidate_admission(self._admission)
+        return staged
+
+    def finalize_exec_revocations(
+        self,
+        subject: str,
+        *,
+        rollback_token: str,
+    ) -> list[Capability]:
+        """Finalize only revocations still owned by this exec publication."""
+
+        finalized: list[Capability] = []
+        with self.store.transaction():
+            revalidate_admission(self._admission)
+            for cap in self.store.list_capabilities(subject=subject):
+                if (
+                    cap.status != CapabilityStatus.EXEC_REVOKED
+                    or cap.metadata.get(EXEC_ROLLBACK_TOKEN_KEY) != rollback_token
+                ):
+                    continue
+                updated = replace(
+                    cap,
+                    status=CapabilityStatus.REVOKED,
+                    metadata=self._without_exec_rollback_token(cap.metadata),
+                )
+                self.store.update_capability(updated)
+                finalized.append(updated)
+            revalidate_admission(self._admission)
+        return finalized
+
     def disable(self, cap_id: str, *, actor: str, reason: str | None = None) -> Capability:
-        cap = self._require(cap_id)
-        updated = replace(cap, status=CapabilityStatus.DISABLED)
-        self.store.update_capability(updated)
-        self.audit.record(
-            actor=actor,
-            action="capability.disable",
-            target=cap.resource,
-            capability_refs=[cap_id],
-            decision={"reason": reason, "subject": cap.subject},
-        )
+        with self.store.transaction():
+            revalidate_admission(self._admission)
+            cap = self._require(cap_id)
+            updated = replace(
+                cap,
+                status=CapabilityStatus.DISABLED,
+                metadata=self._without_exec_rollback_token(cap.metadata),
+            )
+            self.store.update_capability(updated)
+            self.audit.record(
+                actor=actor,
+                action="capability.disable",
+                target=cap.resource,
+                capability_refs=[cap_id],
+                decision={"reason": reason, "subject": cap.subject},
+            )
+            revalidate_admission(self._admission)
         return updated
 
     def revoke_resource(
@@ -202,26 +333,36 @@ class CapabilityMutationService:
         reason: str | None = None,
     ) -> list[Capability]:
         revoked: list[Capability] = []
-        for cap in self.store.list_capabilities():
-            if cap.resource != resource or not cap.active:
-                continue
-            updated = replace(cap, status=CapabilityStatus.REVOKED)
-            self.store.update_capability(updated)
-            revoked.append(updated)
-            self.events.emit(
-                EventType.CAPABILITY_REVOKED,
-                source=revoked_by,
-                target=cap.subject,
-                payload={"capability_id": cap.cap_id, "reason": reason},
-            )
-        if revoked:
-            self.audit.record(
-                actor=revoked_by,
-                action="capability.revoke_resource",
-                target=resource,
-                capability_refs=[cap.cap_id for cap in revoked],
-                decision={"revoked": len(revoked), "reason": reason},
-            )
+        with self.store.transaction():
+            revalidate_admission(self._admission)
+            for cap in self.store.list_capabilities():
+                if cap.resource != resource or cap.status not in {
+                    CapabilityStatus.ACTIVE,
+                    CapabilityStatus.EXEC_REVOKED,
+                }:
+                    continue
+                updated = replace(
+                    cap,
+                    status=CapabilityStatus.REVOKED,
+                    metadata=self._without_exec_rollback_token(cap.metadata),
+                )
+                self.store.update_capability(updated)
+                revoked.append(updated)
+                self.events.emit(
+                    EventType.CAPABILITY_REVOKED,
+                    source=revoked_by,
+                    target=cap.subject,
+                    payload={"capability_id": cap.cap_id, "reason": reason},
+                )
+            if revoked:
+                self.audit.record(
+                    actor=revoked_by,
+                    action="capability.revoke_resource",
+                    target=resource,
+                    capability_refs=[cap.cap_id for cap in revoked],
+                    decision={"revoked": len(revoked), "reason": reason},
+                )
+            revalidate_admission(self._admission)
         return revoked
 
     def _require(self, cap_id: str) -> Capability:
@@ -235,3 +376,17 @@ class CapabilityMutationService:
         if not cap.revocable:
             raise CapabilityDenied(f"capability is not revocable: {cap_id}")
         return cap
+
+    @staticmethod
+    def _without_exec_rollback_token(metadata: dict[str, Any]) -> dict[str, Any]:
+        selected = dict(metadata)
+        selected.pop(EXEC_ROLLBACK_TOKEN_KEY, None)
+        return selected
+
+
+__all__ = [
+    "CAPABILITY_MUTATION_SERVICE_PUBLIC_METHODS",
+    "CapabilityDraft",
+    "CapabilityMutationService",
+    "EXEC_ROLLBACK_TOKEN_KEY",
+]

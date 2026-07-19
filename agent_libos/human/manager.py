@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 import builtins
+import contextlib
 import hashlib
 import threading
 from contextvars import ContextVar
@@ -39,9 +39,15 @@ from agent_libos.models import (
     EventType,
     HumanRequest,
     HumanRequestStatus,
+    HumanProcessWait,
+    KilledProcessOutcome,
+    PausedProcessWait,
+    ProcessExecutionToken,
     ProcessSignal,
     ProcessStatus,
 )
+from agent_libos.process_transition import ProcessTransitionService
+from agent_libos.process_execution import trusted_process_execution_takeover
 from agent_libos.capability.effect_binding import canonical_effect_hash
 from agent_libos.storage import AuthorityRepository, ProcessRepository
 from agent_libos.substrate import HumanProvider, ProviderEffectNotStarted
@@ -53,6 +59,7 @@ from agent_libos.sdk import (
 )
 from agent_libos.ports import (
     AuditPort,
+    BlockingWorkPort,
     EventPort,
     HumanDataFlowPort,
     OperationPort,
@@ -134,7 +141,9 @@ class HumanObjectManager:
         requests: ProcessRepository,
         messages: ProcessMessagePort,
         data_flow: HumanDataFlowPort,
+        blocking_work: BlockingWorkPort,
         config: AgentLibOSConfig | None = None,
+        transitions: ProcessTransitionService | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.processes = processes
@@ -147,6 +156,8 @@ class HumanObjectManager:
         self.authority_policy = authority_policy
         self.operations = operations
         self.data_flow = data_flow
+        self._blocking_work = blocking_work
+        self._transitions = transitions or ProcessTransitionService(processes)
         self.requests = HumanRequestService(requests)
         self.delivery = HumanDeliveryService(provider)
         self.presentation = HumanPresentationService(
@@ -293,24 +304,21 @@ class HumanObjectManager:
                 # Blocking human requests suspend scheduling for this process until
                 # a terminal queue decision moves it back to RUNNABLE.
                 if process is not None:
-                    process.status = ProcessStatus.WAITING_HUMAN
-                    release_parent_id = request.get(_DATA_RELEASE_FOR_REQUEST_KEY)
-                    process.status_message = (
-                        "waiting for human requests "
-                        f"{release_parent_id},{human_request.request_id}"
-                        if _trusted_data_release
-                        and isinstance(release_parent_id, str)
-                        else f"waiting for human request {human_request.request_id}"
+                    request_ids = tuple(
+                        pending.request_id
+                        for pending in self.requests.list(
+                            pid=pid,
+                            status=HumanRequestStatus.PENDING,
+                        )
+                        if pending.blocking
                     )
-                    process.updated_at = utc_now()
-                    self.processes.patch_process(
+                    self._transitions.transition(
                         process.pid,
-                        {
-                            "status": process.status,
-                            "status_message": process.status_message,
-                            "updated_at": process.updated_at,
-                        },
+                        ProcessStatus.WAITING_HUMAN,
                         expected_revision=process.revision,
+                        expected_status=process.status,
+                        expected_state_generation=process.state_generation,
+                        wait_state=HumanProcessWait(request_ids=request_ids),
                     )
             self.events.emit(
                 EventType.HUMAN_QUERY,
@@ -766,20 +774,52 @@ class HumanObjectManager:
         process = self.processes.get_process(pid)
         if process is None:
             raise NotFound(f"process not found: {pid}")
+        wait_state = None
+        outcome = None
         if sig == ProcessSignal.PAUSE:
-            process.status = ProcessStatus.PAUSED
+            selected_status = ProcessStatus.PAUSED
+            wait_state = PausedProcessWait()
         elif sig == ProcessSignal.RESUME:
-            process.status = ProcessStatus.RUNNABLE
+            selected_status = ProcessStatus.RUNNABLE
         elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
-            process.status = ProcessStatus.KILLED
-        process.status_message = (payload or {}).get("reason")
-        process.updated_at = utc_now()
-        process = self.processes.transition_process(
-            pid,
-            process.status,
-            expected_revision=process.revision,
-            status_message=process.status_message,
-        )
+            selected_status = ProcessStatus.KILLED
+            outcome = KilledProcessOutcome(code=sig.value)
+        else:  # pragma: no cover - ProcessSignal currently has no other value
+            raise ProcessError(f"unsupported process signal: {sig.value}")
+        takeover_scope = contextlib.nullcontext()
+        if (
+            process.status == ProcessStatus.RUNNING
+            and selected_status in {ProcessStatus.PAUSED, ProcessStatus.KILLED}
+        ):
+            if process.execution_owner_id is None or process.execution_lease_id is None:
+                raise ProcessError(f"running process has no execution lease: {pid}")
+            takeover_scope = trusted_process_execution_takeover(
+                pid,
+                source_revision=process.revision,
+                source_state_generation=process.state_generation,
+                source_execution_token=ProcessExecutionToken(
+                    pid=pid,
+                    generation=process.execution_generation,
+                    owner_id=process.execution_owner_id,
+                    lease_id=process.execution_lease_id,
+                ),
+                intended_status=selected_status,
+                reason="human interrupt takes over an execution lease",
+                nonce=new_id("process_takeover"),
+                wait_kind="paused" if selected_status == ProcessStatus.PAUSED else None,
+                outcome_code=sig.value if selected_status == ProcessStatus.KILLED else None,
+            )
+        with takeover_scope:
+            process = self._transitions.transition(
+                pid,
+                selected_status,
+                expected_revision=process.revision,
+                expected_status=process.status,
+                expected_state_generation=process.state_generation,
+                wait_state=wait_state,
+                outcome=outcome,
+                status_message=(payload or {}).get("reason"),
+            )
         if process.status in self.TERMINAL_PROCESS_STATUSES:
             self.cancel_pending_for_process(
                 pid,
@@ -1754,7 +1794,7 @@ class HumanObjectManager:
         auto_policy: str | None = None,
         auto_answer: str | None = None,
     ) -> HumanRequest | None:
-        return await asyncio.to_thread(
+        return await self._blocking_work.run(
             self.process_next_terminal,
             human=human,
             auto_approve=auto_approve,
@@ -1887,50 +1927,13 @@ class HumanObjectManager:
                     if status != HumanRequestStatus.APPROVED
                     else None
                 )
-                if process is not None and process.status == ProcessStatus.WAITING_HUMAN:
-                    remaining = [
-                        pending
-                        for pending in self.requests.list(
-                            pid=request.pid,
-                            status=HumanRequestStatus.PENDING,
-                        )
-                        if pending.blocking
-                    ]
-                    if remaining:
-                        process.status = ProcessStatus.WAITING_HUMAN
-                        process.status_message = "waiting for human requests " + ",".join(
-                            pending.request_id for pending in remaining[:8]
-                        )
-                    else:
-                        # Permission denials still wake the process so it can observe
-                        # the structured failed operation. Generic rejections pause.
-                        if release_parent is not None:
-                            process.status = ProcessStatus.PAUSED
-                            process.status_message = (
-                                f"data release {status.value} for Human request "
-                                f"{release_parent.request_id}"
-                            )
-                        else:
-                            process.status = (
-                                ProcessStatus.RUNNABLE
-                                if status == HumanRequestStatus.APPROVED or permission_related
-                                else ProcessStatus.PAUSED
-                            )
-                            process.status_message = (
-                                None
-                                if status == HumanRequestStatus.APPROVED
-                                else f"human rejected {request_id}"
-                            )
-                    process.updated_at = utc_now()
-                    self.processes.patch_process(
-                        process.pid,
-                        {
-                            "status": process.status,
-                            "status_message": process.status_message,
-                            "updated_at": process.updated_at,
-                        },
-                        expected_revision=process.revision,
-                    )
+                self._transition_after_human_decision(
+                    process,
+                    request,
+                    status,
+                    permission_related=permission_related,
+                    release_parent=release_parent,
+                )
                 response_evidence = {
                     "request_id": request_id,
                     "status": status.value,
@@ -1956,6 +1959,66 @@ class HumanObjectManager:
                     decision=response_evidence,
                 )
         return request
+
+    def _transition_after_human_decision(
+        self,
+        process: Any | None,
+        request: HumanRequest,
+        status: HumanRequestStatus,
+        *,
+        permission_related: bool,
+        release_parent: HumanRequest | None,
+    ) -> None:
+        if process is None or process.status != ProcessStatus.WAITING_HUMAN:
+            return
+        remaining = [
+            pending
+            for pending in self.requests.list(
+                pid=request.pid,
+                status=HumanRequestStatus.PENDING,
+            )
+            if pending.blocking
+        ]
+        if remaining:
+            selected_status = ProcessStatus.WAITING_HUMAN
+            wait_state = HumanProcessWait(
+                request_ids=tuple(pending.request_id for pending in remaining)
+            )
+            status_message = None
+        elif release_parent is not None:
+            selected_status = ProcessStatus.PAUSED
+            wait_state = PausedProcessWait()
+            status_message = (
+                f"data release {status.value} for Human request "
+                f"{release_parent.request_id}"
+            )
+        else:
+            # Permission denials wake the process so it can observe the
+            # structured failed operation. Generic rejections remain paused.
+            selected_status = (
+                ProcessStatus.RUNNABLE
+                if status == HumanRequestStatus.APPROVED or permission_related
+                else ProcessStatus.PAUSED
+            )
+            wait_state = (
+                PausedProcessWait()
+                if selected_status == ProcessStatus.PAUSED
+                else None
+            )
+            status_message = (
+                None
+                if status == HumanRequestStatus.APPROVED
+                else f"human rejected {request.request_id}"
+            )
+        self._transitions.transition(
+            process.pid,
+            selected_status,
+            expected_revision=process.revision,
+            expected_status=ProcessStatus.WAITING_HUMAN,
+            expected_state_generation=process.state_generation,
+            wait_state=wait_state,
+            status_message=status_message,
+        )
 
     def _cancel_linked_request_for_release(
         self,
@@ -2594,30 +2657,34 @@ class HumanObjectManager:
                         if pending.blocking
                     ]
                     if remaining:
-                        process.status_message = "waiting for human requests " + ",".join(
-                            pending.request_id for pending in remaining[:8]
+                        selected_status = ProcessStatus.WAITING_HUMAN
+                        wait_state = HumanProcessWait(
+                            request_ids=tuple(
+                                pending.request_id for pending in remaining
+                            )
                         )
+                        status_message = None
                     else:
-                        process.status = ProcessStatus.PAUSED
+                        selected_status = ProcessStatus.PAUSED
+                        wait_state = PausedProcessWait()
                         if release_parent is not None:
-                            process.status_message = (
+                            status_message = (
                                 "data release provider outcome unknown for Human request "
                                 f"{release_parent.request_id}; manual recovery required"
                             )
                         else:
-                            process.status_message = (
+                            status_message = (
                                 f"human provider outcome unknown for request {latest.request_id}; "
                                 "manual recovery required"
                             )
-                    process.updated_at = utc_now()
-                    self.processes.patch_process(
+                    self._transitions.transition(
                         process.pid,
-                        {
-                            "status": process.status,
-                            "status_message": process.status_message,
-                            "updated_at": process.updated_at,
-                        },
+                        selected_status,
                         expected_revision=process.revision,
+                        expected_status=ProcessStatus.WAITING_HUMAN,
+                        expected_state_generation=process.state_generation,
+                        wait_state=wait_state,
+                        status_message=status_message,
                     )
 
                 evidence = {

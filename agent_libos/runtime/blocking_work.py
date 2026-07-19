@@ -3,12 +3,25 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import threading
+from concurrent.futures import CancelledError as FutureCancelledError
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from functools import partial
 from typing import Any, Callable, TypeVar
 
+from agent_libos.ports.blocking_work import run_blocking_once
+
 
 T = TypeVar("T")
+
+
+def _settled_worker_error(future: Future[Any]) -> BaseException | None:
+    if not future.done():
+        return None
+    try:
+        future.result()
+    except BaseException as exc:
+        return exc
+    return None
 
 
 class BlockingWorkSupervisor:
@@ -43,15 +56,39 @@ class BlockingWorkSupervisor:
 
         wrapped = asyncio.wrap_future(future)
         cancelled = False
+        caller_task = asyncio.current_task()
+        initial_cancellations = (
+            caller_task.cancelling() if caller_task is not None else 0
+        )
         while True:
             try:
                 result = await asyncio.shield(wrapped)
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
+                worker_error = _settled_worker_error(future)
+                if worker_error is not None:
+                    selected_error: BaseException = (
+                        exc
+                        if isinstance(worker_error, FutureCancelledError)
+                        else worker_error
+                    )
+                    caller_cancelled_now = bool(
+                        caller_task is not None
+                        and caller_task.cancelling() > initial_cancellations
+                    )
+                    if cancelled or caller_cancelled_now:
+                        raise BaseExceptionGroup(
+                            "runtime blocking work was cancelled while its worker failed",
+                            [asyncio.CancelledError(), selected_error],
+                        ) from None
+                    raise selected_error
                 cancelled = True
                 continue
-            except BaseException:
+            except BaseException as exc:
                 if cancelled:
-                    raise asyncio.CancelledError() from None
+                    raise BaseExceptionGroup(
+                        "runtime blocking work was cancelled while its worker failed",
+                        [asyncio.CancelledError(), exc],
+                    ) from None
                 raise
             if cancelled:
                 raise asyncio.CancelledError()
@@ -81,7 +118,9 @@ class BlockingWorkSupervisor:
             return True
 
     async def ashutdown(self) -> bool:
-        return await asyncio.get_running_loop().run_in_executor(None, self.shutdown)
+        # This supervisor cannot submit its own shutdown to the executor that it
+        # is closing. A one-call owned executor is drained by the await itself.
+        return await run_blocking_once(self.shutdown)
 
 
 __all__ = ["BlockingWorkSupervisor"]

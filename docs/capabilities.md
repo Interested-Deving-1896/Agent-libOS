@@ -54,6 +54,24 @@ Internal wait polling does not repeatedly consume authority.
 Capability issuance itself commits the new row, process attachment, event,
 audit, and issuer reservation as one transaction.
 
+Capability mutation admission is enforced at the durable authority-service
+boundary, not only at selected Runtime façade methods. The 48 public
+`CapabilityManager` methods have a machine-checked read/mutation/mixed
+classification; all five public finite-use lease methods and all eight public
+capability-mutation service methods are mutation guarded as well. Mixed
+authorization methods remain readable for diagnosis when `audit=false`, while
+their evidence-writing `audit=true` branch is mutation admission. Therefore a
+recovery-required `CLOSE_FAILED` runtime cannot be bypassed through
+`manager.leases` or `manager.mutations`.
+
+`AuthorityTransaction` acquires lifecycle admission when its context is
+entered and retains it through reauthorization, caller business work,
+finite-use settlement, and UnitOfWork commit. Authority services revalidate the
+recovery-fence epoch after acquiring the store lock and again before commit.
+If a recovery fence invalidates an already-admitted waiter, its capability,
+reservation, event, and audit writes roll back together. Startup and recovery
+code can still mutate under their explicit internal lifecycle lease.
+
 Launch authority is additionally bounded by a metadata-only
 [`TaskAuthorityManifest`](task_authority_manifest.md). Image requirements do
 not compile into capabilities. Model permission requests are rejected before a
@@ -206,7 +224,11 @@ All authority mutation goes through explicit operations:
   capability-minting right: it can only transfer rights the actor already has,
   cannot create `deny`/`ask` policy records, and cannot transfer finite-use
   capabilities onward. Overlapping `deny` or `ask` boundaries, or malformed
-  authority rules on the covering parent, fail closed before transfer.
+  authority rules on the covering parent, fail closed before transfer. The
+  selected `admin`/`grant` decision and the complete transferred-right parent
+  chain are recomputed inside the issue AuthorityTransaction; its finite-use
+  reservation, capability row, process attachment, event, audit, and lineage
+  links therefore commit together against one authority/target generation.
 - `delegate(parent, child, spec)`: `parent` must hold a covering delegable
   `allow` capability. Delegation can only attenuate resource, rights, expiry,
   constraints, and delegation depth. Finite-use capabilities are consumed by

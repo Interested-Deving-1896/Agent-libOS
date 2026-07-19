@@ -295,6 +295,11 @@ descriptive metadata; it cannot rewind or recreate the provider resource.
 Checkpoint fork drops owned and borrowed `EXTERNAL_REF` roots and object
 capabilities rather than aliasing the source terminal. Reopening the runtime
 releases stale PTY objects rather than trying to reconnect a host process.
+If a live Runtime is recovery-fenced, its explicit diagnostics handoff invokes
+only the PTY module's recovery-safe transient cleanup: it stops reader/monitor
+workers and closes the process/FD handle without changing that durable Object
+or any evidence row. Failure leaves the store open and the callback retryable;
+success lets same-process reopen perform the normal stale-object recovery.
 
 ## External Effect Ledger
 
@@ -431,6 +436,38 @@ sidecar `flock` where available or an exclusive database lock as fallback, and
 PostgreSQL uses a database/schema-scoped session advisory lock. Another
 writable Runtime cannot open the same database until the active Runtime closes
 and releases the lease.
+
+Ordinary shutdown claims the exact store guard immediately before close. Its
+async form runs backend close off-loop and drains the result through caller
+cancellation. After the backend release point, warnings are retained on
+idempotent shutdown readback and a leader's cancellation or control-flow
+diagnostic is not replayed to concurrent followers. If ownership was already
+lost before shutdown begins, durable shutdown evidence is unavailable; the
+runtime records that warning in memory, still drains the transient graph and
+clears its stale exact guard, and ends `closed`.
+
+A recovery-required fence is different from an ordinary drain timeout. It is
+monotonic for the affected Runtime instance: every later `close()` or
+`shutdown()` remains fail closed with the recovery reason and leaves the store,
+commit guard, backend lease, transient components, and diagnostic state intact.
+Ordinary shutdown never clears that fence, writes shutdown audit/event evidence,
+runs user finalizers, or tears down components behind an active admission.
+
+Once diagnostics have been captured, the owner may explicitly hand the store
+off with `Runtime.release_recovery_diagnostics()` or, for an async host,
+`await Runtime.arelease_recovery_diagnostics()`. The operation rejects an
+unfenced/open Runtime, a forged internal authority, and any active admission or
+shutdown attempt. It writes no audit, event, terminal, or finalizer records and
+does not run ordinary finalizers; it runs only callbacks explicitly registered
+for no-write recovery cleanup, stops the process-local transient worker graph,
+then releases the exact commit guard and backend active-runtime lease. Failure
+or cancellation before ownership release is drained and leaves the handoff
+retryable. Once backend ownership is irreversibly released, this Runtime becomes
+closed even if close reports a warning or caller cancellation arrives; warning
+diagnostics remain on idempotent release readback and control-flow interruption
+is propagated. A subsequent `Runtime.open()` or `Runtime.aopen()` of the same
+target creates a fresh lifecycle and runs authoritative startup recovery before
+normal mutation admission resumes.
 
 Audit and event rows are append-only through the Runtime API and participate in
 the same store transactions as the state transitions they evidence. This is an

@@ -43,7 +43,18 @@ class ModuleHost(Protocol):
 
     def bind_shutdown_finalizer(self, finalizer: Callable[[], Any]) -> None: ...
 
+    def bind_recovery_cleanup(self, cleanup: Callable[[], Any]) -> None: ...
+
+    def require_recovery_cleanup_lease(self) -> None: ...
+
     def bind_object_release_finalizer(self, finalizer: Callable[..., None]) -> None: ...
+
+    def bind_durable_object_release_finalizer(
+        self,
+        finalizer_id: str,
+        prepare: Callable[..., Any],
+        finalize: Callable[..., None],
+    ) -> None: ...
 
     def add_handle_to_process_view(self, pid: str, handle: Any) -> None: ...
 
@@ -81,11 +92,19 @@ class ModuleContext:
     syscalls: dict[str, SyscallHandler] = field(default_factory=dict)
     provider_hooks: dict[str, list[ProviderHook]] = field(default_factory=lambda: defaultdict(list))
     startup_hooks: dict[str, StartupHook] = field(default_factory=dict)
+    durable_object_release_finalizers: dict[
+        str,
+        tuple[Callable[..., Any], Callable[..., None]],
+    ] = field(default_factory=dict)
     _declared_tools: frozenset[str] = field(init=False, repr=False)
     _declared_images: frozenset[str] = field(init=False, repr=False)
     _declared_syscalls: frozenset[str] = field(init=False, repr=False)
     _declared_provider_hooks: frozenset[str] = field(init=False, repr=False)
     _declared_startup_hooks: frozenset[str] = field(init=False, repr=False)
+    _declared_durable_object_release_finalizers: frozenset[str] = field(
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._declared_tools = frozenset(self.manifest.provides.tools)
@@ -93,6 +112,9 @@ class ModuleContext:
         self._declared_syscalls = frozenset(self.manifest.provides.syscalls)
         self._declared_provider_hooks = frozenset(self.manifest.provides.provider_hooks)
         self._declared_startup_hooks = frozenset(self.manifest.provides.startup_hooks)
+        self._declared_durable_object_release_finalizers = frozenset(
+            self.manifest.provides.durable_object_release_finalizers
+        )
 
     @property
     def module_id(self) -> str:
@@ -143,6 +165,35 @@ class ModuleContext:
             raise ValidationError(f"startup hook is not callable: {hook_name}")
         self.startup_hooks[hook_name] = hook
 
+    def bind_durable_object_release_finalizer(
+        self,
+        finalizer_id: str,
+        prepare: Callable[..., Any],
+        finalize: Callable[..., None],
+    ) -> None:
+        selected_id = self._normalize_name(
+            finalizer_id,
+            "durable object release finalizer",
+        )
+        self._require_declared(
+            selected_id,
+            self._declared_durable_object_release_finalizers,
+            "durable object release finalizer",
+        )
+        if selected_id in self.durable_object_release_finalizers:
+            raise ValidationError(
+                "module registered duplicate durable object release finalizer: "
+                f"{selected_id}"
+            )
+        if not callable(prepare) or not callable(finalize):
+            raise ValidationError(
+                "durable object release finalizer callbacks must be callable"
+            )
+        self.durable_object_release_finalizers[selected_id] = (
+            prepare,
+            finalize,
+        )
+
     def registered_summary(self) -> dict[str, Any]:
         return {
             "tools": [tool.spec().name for tool in self.tools],
@@ -150,6 +201,9 @@ class ModuleContext:
             "syscalls": sorted(self.syscalls),
             "provider_hooks": {kind: len(hooks) for kind, hooks in self.provider_hooks.items()},
             "startup_hooks": sorted(self.startup_hooks),
+            "durable_object_release_finalizers": sorted(
+                self.durable_object_release_finalizers
+            ),
         }
 
     def _require_declared(self, value: str, declared: Container[str], kind: str) -> None:

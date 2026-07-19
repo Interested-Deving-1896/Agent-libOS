@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -22,11 +23,17 @@ from agent_libos.models import (
     ObjectOwnerKind,
     ProcessStatus,
     ResourceBudget,
+    ToolSpec,
     ValidationResult,
 )
-from agent_libos.models.exceptions import ResourceLimitExceeded, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    ResourceLimitExceeded,
+    ValidationError,
+)
 from agent_libos.runtime.syscalls import LibOSSyscallSession
 from agent_libos.substrate import CommandMetrics, LocalResourceProviderSubstrate, SubprocessLimits, WindowsJobObject
+from agent_libos.tools.broker import ToolBroker
 from agent_libos.tools.sandbox import DenoTypescriptSandbox, SandboxBackend
 from agent_libos.utils.serde import dumps
 from tests.support.deno import (
@@ -48,6 +55,22 @@ def _pid_is_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+def test_tool_broker_sort_key_uses_persisted_spec_without_loaded_handle() -> None:
+    broker = object.__new__(ToolBroker)
+    broker.registry = SimpleNamespace(handle=lambda _tool_id: None)
+    broker.extensions = SimpleNamespace(
+        get_tool_spec=lambda _tool_id: ToolSpec(
+            name="persisted_name",
+            description="persisted-only tool",
+        )
+    )
+
+    assert broker._tool_sort_key("tool_persisted") == (
+        "persisted_name",
+        "tool_persisted",
+    )
+
 
 class TestJitSecurity:
 
@@ -517,7 +540,9 @@ class TestJitSecurity:
         pid = self._spawn_multiplexed_process()
 
         assert JIT_MULTIPLEXER_TOOL_NAME not in self._schema_names(pid)
-        assert JIT_MULTIPLEXER_TOOL_NAME not in {row['name'] for row in self.runtime.tools.model_visible_tools(pid)}
+        assert JIT_MULTIPLEXER_TOOL_NAME not in {
+            row['name'] for row in self.runtime.tools.model_visible_tools(pid)
+        }
 
     @pytest.mark.real_deno
     def test_multiplexer_cannot_dispatch_static_or_other_process_tool(self) -> None:
@@ -613,6 +638,66 @@ class TestJitSecurity:
         session = LibOSSyscallSession(self.runtime, pid)
         with pytest.raises(ValidationError):
             asyncio.run(session.handle('shell.run', {'argv': 'git status'}))
+
+    def test_capability_inspect_revalidates_subject_after_concurrent_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(goal="inspect own capability")
+        other = self.runtime.process.spawn(goal="must not receive inspected authority")
+        capability = self.runtime.capability.issue_trusted(
+            pid,
+            "test:syscall-inspect",
+            [CapabilityRight.READ],
+            issued_by="test.host",
+        )
+        original_inspect = self.runtime.capability.inspect
+
+        def transfer_before_authoritative_read(capability_id: str) -> dict[str, Any]:
+            current = self.runtime.uow.authority.get_capability(capability_id)
+            assert current is not None
+            self.runtime.uow.authority.update_capability(
+                replace(current, subject=other)
+            )
+            return original_inspect(capability_id)
+
+        monkeypatch.setattr(
+            self.runtime.capability,
+            "inspect",
+            transfer_before_authoritative_read,
+        )
+        session = LibOSSyscallSession(self.runtime, pid)
+
+        with pytest.raises(
+            CapabilityDenied,
+            match="inspect only their own capabilities",
+        ):
+            session._capability_inspect({"capability_id": capability.cap_id})
+
+    def test_capability_inspect_rejects_noncanonical_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pid = self.runtime.process.spawn(goal="reject malformed capability status")
+        capability = self.runtime.capability.issue_trusted(
+            pid,
+            "test:syscall-status",
+            [CapabilityRight.READ],
+            issued_by="test.host",
+        )
+        monkeypatch.setattr(
+            self.runtime.capability,
+            "inspect",
+            lambda capability_id: {
+                "cap_id": capability_id,
+                "subject": pid,
+                "status": "future-status",
+            },
+        )
+        session = LibOSSyscallSession(self.runtime, pid)
+
+        with pytest.raises(ValidationError, match="invalid capability status"):
+            session._capability_inspect({"capability_id": capability.cap_id})
 
     @pytest.mark.real_deno
     def test_deno_jit_human_approval_is_internal_to_syscall(self) -> None:

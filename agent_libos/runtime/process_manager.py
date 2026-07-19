@@ -2,25 +2,38 @@ from __future__ import annotations
 
 import builtins
 import contextlib
-from collections.abc import Callable
+import inspect
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from copy import deepcopy
 from pathlib import PurePosixPath, PureWindowsPath
-from typing import Any, Iterable
+from typing import Any, Iterable, NoReturn
 
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig
 from agent_libos.memory.data_labels import metadata_from_labels, propagate_object_labels
 from agent_libos.memory.object_memory import ObjectMemoryManager
-from agent_libos.models.exceptions import CapabilityDenied, NotFound, ProcessError, ProcessWaitRequired, ValidationError
+from agent_libos.models.exceptions import (
+    CapabilityDenied,
+    NotFound,
+    ProcessError,
+    ProcessWaitRequired,
+    RuntimePublicationPending,
+    ValidationError,
+)
 from agent_libos.utils.ids import new_id, utc_now
-from agent_libos.utils.serde import loads
 from agent_libos.models import (
     AgentProcess,
     CapabilityRight,
+    ChildProcessWait,
     DataFlowContext,
     DataLabels,
     EventType,
+    ExitedProcessOutcome,
+    FailedProcessOutcome,
     ForkMode,
+    HostResumeProcessWait,
+    KilledProcessOutcome,
     MemoryView,
     MemoryViewSpec,
     MergePolicy,
@@ -29,17 +42,31 @@ from agent_libos.models import (
     ObjectMetadata,
     ObjectOwnerKind,
     ObjectType,
+    OperationOutcome,
+    OperationState,
     Provenance,
     ProcessMessage,
+    ProcessCursor,
+    ProcessExecutionToken,
     ProcessResult,
     ProcessSignal,
     ProcessStatus,
+    ProcessWaitState,
+    PausedProcessWait,
     ResourceBudget,
     ResourceUsage,
+    RuntimePublicationCursor,
     ViewMode,
 )
 from agent_libos.runtime.audit_manager import AuditManager
 from agent_libos.runtime.event_bus import EventBus
+from agent_libos.process_transition import ProcessTransitionService
+from agent_libos.process_execution import (
+    current_process_execution_token,
+    trusted_process_control_mutation,
+    trusted_process_execution_takeover,
+    trusted_terminal_process_mutation,
+)
 from agent_libos.storage import UnitOfWork
 
 
@@ -47,7 +74,6 @@ class ProcessManager:
     """Process lifecycle primitive."""
 
     TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
-    HOST_RESUME_REQUIRED_PREFIX = "host_resume_required:"
 
     def __init__(
         self,
@@ -56,16 +82,26 @@ class ProcessManager:
         capabilities: CapabilityManager,
         audit: AuditManager,
         events: EventBus,
+        require_recovery_lease: Callable[[], None],
         config: AgentLibOSConfig | None = None,
         resources: Any | None = None,
         llm_profile_resolver: Callable[[str, str | None], str] | None = None,
         authority_manifests: Any | None = None,
         data_flow: Any | None = None,
         object_task_terminal_notifier: Callable[[str], None] | None = None,
+        failed_launch_artifact_cleanup: Callable[[dict[str, Any]], None] | None = None,
         owner_instance_id: str = "runtime.local",
+        recovery_required_callback: Callable[..., None] | None = None,
+        recovery_terminalization_scope: (
+            Callable[[str], AbstractContextManager[Any]] | None
+        ) = None,
+        transitions: ProcessTransitionService | None = None,
     ):
         self.config = config or DEFAULT_CONFIG
         self.store = unit_of_work.processes
+        self._authority = unit_of_work.authority
+        self._evidence = unit_of_work.evidence
+        self.publications = unit_of_work.publications
         self.objects = unit_of_work.objects
         self.memory = memory
         self.capabilities = capabilities
@@ -76,11 +112,58 @@ class ProcessManager:
         self.authority_manifests = authority_manifests
         self.data_flow = data_flow
         self._before_spawn_hooks: builtins.list[Callable[[str], None]] = []
-        self._after_spawn_hooks: builtins.list[Callable[[str, str], None]] = []
+        self._after_spawn_hooks: builtins.list[Callable[[str, str, str], None]] = []
         self._object_task_terminal_notifier = object_task_terminal_notifier
+        self._failed_launch_artifact_cleanup = failed_launch_artifact_cleanup
         self.owner_instance_id = str(owner_instance_id)
+        self._require_recovery_lease = require_recovery_lease
+        self._recovery_required_callback = recovery_required_callback
+        # Preserve the builder-bound lifecycle method as an immutable local
+        # fallback. Tests and adapters may wrap the primary callback; an
+        # interruption before that wrapper marks the lifecycle must not leave
+        # mutation admission open.
+        self._recovery_required_fallback = recovery_required_callback
+        if (
+            recovery_required_callback is not None
+            and recovery_terminalization_scope is None
+        ):
+            raise RuntimeError(
+                "recovery fencing requires a terminalization scope"
+            )
+        self._recovery_terminalization_scope = (
+            recovery_terminalization_scope
+            if recovery_terminalization_scope is not None
+            else lambda _publication_id: contextlib.nullcontext()
+        )
+        self.transitions = transitions or ProcessTransitionService(self.store)
 
-    def add_after_spawn_hook(self, hook: Callable[[str, str], None]) -> None:
+    def add_after_spawn_hook(self, hook: Callable[..., None]) -> None:
+        """Register a spawn hook, adapting the legacy two-argument shape."""
+
+        try:
+            signature = inspect.signature(hook)
+        except (TypeError, ValueError):
+            self._after_spawn_hooks.append(hook)
+            return
+        try:
+            signature.bind("pid", "image_id", "publication_id")
+        except TypeError as three_argument_error:
+            try:
+                signature.bind("pid", "image_id")
+            except TypeError:
+                raise three_argument_error
+
+            def legacy_hook(
+                pid: str,
+                image_id: str,
+                _publication_id: str,
+                *,
+                _hook: Callable[..., None] = hook,
+            ) -> None:
+                _hook(pid, image_id)
+
+            self._after_spawn_hooks.append(legacy_hook)
+            return
         self._after_spawn_hooks.append(hook)
 
     def add_before_spawn_hook(self, hook: Callable[[str], None]) -> None:
@@ -126,11 +209,8 @@ class ProcessManager:
         pid = new_id("pid")
         selected_llm_profile = self._resolve_root_llm_profile(selected_image, llm_profile_id)
         cwd = self._normalize_working_directory(working_directory or self.config.process.default_working_directory)
-        publication_id = self._begin_launch_publication(
-            pid=pid,
-            launch_kind="spawn",
-            image_id=selected_image,
-            parent_pid=None,
+        publication_id, control_scope = self._begin_controlled_launch(
+            pid, "spawn", selected_image, None
         )
         try:
             process = AgentProcess(
@@ -154,12 +234,12 @@ class ProcessManager:
             )
             self.store.insert_process(process)
             self._publication_phase(publication_id, "process_inserted")
-            self.memory.ensure_process_namespace(pid)
-            self._publication_phase(publication_id, "namespace_created")
-            goal_handle = self._ensure_goal(pid, goal)
-            self._publication_phase(publication_id, "goal_created", goal_oid=goal_handle.oid)
-            # A process starts with a mutable view rooted at its goal. Later tool
-            # results are appended to this view by the LLM executor.
+            goal_handle = self._initialize_launch_goal(
+                publication_id,
+                pid,
+                goal,
+            )
+            # A process starts with a mutable goal-rooted view; later results append to it.
             view = self.memory.create_view(pid, [goal_handle], mode=ViewMode.MUTABLE)
             process = self._get(pid)
             process.goal_oid = goal_handle.oid
@@ -174,40 +254,20 @@ class ProcessManager:
                 },
                 expected_revision=process.revision,
             )
-            if self.authority_manifests is not None:
-                manifest = self.authority_manifests.prepare_launch(
-                    pid=pid,
-                    image_id=selected_image,
-                    goal_ref=goal_handle.oid,
-                    supplied=authority_manifest,
-                    authorized_capabilities=capabilities or [],
-                    resource_budget=resource_budget,
-                    issued_by="process.spawn",
-                )
-                if manifest.resource_budget:
-                    process = self._get(pid)
-                    process.resource_budget = ResourceBudget(**manifest.resource_budget)
-                    process.updated_at = utc_now()
-                    process = self.store.patch_process(
-                        pid,
-                        {
-                            "resource_budget": process.resource_budget,
-                            "updated_at": process.updated_at,
-                        },
-                        expected_revision=process.revision,
-                    )
-                self._assert_goal_data_flow(pid, goal_handle)
-                self.authority_manifests.compile_root_capabilities(manifest)
-            else:
-                self._grant_specs(pid, capabilities or [], issued_by="process.spawn")
-            self._publication_phase(publication_id, "authority_compiled")
-            self._run_after_spawn_hooks(pid, selected_image)
+            self._compile_root_launch_authority(
+                publication_id,
+                pid=pid,
+                image_id=selected_image,
+                goal_handle=goal_handle,
+                capabilities=capabilities or [],
+                resource_budget=resource_budget,
+                authority_manifest=authority_manifest,
+            )
+            self._run_after_spawn_hooks(pid, selected_image, publication_id)
             self._publication_phase(publication_id, "image_configured")
             with self.store.transaction():
                 process = self._get(pid)
-                process.status = ProcessStatus.RUNNABLE
-                process.updated_at = utc_now()
-                process = self.store.transition_process(
+                process = self.transitions.transition(
                     pid,
                     ProcessStatus.RUNNABLE,
                     expected_revision=process.revision,
@@ -232,23 +292,20 @@ class ProcessManager:
                     output_refs=[goal_handle.oid],
                     decision={"image": selected_image, "working_directory": cwd, "llm_profile_id": selected_llm_profile},
                 )
-                if not self.store.advance_runtime_publication(
+                self._commit_launch_publication(
                     publication_id,
-                    state="committed",
-                    phase="committed",
                     receipt={
                         "phase": "committed",
                         "event_id": event.event_id,
                         "audit_id": audit.record_id,
                         "revision": process.revision,
                     },
-                    expected_states={"applying"},
-                ):
-                    raise ProcessError(f"cannot commit process publication: {publication_id}")
+                )
             return pid
-        except Exception as exc:
-            self._rollback_launch_publication(publication_id, pid, exc)
-            raise
+        except BaseException as exc:
+            return self._finish_failed_launch(publication_id, pid, exc)
+        finally:
+            control_scope.close()
 
     def fork(
         self,
@@ -278,11 +335,8 @@ class ProcessManager:
         selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
-        publication_id = self._begin_launch_publication(
-            pid=child_pid,
-            launch_kind="fork",
-            image_id=selected_image,
-            parent_pid=parent,
+        publication_id, control_scope = self._begin_controlled_launch(
+            child_pid, "fork", selected_image, parent
         )
         try:
             self._reserve_child_budget(parent, child_pid, selected_budget)
@@ -308,16 +362,15 @@ class ProcessManager:
             )
             self.store.insert_process(child)
             self._publication_phase(publication_id, "process_inserted")
-            self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
-            self._publication_phase(publication_id, "namespace_created")
-            goal_handle = self._ensure_goal(
+            goal_handle = self._initialize_launch_goal(
+                publication_id,
                 child_pid,
                 goal,
+                parent_pid=parent,
                 source_oids=self.flow_source_oids(parent, source_oids),
                 source_labels=source_labels,
                 source_context=source_context,
             )
-            self._publication_phase(publication_id, "goal_created", goal_oid=goal_handle.oid)
             requested_specs = [*(capabilities or []), *inherit_specs]
             manifest = None
             if self.authority_manifests is not None:
@@ -338,27 +391,17 @@ class ProcessManager:
                 spec = MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
             else:
                 spec = memory_view or MemoryViewSpec(mode=self._fork_mode_to_view_mode(fork_mode))
-            # Forking attenuates memory handles by default. The child can see only
-            # roots selected by the parent and only the rights granted into its view.
-            with self.memory.ownership_locked(), self.store.locked():
-                child_view = self.memory.fork_view(parent, child_pid, source_view, spec)
-                for root in child_view.roots:
-                    self._assert_object_data_flow(child_pid, root.oid)
-                child_view.roots.append(goal_handle)
-                child = self._get(child_pid)
-                child.goal_oid = goal_handle.oid
-                child.memory_view = child_view
-                child.updated_at = utc_now()
-                child = self.store.patch_process(
-                    child_pid,
-                    {
-                        "goal_oid": child.goal_oid,
-                        "memory_view": child.memory_view,
-                        "updated_at": child.updated_at,
-                    },
-                    expected_revision=child.revision,
-                )
-            self._compile_child_authority(
+            # Forking exposes only parent-selected roots and rights granted into the child view.
+            child = self._publish_fork_launch_view(
+                publication_id,
+                parent_pid=parent,
+                child_pid=child_pid,
+                source_view=source_view,
+                spec=spec,
+                goal_handle=goal_handle,
+            )
+            self._publish_child_launch_authority(
+                publication_id,
                 parent_pid=parent,
                 child_pid=child_pid,
                 manifest=manifest,
@@ -366,15 +409,12 @@ class ProcessManager:
                 inherit_specs=inherit_specs,
                 transition_kind="process.fork",
             )
-            self._publication_phase(publication_id, "authority_compiled")
-            self._run_after_spawn_hooks(child_pid, child.image_id)
+            self._run_after_spawn_hooks(child_pid, child.image_id, publication_id)
             self._publication_phase(publication_id, "image_configured")
             self._charge_child_creation(parent)
             with self.store.transaction():
                 child = self._get(child_pid)
-                child.status = ProcessStatus.RUNNABLE
-                child.updated_at = utc_now()
-                child = self.store.transition_process(
+                child = self.transitions.transition(
                     child_pid,
                     ProcessStatus.RUNNABLE,
                     expected_revision=child.revision,
@@ -405,23 +445,20 @@ class ProcessManager:
                         "llm_profile_id": selected_llm_profile,
                     },
                 )
-                if not self.store.advance_runtime_publication(
+                self._commit_launch_publication(
                     publication_id,
-                    state="committed",
-                    phase="committed",
                     receipt={
                         "phase": "committed",
                         "event_id": event.event_id,
                         "audit_id": audit.record_id,
                         "revision": child.revision,
                     },
-                    expected_states={"applying"},
-                ):
-                    raise ProcessError(f"cannot commit process publication: {publication_id}")
+                )
             return child_pid
-        except Exception as exc:
-            self._rollback_launch_publication(publication_id, child_pid, exc)
-            raise
+        except BaseException as exc:
+            return self._finish_failed_launch(publication_id, child_pid, exc)
+        finally:
+            control_scope.close()
 
     def spawn_child(
         self,
@@ -433,6 +470,7 @@ class ProcessManager:
         image: str | None = None,
         working_directory: str | None = None,
         initial_status: ProcessStatus | str = ProcessStatus.RUNNABLE,
+        initial_wait_state: ProcessWaitState | None = None,
         llm_profile_id: str | None = None,
         authority_manifest: Any | None = None,
         source_oids: Iterable[str] | None = None,
@@ -452,11 +490,8 @@ class ProcessManager:
         selected_llm_profile = self._resolve_child_llm_profile(parent_proc, llm_profile_id)
         now = utc_now()
         child_pid = new_id("pid")
-        publication_id = self._begin_launch_publication(
-            pid=child_pid,
-            launch_kind="spawn_child",
-            image_id=selected_image,
-            parent_pid=parent,
+        publication_id, control_scope = self._begin_controlled_launch(
+            child_pid, "spawn_child", selected_image, parent
         )
         try:
             self._reserve_child_budget(parent, child_pid, selected_budget)
@@ -482,18 +517,16 @@ class ProcessManager:
             )
             self.store.insert_process(child)
             self._publication_phase(publication_id, "process_inserted")
-            self.memory.ensure_process_namespace(child_pid, parent_pid=parent)
-            self._publication_phase(publication_id, "namespace_created")
-            goal_handle = self._ensure_goal(
+            goal_handle = self._initialize_launch_goal(
+                publication_id,
                 child_pid,
                 goal,
+                parent_pid=parent,
                 source_oids=self.flow_source_oids(parent, source_oids),
                 source_labels=source_labels,
                 source_context=source_context,
             )
-            self._publication_phase(publication_id, "goal_created", goal_oid=goal_handle.oid)
-            # Unlike fork(), spawn_child() starts from a fresh address-space-like
-            # Object Memory view rooted only at the child goal.
+            # Unlike fork(), spawn_child() starts with a fresh child-goal-only view.
             child = self._get(child_pid)
             child.memory_view = self.memory.create_view(child_pid, [goal_handle], mode=ViewMode.MUTABLE)
             child.goal_oid = goal_handle.oid
@@ -521,7 +554,8 @@ class ProcessManager:
                     issued_by=f"process.spawn_child:{parent}",
                 )
                 self._assert_goal_data_flow(child_pid, goal_handle)
-            self._compile_child_authority(
+            self._publish_child_launch_authority(
+                publication_id,
                 parent_pid=parent,
                 child_pid=child_pid,
                 manifest=manifest,
@@ -529,19 +563,17 @@ class ProcessManager:
                 inherit_specs=inherit_specs,
                 transition_kind="process.spawn_child",
             )
-            self._publication_phase(publication_id, "authority_compiled")
-            self._run_after_spawn_hooks(child_pid, child.image_id)
+            self._run_after_spawn_hooks(child_pid, child.image_id, publication_id)
             self._publication_phase(publication_id, "image_configured")
             self._charge_child_creation(parent)
             with self.store.transaction():
                 child = self._get(child_pid)
-                child.status = selected_initial_status
-                child.updated_at = utc_now()
-                child = self.store.transition_process(
+                child = self.transitions.transition(
                     child_pid,
                     selected_initial_status,
                     expected_revision=child.revision,
                     expected_status=ProcessStatus.CREATED,
+                    wait_state=initial_wait_state,
                 )
                 event = self.events.emit(
                     EventType.PROCESS_CREATED,
@@ -569,25 +601,22 @@ class ProcessManager:
                         "llm_profile_id": selected_llm_profile,
                     },
                 )
-                if not self.store.advance_runtime_publication(
+                self._commit_launch_publication(
                     publication_id,
-                    state="committed",
-                    phase="committed",
                     receipt={
                         "phase": "committed",
                         "event_id": event.event_id,
                         "audit_id": audit.record_id,
                         "revision": child.revision,
                     },
-                    expected_states={"applying"},
-                ):
-                    raise ProcessError(f"cannot commit process publication: {publication_id}")
+                )
             return child_pid
-        except Exception as exc:
-            self._rollback_launch_publication(publication_id, child_pid, exc)
-            raise
+        except BaseException as exc:
+            return self._finish_failed_launch(publication_id, child_pid, exc)
+        finally:
+            control_scope.close()
 
-    def exec(
+    def apply_exec_state(
         self,
         pid: str,
         image: str,
@@ -600,7 +629,10 @@ class ProcessManager:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
         _record_evidence: bool = True,
+        _capability_rollback_token: str | None = None,
     ) -> None:
+        """Apply the SQL/Object-Memory phase of an ImageBoot publication."""
+
         with self.store.transaction(include_object_payloads=True):
             self._exec_uncommitted(
                 pid,
@@ -614,6 +646,7 @@ class ProcessManager:
                 source_labels=source_labels,
                 source_context=source_context,
                 record_evidence=_record_evidence,
+                capability_rollback_token=_capability_rollback_token,
             )
 
     def _exec_uncommitted(
@@ -629,6 +662,7 @@ class ProcessManager:
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
         record_evidence: bool = True,
+        capability_rollback_token: str | None = None,
     ) -> None:
         process = self._get(pid)
         if process.status in self.TERMINAL_STATUSES:
@@ -652,6 +686,11 @@ class ProcessManager:
             for cap in self.capabilities.capabilities_for(pid):
                 if cap.resource.startswith("object:") or cap.resource == process_namespace_resource:
                     kept.append(cap.cap_id)
+                elif capability_rollback_token is not None:
+                    self.capabilities.stage_exec_revocation(
+                        cap.cap_id,
+                        rollback_token=capability_rollback_token,
+                    )
                 else:
                     self.capabilities.revoke(
                         cap.cap_id,
@@ -750,28 +789,18 @@ class ProcessManager:
             if child_proc.status not in self.TERMINAL_STATUSES:
                 if timeout == 0:
                     raise TimeoutError(f"child still running: {child}")
-                parent.status = ProcessStatus.WAITING_EVENT
-                parent.status_message = f"waiting for {child}"
-                parent.updated_at = utc_now()
-                parent = self.store.transition_process(
+                parent = self.transitions.transition(
                     pid,
                     ProcessStatus.WAITING_EVENT,
                     expected_revision=parent.revision,
-                    status_message=parent.status_message,
+                    expected_state_generation=parent.state_generation,
+                    wait_state=ChildProcessWait(child_pid=child),
                 )
+                wait_token = self.transitions.wait_token(parent)
                 child_proc = self._require_child(parent.pid, child)
                 if child_proc.status not in self.TERMINAL_STATUSES:
                     raise ProcessWaitRequired(child_pid=child, message=f"{pid} is waiting for child process {child}")
-                parent.status = ProcessStatus.RUNNABLE
-                parent.status_message = None
-                parent.updated_at = utc_now()
-                parent = self.store.transition_process(
-                    pid,
-                    ProcessStatus.RUNNABLE,
-                    expected_revision=parent.revision,
-                    expected_status=ProcessStatus.WAITING_EVENT,
-                    status_message=None,
-                )
+                parent = self.transitions.wake(wait_token, control=False)
         result_handle = None
         # Keep the receiver-domain check, source ownership transfer, and
         # handle publication under one lock domain so a mutable result cannot
@@ -779,8 +808,9 @@ class ProcessManager:
         with self.memory.ownership_locked(), self.store.locked():
             parent = self._get(pid)
             child_proc = self._require_child(parent.pid, child)
-            if child_proc.status_message and child_proc.status_message.startswith("result_oid:"):
-                oid = child_proc.status_message.split(":", 1)[1]
+            outcome = child_proc.outcome
+            if isinstance(outcome, (ExitedProcessOutcome, FailedProcessOutcome)) and outcome.result_oid:
+                oid = outcome.result_oid
                 self._assert_object_data_flow(pid, oid)
                 self.memory.preserve_process_owned(child, {oid})
                 result_handle = self.capabilities.handle_for_object(
@@ -790,16 +820,14 @@ class ProcessManager:
                     issued_by=f"process.wait:{child}",
                 )
                 parent = self._add_handle_to_process_view(parent, result_handle)
-            if parent.status == ProcessStatus.WAITING_EVENT and parent.status_message == f"waiting for {child}":
-                parent.status = ProcessStatus.RUNNABLE
-                parent.status_message = None
-                parent.updated_at = utc_now()
-                parent = self.store.transition_process(
-                    pid,
-                    ProcessStatus.RUNNABLE,
-                    expected_revision=parent.revision,
-                    expected_status=ProcessStatus.WAITING_EVENT,
-                    status_message=None,
+            if (
+                parent.status == ProcessStatus.WAITING_EVENT
+                and isinstance(parent.wait_state, ChildProcessWait)
+                and parent.wait_state.child_pid == child
+            ):
+                parent = self.transitions.wake(
+                    self.transitions.wait_token(parent),
+                    control=False,
                 )
         self.audit.record(
             actor=pid,
@@ -808,7 +836,15 @@ class ProcessManager:
             output_refs=[result_handle.oid] if result_handle else [],
             decision={"child_status": child_proc.status.value},
         )
-        return ProcessResult(pid=child, status=child_proc.status, result=result_handle, message=child_proc.status_message)
+        return ProcessResult(
+            pid=child,
+            status=child_proc.status,
+            result=result_handle,
+            message=child_proc.status_message,
+            wait_state=child_proc.wait_state,
+            outcome=child_proc.outcome,
+            state_generation=child_proc.state_generation,
+        )
 
     def set_working_directory(self, pid: str, path: str) -> AgentProcess:
         process = self._get(pid)
@@ -863,32 +899,52 @@ class ProcessManager:
         sig = ProcessSignal(signal)
         self._require_signal_applicable(child_proc, sig)
         payload: dict[str, Any] = {}
+        reason_handle: ObjectHandle | None = None
+        takeover_scope = self._signal_takeover_scope(
+            child_proc,
+            sig,
+            reason_text=reason,
+            reason_action="process.signal_child.reason" if reason is not None else None,
+            require_host_resume=False,
+        )
         # The labeled reason carrier is part of the signal transition, not a
         # preparatory side effect.  Keep its Object payload, capability, child
         # MemoryView root, process state, event, and audit in one rollback scope.
-        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
-            if reason is not None:
-                reason_handle = self._create_flow_text_carrier(
-                    recipient_pid=child,
-                    text=reason,
-                    payload_field="reason",
-                    object_type=ObjectType.MESSAGE,
-                    title="Process signal reason",
-                    tags=["process_signal", "reason"],
-                    created_from_action="process.signal_child.reason",
-                    source_pid=pid,
-                    source_oids=source_oids,
-                    source_labels=source_labels,
-                    source_context=source_context,
+        with self.memory.ownership_locked(), self.store.transaction(
+            include_object_payloads=True
+        ):
+            with takeover_scope, trusted_process_control_mutation(
+                child,
+                allowed_statuses={child_proc.status},
+                reason="process.signal_child changes an authorized child",
+            ):
+                if reason is not None:
+                    reason_handle = self._create_flow_text_carrier(
+                        recipient_pid=child,
+                        text=reason,
+                        payload_field="reason",
+                        object_type=ObjectType.MESSAGE,
+                        title="Process signal reason",
+                        tags=["process_signal", "reason"],
+                        created_from_action="process.signal_child.reason",
+                        source_pid=pid,
+                        source_oids=source_oids,
+                        source_labels=source_labels,
+                        source_context=source_context,
+                    )
+                    payload["reason_oid"] = reason_handle.oid
+                updated = self._apply_signal(
+                    child_proc,
+                    sig,
+                    payload=payload,
+                    allow_host_resume=False,
                 )
-                payload["reason_oid"] = reason_handle.oid
-            updated = self._apply_signal(
-                child_proc,
+            self._record_signal_transition(
+                updated,
                 sig,
                 payload=payload,
                 actor=pid,
                 action="process.signal_child",
-                allow_host_resume=False,
             )
         if updated.status in self.TERMINAL_STATUSES:
             self._complete_terminal_signal(updated, actor=pid, signal=sig)
@@ -949,30 +1005,104 @@ class ProcessManager:
         selected_payload = dict(payload or {})
         reason = selected_payload.pop("reason", None)
         self._require_signal_applicable(proc, sig)
-        with self.memory.ownership_locked(), self.store.transaction(include_object_payloads=True):
-            if reason is not None:
-                reason_handle = self._create_flow_text_carrier(
-                    recipient_pid=target,
-                    text=str(reason),
-                    payload_field="reason",
-                    object_type=ObjectType.MESSAGE,
-                    title="Process signal reason",
-                    tags=["process_signal", "reason"],
-                    created_from_action="process.signal.reason",
-                    source_pid=target,
+        reason_handle: ObjectHandle | None = None
+        reason_text = str(reason) if reason is not None else None
+        takeover_scope = self._signal_takeover_scope(
+            proc,
+            sig,
+            reason_text=reason_text,
+            reason_action="process.signal.reason" if reason is not None else None,
+            require_host_resume=_require_host_resume,
+        )
+        with self.memory.ownership_locked(), self.store.transaction(
+            include_object_payloads=True
+        ):
+            with takeover_scope, trusted_process_control_mutation(
+                target,
+                allowed_statuses={proc.status},
+                reason="process.signal applies trusted Host control",
+            ):
+                if reason_text is not None:
+                    reason_handle = self._create_flow_text_carrier(
+                        recipient_pid=target,
+                        text=reason_text,
+                        payload_field="reason",
+                        object_type=ObjectType.MESSAGE,
+                        title="Process signal reason",
+                        tags=["process_signal", "reason"],
+                        created_from_action="process.signal.reason",
+                        source_pid=target,
+                    )
+                    selected_payload["reason_oid"] = reason_handle.oid
+                updated = self._apply_signal(
+                    proc,
+                    sig,
+                    payload=selected_payload,
+                    allow_host_resume=True,
+                    require_host_resume=_require_host_resume,
                 )
-                selected_payload["reason_oid"] = reason_handle.oid
-            updated = self._apply_signal(
-                proc,
+            self._record_signal_transition(
+                updated,
                 sig,
                 payload=selected_payload,
                 actor="runtime",
                 action="process.signal",
-                allow_host_resume=True,
-                require_host_resume=_require_host_resume,
             )
         if updated.status in self.TERMINAL_STATUSES:
             self._complete_terminal_signal(updated, actor="runtime", signal=sig)
+
+    @staticmethod
+    def _signal_takeover_scope(
+        process: AgentProcess,
+        signal: ProcessSignal,
+        *,
+        reason_text: str | None,
+        reason_action: str | None,
+        require_host_resume: bool,
+    ) -> AbstractContextManager[Any]:
+        if process.status != ProcessStatus.RUNNING or signal not in {
+            ProcessSignal.PAUSE,
+            ProcessSignal.CANCEL,
+            ProcessSignal.TERMINATE,
+        }:
+            return contextlib.nullcontext()
+        if (
+            process.execution_owner_id is None
+            and process.execution_lease_id is None
+        ):
+            return contextlib.nullcontext()
+        if process.execution_owner_id is None or process.execution_lease_id is None:
+            raise ProcessError(
+                f"running process has an incomplete execution lease: {process.pid}"
+            )
+        intended_status = (
+            ProcessStatus.PAUSED
+            if signal == ProcessSignal.PAUSE
+            else ProcessStatus.KILLED
+        )
+        wait_kind = None
+        if signal == ProcessSignal.PAUSE:
+            wait_kind = "host_resume" if require_host_resume else "paused"
+        return trusted_process_execution_takeover(
+            process.pid,
+            source_revision=process.revision,
+            source_state_generation=process.state_generation,
+            source_execution_token=ProcessExecutionToken(
+                pid=process.pid,
+                generation=process.execution_generation,
+                owner_id=process.execution_owner_id,
+                lease_id=process.execution_lease_id,
+            ),
+            intended_status=intended_status,
+            reason="trusted process signal takes over an execution lease",
+            nonce=new_id("process_takeover"),
+            reason_text=reason_text,
+            reason_action=reason_action,
+            wait_kind=wait_kind,
+            outcome_code=(
+                signal.value if intended_status == ProcessStatus.KILLED else None
+            ),
+        )
 
     def _require_signal_applicable(self, proc: AgentProcess, sig: ProcessSignal) -> None:
         if proc.status in self.TERMINAL_STATUSES:
@@ -1009,6 +1139,7 @@ class ProcessManager:
         source_oids: Iterable[str] | None = None,
         source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
         source_context: DataFlowContext | None = None,
+        attach_to_view: bool = True,
     ) -> ObjectHandle:
         selected_sources = (
             self.flow_source_oids(source_pid, source_oids)
@@ -1047,7 +1178,8 @@ class ProcessManager:
                 parent_oids=selected_sources,
             ),
         )
-        self._add_handle_to_process_view(self._get(recipient_pid), handle)
+        if attach_to_view:
+            self._add_handle_to_process_view(self._get(recipient_pid), handle)
         return handle
 
     def _apply_signal(
@@ -1055,8 +1187,6 @@ class ProcessManager:
         proc: AgentProcess,
         sig: ProcessSignal,
         payload: dict[str, Any],
-        actor: str,
-        action: str,
         *,
         allow_host_resume: bool,
         require_host_resume: bool = False,
@@ -1068,61 +1198,80 @@ class ProcessManager:
         with self.store.transaction():
             proc = self._get(proc.pid)
             self._require_signal_applicable(proc, sig)
-            host_resume_required = bool(
-                proc.status_message
-                and proc.status_message.startswith(self.HOST_RESUME_REQUIRED_PREFIX)
-            )
+            host_resume_required = isinstance(proc.wait_state, HostResumeProcessWait)
             if sig == ProcessSignal.RESUME and host_resume_required and not allow_host_resume:
                 raise ProcessError(f"process requires explicit Host resume: {proc.pid}")
+            wait_state: ProcessWaitState | None = None
+            outcome = None
             if sig == ProcessSignal.PAUSE:
-                if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
-                    raise ProcessError(f"cannot pause waiting process: {proc.pid} status={proc.status.value}")
-                proc.status = ProcessStatus.PAUSED
+                selected_status = ProcessStatus.PAUSED
             elif sig == ProcessSignal.RESUME:
-                if proc.status in {ProcessStatus.WAITING_EVENT, ProcessStatus.WAITING_TOOL, ProcessStatus.WAITING_HUMAN}:
-                    raise ProcessError(f"cannot resume waiting process: {proc.pid} status={proc.status.value}")
                 if proc.status in {ProcessStatus.PAUSED, ProcessStatus.SUSPENDED}:
-                    proc.status = ProcessStatus.RUNNABLE
+                    selected_status = ProcessStatus.RUNNABLE
+                else:
+                    selected_status = proc.status
             elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
-                proc.status = ProcessStatus.KILLED
+                selected_status = ProcessStatus.KILLED
+            else:  # pragma: no cover - interrupt is rejected by _require_signal_applicable
+                raise ProcessError(f"unsupported process signal: {sig.value}")
             reason_oid = str(payload.get("reason_oid") or "").strip()
             if sig == ProcessSignal.PAUSE and require_host_resume:
-                proc.status_message = f"{self.HOST_RESUME_REQUIRED_PREFIX}{reason_oid}"
+                wait_state = HostResumeProcessWait(reason_oid=reason_oid)
             elif sig == ProcessSignal.PAUSE and host_resume_required:
                 # Ordinary child signaling must not erase an existing Host-only
                 # resume gate by pausing the process again with a new reason.
-                pass
-            else:
-                proc.status_message = f"result_oid:{reason_oid}" if reason_oid else None
-            proc.updated_at = utc_now()
-            proc = self.store.transition_process(
+                wait_state = proc.wait_state
+            elif sig == ProcessSignal.PAUSE:
+                wait_state = PausedProcessWait(reason_oid=reason_oid or None)
+            elif sig in {ProcessSignal.CANCEL, ProcessSignal.TERMINATE}:
+                outcome = KilledProcessOutcome(
+                    reason_oid=reason_oid or None,
+                    code=sig.value,
+                )
+            proc = self.transitions.transition(
                 proc.pid,
-                proc.status,
+                selected_status,
                 expected_revision=proc.revision,
-                status_message=proc.status_message,
+                expected_status=proc.status,
+                expected_state_generation=proc.state_generation,
+                wait_state=wait_state,
+                outcome=outcome,
+                control=True,
+                allowed_statuses={proc.status},
+                reason="trusted process signal state transition",
             )
-            if proc.status in self.TERMINAL_STATUSES:
-                self._release_child_budget(proc.pid)
-            self.events.emit(
-                EventType.PROCESS_SIGNAL,
-                source=actor,
-                target=proc.pid,
-                payload={"signal": sig.value, "payload": payload or {}},
-            )
-            self.audit.record(
-                actor=actor,
-                action=action,
-                target=f"process:{proc.pid}",
-                decision={"signal": sig.value, "payload": payload or {}},
-            )
-            if proc.status in self.TERMINAL_STATUSES:
-                self._wake_parent_waiting_on_child(proc)
         return proc
+
+    def _record_signal_transition(
+        self,
+        process: AgentProcess,
+        signal: ProcessSignal,
+        *,
+        payload: dict[str, Any],
+        actor: str,
+        action: str,
+    ) -> None:
+        if process.status in self.TERMINAL_STATUSES:
+            self._release_child_budget(process.pid)
+        self.events.emit(
+            EventType.PROCESS_SIGNAL,
+            source=actor,
+            target=process.pid,
+            payload={"signal": signal.value, "payload": payload or {}},
+        )
+        self.audit.record(
+            actor=actor,
+            action=action,
+            target=f"process:{process.pid}",
+            decision={"signal": signal.value, "payload": payload or {}},
+        )
+        if process.status in self.TERMINAL_STATUSES:
+            self._wake_parent_waiting_on_child(process)
 
     def _complete_terminal_signal(self, process: AgentProcess, *, actor: str, signal: ProcessSignal) -> None:
         preserve_oids: set[str] = set()
-        if process.status_message and process.status_message.startswith("result_oid:"):
-            preserve_oids.add(process.status_message.split(":", 1)[1])
+        if isinstance(process.outcome, KilledProcessOutcome) and process.outcome.reason_oid:
+            preserve_oids.add(process.outcome.reason_oid)
         self._complete_terminal_cleanup(
             process,
             actor=actor,
@@ -1243,14 +1392,20 @@ class ProcessManager:
             # row before applying the terminal transition so neither write wins
             # over the other.
             process = self._get(pid)
-            process.status = ProcessStatus.FAILED if failed else ProcessStatus.EXITED
-            process.status_message = f"result_oid:{result.oid}" if result is not None else None
-            process.updated_at = utc_now()
-            process = self.store.transition_process(
+            selected_status = ProcessStatus.FAILED if failed else ProcessStatus.EXITED
+            result_oid = result.oid if result is not None else None
+            outcome = (
+                FailedProcessOutcome(result_oid=result_oid)
+                if failed
+                else ExitedProcessOutcome(result_oid=result_oid)
+            )
+            process = self.transitions.transition(
                 pid,
-                process.status,
+                selected_status,
                 expected_revision=process.revision,
-                status_message=process.status_message,
+                expected_status=process.status,
+                expected_state_generation=process.state_generation,
+                outcome=outcome,
             )
             self._release_child_budget(pid)
             self.events.emit(
@@ -1769,21 +1924,14 @@ class ProcessManager:
             # domain check must therefore use that Host-written label record
             # before handing the caller a handle whose materialization will
             # still fail. Direct database tampering is outside this boundary.
-            rows = self.objects.select_table_rows(
-                "objects",
-                "oid = ? AND lifecycle_state IN (?, ?)",
-                (oid, "live", "released"),
-            )
-            if not rows:
-                raise NotFound(f"data-flow source object not found: {oid}")
             try:
-                metadata = ObjectMetadata.from_persisted(
-                    loads(rows[0].get("metadata_json"), {})
-                )
+                metadata = self.objects.get_persisted_object_metadata(oid)
             except (TypeError, ValueError) as exc:
                 raise ValidationError(
                     f"invalid persisted metadata for released object {oid}: {exc}"
                 ) from exc
+            if metadata is None:
+                raise NotFound(f"data-flow source object not found: {oid}")
             labels = DataLabels.from_object_metadata(metadata)
         self.authority_manifests.assert_data_flow_labels(
             pid,
@@ -1805,6 +1953,130 @@ class ProcessManager:
                 selected.append(oid)
                 seen.add(oid)
         return selected
+
+    def _initialize_launch_goal(
+        self,
+        publication_id: str,
+        pid: str,
+        goal: dict[str, Any] | str | ObjectHandle | None,
+        *,
+        parent_pid: str | None = None,
+        source_oids: Iterable[str] | None = None,
+        source_labels: ObjectMetadata | DataLabels | dict[str, Any] | None = None,
+        source_context: DataFlowContext | None = None,
+    ) -> ObjectHandle:
+        with self._launch_capability_receipts(publication_id, pid):
+            self.memory.ensure_process_namespace(pid, parent_pid=parent_pid)
+            self._publication_phase(publication_id, "namespace_created")
+            handle = self._ensure_goal(
+                pid,
+                goal,
+                source_oids=source_oids,
+                source_labels=source_labels,
+                source_context=source_context,
+            )
+            self._publication_phase(
+                publication_id,
+                "goal_created",
+                goal_oid=handle.oid,
+            )
+        return handle
+
+    def _compile_root_launch_authority(
+        self,
+        publication_id: str,
+        *,
+        pid: str,
+        image_id: str,
+        goal_handle: ObjectHandle,
+        capabilities: builtins.list[dict[str, Any]],
+        resource_budget: ResourceBudget | None,
+        authority_manifest: Any | None,
+    ) -> None:
+        with self._launch_capability_receipts(publication_id, pid):
+            if self.authority_manifests is None:
+                self._grant_specs(pid, capabilities, issued_by="process.spawn")
+            else:
+                manifest = self.authority_manifests.prepare_launch(
+                    pid=pid,
+                    image_id=image_id,
+                    goal_ref=goal_handle.oid,
+                    supplied=authority_manifest,
+                    authorized_capabilities=capabilities,
+                    resource_budget=resource_budget,
+                    issued_by="process.spawn",
+                )
+                if manifest.resource_budget:
+                    process = self._get(pid)
+                    process.resource_budget = ResourceBudget(**manifest.resource_budget)
+                    process.updated_at = utc_now()
+                    self.store.patch_process(
+                        pid,
+                        {
+                            "resource_budget": process.resource_budget,
+                            "updated_at": process.updated_at,
+                        },
+                        expected_revision=process.revision,
+                    )
+                self._assert_goal_data_flow(pid, goal_handle)
+                self.authority_manifests.compile_root_capabilities(manifest)
+            self._publication_phase(publication_id, "authority_compiled")
+
+    def _publish_fork_launch_view(
+        self,
+        publication_id: str,
+        *,
+        parent_pid: str,
+        child_pid: str,
+        source_view: MemoryView,
+        spec: MemoryViewSpec,
+        goal_handle: ObjectHandle,
+    ) -> AgentProcess:
+        with self._launch_capability_receipts(publication_id, child_pid):
+            child_view = self.memory.fork_view(
+                parent_pid,
+                child_pid,
+                source_view,
+                spec,
+            )
+            for root in child_view.roots:
+                self._assert_object_data_flow(child_pid, root.oid)
+            child_view.roots.append(goal_handle)
+            child = self._get(child_pid)
+            child.goal_oid = goal_handle.oid
+            child.memory_view = child_view
+            child.updated_at = utc_now()
+            return self.store.patch_process(
+                child_pid,
+                {
+                    "goal_oid": child.goal_oid,
+                    "memory_view": child.memory_view,
+                    "updated_at": child.updated_at,
+                },
+                expected_revision=child.revision,
+            )
+
+    def _publish_child_launch_authority(
+        self,
+        publication_id: str,
+        *,
+        parent_pid: str,
+        child_pid: str,
+        manifest: Any | None,
+        requested_capabilities: builtins.list[dict[str, Any]],
+        inherit_specs: builtins.list[dict[str, Any]],
+        transition_kind: str,
+    ) -> None:
+        with self._launch_capability_receipts(publication_id, child_pid):
+            self._compile_child_authority(
+                parent_pid=parent_pid,
+                child_pid=child_pid,
+                manifest=manifest,
+                requested_capabilities=requested_capabilities,
+                inherit_specs=inherit_specs,
+                transition_kind=transition_kind,
+            )
+            self._publication_phase(publication_id, "authority_compiled")
 
     def _grant_specs(self, pid: str, specs: Iterable[dict[str, Any]], issued_by: str) -> None:
         for spec in specs:
@@ -1881,9 +2153,14 @@ class ProcessManager:
             return ViewMode.READ_ONLY
         return ViewMode.READ_ONLY
 
-    def _run_after_spawn_hooks(self, pid: str, image_id: str) -> None:
+    def _run_after_spawn_hooks(
+        self,
+        pid: str,
+        image_id: str,
+        publication_id: str,
+    ) -> None:
         for hook in self._after_spawn_hooks:
-            hook(pid, image_id)
+            hook(pid, image_id, publication_id)
 
     def _run_before_spawn_hooks(self, image_id: str) -> None:
         for hook in self._before_spawn_hooks:
@@ -1895,79 +2172,411 @@ class ProcessManager:
         namespace = self.memory.process_namespace(pid)
         namespace_resource = f"object_namespace:{namespace}"
         with contextlib.suppress(Exception):
-            with self.store.transaction(include_object_payloads=True) as cur:
-                cur.execute("DELETE FROM capabilities WHERE subject = ? OR resource = ?", (pid, namespace_resource))
-                cur.execute("DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?", (pid, pid))
-                cur.execute("DELETE FROM llm_pending_actions WHERE pid = ?", (pid,))
-                cur.execute("DELETE FROM authority_manifests WHERE pid = ?", (pid,))
-                cur.execute("DELETE FROM tool_candidates WHERE pid = ?", (pid,))
-                cur.execute("DELETE FROM process_messages WHERE sender = ? OR recipient_pid = ?", (pid, pid))
-                cur.execute("DELETE FROM object_namespaces WHERE namespace = ? AND created_by = ?", (namespace, pid))
-                cur.execute("DELETE FROM processes WHERE pid = ?", (pid,))
+            self.store.delete_process_scaffold(
+                pid,
+                namespace=namespace,
+                namespace_resource=namespace_resource,
+            )
 
     def recover_incomplete_publications(self) -> list[str]:
         """Compensate process launches interrupted before their atomic commit."""
 
+        self._require_recovery_lease()
+
         recovered: list[str] = []
-        nonterminal = self.store.list_runtime_publications(
-            states={"planning", "applying", "rollback_pending"}
-        )
-        for publication in nonterminal:
-            if publication["kind"] != "process_launch":
-                continue
-            publication_id = publication["publication_id"]
-            pid = publication["pid"]
-            self.store.advance_runtime_publication(
-                publication_id,
-                state="rollback_pending",
-                phase="startup_compensation",
-                receipt={"phase": "startup_compensation", "pid": pid},
-                expected_states={"planning", "applying", "rollback_pending"},
-            )
-            try:
-                self._cleanup_failed_launch_strict(pid)
-            except Exception as exc:
-                self.store.advance_runtime_publication(
-                    publication_id,
-                    state="failed",
-                    phase="startup_compensation_failed",
-                    error={"code": "publication_compensation_failed", "error_type": type(exc).__name__},
-                    expected_states={"rollback_pending"},
+        page_size = self.config.runtime.publication_reconciliation_page_size
+        for state in ("planning", "applying", "rollback_pending", "failed", "manual"):
+            for operation_reconciled in (False, True):
+                self._recover_launch_publication_state(
+                    state,
+                    operation_reconciled=operation_reconciled,
+                    recovered=recovered,
                 )
+
+        self.reconcile_terminal_publications()
+        self._fail_orphaned_created_processes()
+        return recovered
+
+    def _recover_launch_publication_state(
+        self,
+        state: str,
+        *,
+        operation_reconciled: bool,
+        recovered: list[str],
+    ) -> None:
+        page_size = self.config.runtime.publication_reconciliation_page_size
+        after: RuntimePublicationCursor | None = None
+        while True:
+            page = self.publications.query_runtime_publication_recovery(
+                kind="process_launch",
+                state=state,
+                operation_reconciled=operation_reconciled,
+                after=after,
+                limit=page_size,
+            )
+            previous = after
+            for publication in page.records:
+                cursor = RuntimePublicationCursor(
+                    publication["created_at"],
+                    publication["publication_id"],
+                )
+                if (
+                    publication["kind"] != "process_launch"
+                    or publication["state"] != state
+                    or publication["operation_reconciled"] is not operation_reconciled
+                    or (previous is not None and cursor <= previous)
+                ):
+                    raise ValidationError(
+                        "runtime publication repository returned an invalid launch recovery page"
+                    )
+                recovered_id = self._recover_launch_publication(publication)
+                if recovered_id is not None and len(recovered) < page_size:
+                    recovered.append(recovered_id)
+                previous = cursor
+            if page.next_cursor is None:
+                break
+            if previous is None or page.next_cursor != previous:
+                raise ValidationError(
+                    "runtime publication repository returned an invalid launch recovery cursor"
+                )
+            after = page.next_cursor
+
+    def _recover_launch_publication(
+        self,
+        publication: dict[str, Any],
+    ) -> str | None:
+        if publication["state"] == "manual":
+            self._fail_closed_manual_launch_publication(publication)
+        claimed = self.publications.claim_runtime_publication_recovery(
+            publication["publication_id"],
+            claimant_instance_id=self.owner_instance_id,
+            expected_owner_instance_id=publication["owner_instance_id"],
+            expected_state=publication["state"],
+            classification="compensate_process_launch",
+            max_attempts=self.config.runtime.publication_recovery_max_attempts,
+            allow_orphaned_claim_takeover=True,
+        )
+        if claimed is None:
+            self._require_launch_publication_resolved(publication["publication_id"])
+            return None
+        if claimed["state"] == "manual":
+            self._fail_closed_manual_launch_publication(claimed)
+        recovery_lease_id = self._launch_recovery_lease_id(claimed)
+        try:
+            self._compensate_claimed_launch_publication(
+                claimed,
+                recovery_lease_id=recovery_lease_id,
+            )
+        except Exception as exc:
+            self._record_launch_recovery_failure(
+                claimed,
+                recovery_lease_id=recovery_lease_id,
+                error=exc,
+            )
+            raise ProcessError(
+                f"cannot compensate process publication {claimed['publication_id']}"
+            ) from exc
+        return str(claimed["publication_id"])
+
+    def _compensate_claimed_launch_publication(
+        self,
+        claimed: dict[str, Any],
+        *,
+        recovery_lease_id: str,
+    ) -> None:
+        publication_id = str(claimed["publication_id"])
+        with self.store.transaction(include_object_payloads=True):
+            current = self.publications.get_runtime_publication(publication_id)
+            if current is None:
                 raise ProcessError(
-                    f"cannot compensate process publication {publication_id}"
-                ) from exc
-            self.store.advance_runtime_publication(
+                    f"process publication disappeared: {publication_id}"
+                )
+            if self._launch_recovery_lease_id(current) != recovery_lease_id:
+                raise ProcessError(
+                    f"process publication recovery lease changed: {publication_id}"
+                )
+            self._cleanup_failed_launch_strict(current)
+            if not self.publications.advance_runtime_publication(
                 publication_id,
                 state="rolled_back",
                 phase="startup_compensated",
-                receipt={"phase": "startup_compensated", "pid": pid},
+                receipt={"phase": "startup_compensated", "pid": current["pid"]},
                 expected_states={"rollback_pending"},
-            )
-            recovered.append(publication_id)
+                recovery_lease_id=recovery_lease_id,
+            ):
+                raise ProcessError(
+                    "process publication recovery lease changed before terminal state: "
+                    f"{publication_id}"
+                )
+            rolled_back = self.publications.get_runtime_publication(publication_id)
+            if rolled_back is not None:
+                self._reconcile_launch_publication_operation(
+                    rolled_back,
+                    OperationOutcome.FAILED,
+                )
 
-        publication_pids = {
-            publication["pid"]
-            for publication in self.store.list_runtime_publications()
-            if publication["kind"] == "process_launch"
+    def _record_launch_recovery_failure(
+        self,
+        claimed: dict[str, Any],
+        *,
+        recovery_lease_id: str,
+        error: Exception,
+    ) -> None:
+        publication_id = str(claimed["publication_id"])
+        with self.store.transaction():
+            if not self.publications.advance_runtime_publication(
+                publication_id,
+                state="failed",
+                phase="startup_compensation_failed",
+                error={
+                    "code": "publication_compensation_failed",
+                    "error_type": type(error).__name__,
+                },
+                expected_states={"rollback_pending"},
+                recovery_lease_id=recovery_lease_id,
+            ):
+                raise ProcessError(
+                    "process publication recovery lease changed before failure: "
+                    f"{publication_id}"
+                ) from error
+            failed = self.publications.get_runtime_publication(publication_id)
+            if failed is not None:
+                self._reconcile_launch_publication_operation(
+                    failed,
+                    OperationOutcome.UNKNOWN,
+                )
+
+    def _fail_closed_manual_launch_publication(
+        self,
+        publication: dict[str, Any],
+    ) -> None:
+        with self.store.transaction():
+            self._reconcile_launch_publication_operation(
+                publication,
+                OperationOutcome.UNKNOWN,
+            )
+        raise ProcessError(
+            f"process publication requires manual recovery: {publication['publication_id']}"
+        )
+
+    @staticmethod
+    def _launch_recovery_lease_id(publication: dict[str, Any]) -> str:
+        recovery_lease_id = str(
+            (publication["receipt"].get("recovery") or {}).get("lease_id") or ""
+        )
+        if not recovery_lease_id:
+            raise ProcessError(
+                "process publication recovery claim has no lease: "
+                f"{publication['publication_id']}"
+            )
+        return recovery_lease_id
+
+    def _require_launch_publication_resolved(self, publication_id: str) -> None:
+        current = self.publications.get_runtime_publication(publication_id)
+        if current is None or current["state"] in {"committed", "rolled_back"}:
+            return
+        raise ProcessError(
+            f"cannot claim unresolved process publication: {publication_id}"
+        )
+
+    def _fail_orphaned_created_processes(self) -> None:
+        after: ProcessCursor | None = None
+        page_size = self.config.runtime.publication_reconciliation_page_size
+        while True:
+            page = self.store.query_orphaned_created_processes(
+                after=after,
+                limit=page_size,
+            )
+            previous = after
+            for process in page.records:
+                cursor = ProcessCursor(process.created_at, process.pid)
+                if (
+                    process.status != ProcessStatus.CREATED
+                    or (previous is not None and cursor <= previous)
+                ):
+                    raise ValidationError(
+                        "process repository returned an invalid orphan recovery page"
+                    )
+                self.transitions.transition(
+                    process.pid,
+                    ProcessStatus.FAILED,
+                    expected_revision=process.revision,
+                    expected_status=ProcessStatus.CREATED,
+                    expected_state_generation=process.state_generation,
+                    outcome=FailedProcessOutcome(code="orphaned_launch"),
+                    status_message="orphaned_launch",
+                )
+                self.audit.record(
+                    actor="runtime.recovery",
+                    action="orphaned_launch",
+                    target=f"process:{process.pid}",
+                    decision={"status": "failed"},
+                )
+                previous = cursor
+            if page.next_cursor is None:
+                break
+            if previous is None or page.next_cursor != previous:
+                raise ValidationError(
+                    "process repository returned an invalid orphan recovery cursor"
+                )
+            after = page.next_cursor
+
+    def _reconcile_launch_publication_operation(
+        self,
+        publication: dict[str, Any],
+        outcome: OperationOutcome,
+    ) -> None:
+        operations = self.audit.operations
+        operation_id = self._launch_publication_operation_id(
+            publication,
+            operations,
+        )
+        if operation_id is None or operations is None:
+            if not self.publications.mark_runtime_publication_operation_reconciled(
+                str(publication["publication_id"]),
+                expected_kind="process_launch",
+                expected_state=str(publication["state"]),
+                expected_phase=str(publication["phase"]),
+                expected_operation_id=None,
+            ):
+                raise ValidationError(
+                    "process launch publication changed while marking unbound reconciliation: "
+                    f"{publication['publication_id']}"
+                )
+            return
+        publication_id = str(publication["publication_id"])
+        operation = self._evidence.get_operation(operation_id)
+        if operation is None:
+            raise ValidationError(
+                "runtime publication references a missing operation: "
+                f"{publication_id} -> {operation_id}"
+            )
+        expected_name, expected_actor, expected_pid = (
+            self._launch_publication_operation_contract(publication, operation)
+        )
+        if expected_name == "process.spawn" and operation.pid is None:
+            operations.set_pid(expected_pid, operation_id=operation_id)
+        operations.reconcile_runtime_publication(
+            operation_id,
+            outcome,
+            publication_id=publication_id,
+            publication_kind="process_launch",
+            publication_state=str(publication["state"]),
+            publication_phase=str(publication["phase"]),
+            expected_kind="runtime",
+            expected_name=expected_name,
+            expected_actor=expected_actor,
+            expected_pid=expected_pid,
+        )
+
+    def _launch_publication_operation_id(
+        self,
+        publication: dict[str, Any],
+        operations: Any | None,
+    ) -> str | None:
+        plan = publication["plan"]
+        operation_id = str(plan.get("operation_id") or "")
+        if operations is None:
+            if operation_id or plan.get("operation_binding_version") is not None:
+                raise ValidationError(
+                    "process launch publication cannot resolve its operation manager: "
+                    f"{publication['publication_id']}"
+                )
+            return None
+        if operation_id:
+            return operation_id
+        reverse_bindings = operations.runtime_publication_binding_operation_ids(
+            str(publication["publication_id"])
+        )
+        if plan.get("operation_binding_version") is not None or reverse_bindings:
+            raise ValidationError(
+                "process launch publication lost its durable operation binding: "
+                f"{publication['publication_id']} -> "
+                f"{reverse_bindings or '<missing>'}"
+            )
+        return None
+
+    @staticmethod
+    def _launch_publication_operation_contract(
+        publication: dict[str, Any],
+        operation: Any,
+    ) -> tuple[str, str, str]:
+        publication_id = str(publication["publication_id"])
+        publication_pid = str(publication["pid"])
+        plan = publication["plan"]
+        if (
+            publication["kind"] != "process_launch"
+            or str(plan.get("pid") or "") != publication_pid
+        ):
+            raise ValidationError(
+                f"invalid process launch publication identity: {publication_id}"
+            )
+        launch_kind = str(plan.get("launch_kind") or "")
+        if launch_kind == "spawn":
+            if plan.get("parent_pid") is not None or operation.pid not in {
+                None,
+                publication_pid,
+            }:
+                raise ValidationError(
+                    f"invalid root process spawn operation: {publication_id}"
+                )
+            return "process.spawn", "runtime", publication_pid
+        parent_pid = str(plan.get("parent_pid") or "")
+        if not parent_pid or launch_kind not in {"fork", "spawn_child"}:
+            raise ValidationError(
+                f"invalid child process launch operation: {publication_id}"
+            )
+        return f"process.{launch_kind}", parent_pid, parent_pid
+
+    def reconcile_terminal_publications(self) -> list[str]:
+        outcomes = {
+            "committed": OperationOutcome.SUCCEEDED,
+            "rolled_back": OperationOutcome.FAILED,
+            "failed": OperationOutcome.UNKNOWN,
+            "manual": OperationOutcome.UNKNOWN,
         }
-        for process in self.store.list_processes_by_status(ProcessStatus.CREATED):
-            if process.pid in publication_pids:
-                continue
-            self.store.transition_process(
-                process.pid,
-                ProcessStatus.FAILED,
-                expected_revision=process.revision,
-                expected_status=ProcessStatus.CREATED,
-                status_message="orphaned_launch",
-            )
-            self.audit.record(
-                actor="runtime.recovery",
-                action="orphaned_launch",
-                target=f"process:{process.pid}",
-                decision={"status": "failed"},
-            )
-        return recovered
+        reconciled: list[str] = []
+        page_size = self.config.runtime.publication_reconciliation_page_size
+        for state, outcome in outcomes.items():
+            after: RuntimePublicationCursor | None = None
+            while True:
+                page = self.publications.query_runtime_publication_operation_reconciliation(
+                    kind="process_launch",
+                    state=state,
+                    after=after,
+                    limit=page_size,
+                )
+                previous = after
+                for publication in page.records:
+                    cursor = RuntimePublicationCursor(
+                        publication["created_at"],
+                        publication["publication_id"],
+                    )
+                    if (
+                        publication["kind"] != "process_launch"
+                        or publication["state"] != state
+                        or publication["operation_reconciled"]
+                        or (previous is not None and cursor <= previous)
+                    ):
+                        raise ValidationError(
+                            "runtime publication repository returned an invalid launch reconciliation page"
+                        )
+                    with self.store.transaction():
+                        self._reconcile_launch_publication_operation(
+                            publication,
+                            outcome,
+                        )
+                    if len(reconciled) < page_size:
+                        reconciled.append(str(publication["publication_id"]))
+                    previous = cursor
+                if page.next_cursor is None:
+                    break
+                if previous is None or page.next_cursor != previous:
+                    raise ValidationError(
+                        "runtime publication repository returned an invalid launch reconciliation cursor"
+                    )
+                after = page.next_cursor
+        return reconciled
 
     def _begin_launch_publication(
         self,
@@ -1978,20 +2587,96 @@ class ProcessManager:
         parent_pid: str | None,
     ) -> str:
         publication_id = new_id("publication")
-        self.store.insert_runtime_publication(
-            publication_id=publication_id,
-            kind="process_launch",
-            pid=pid,
-            owner_instance_id=self.owner_instance_id,
-            plan={
-                "launch_kind": launch_kind,
-                "pid": pid,
-                "parent_pid": parent_pid,
-                "image_id": image_id,
-                "artifact_owner": f"publication:{publication_id}",
-            },
-        )
+        operations = self.audit.operations
+        operation_id = operations.current_id() if operations is not None else None
+        if launch_kind == "spawn":
+            expected_name = "process.spawn"
+            expected_actor = "runtime"
+            expected_pid = None
+        elif launch_kind in {"fork", "spawn_child"} and parent_pid is not None:
+            expected_name = f"process.{launch_kind}"
+            expected_actor = parent_pid
+            expected_pid = parent_pid
+        else:
+            raise ValidationError(
+                f"invalid process launch publication contract: {launch_kind}"
+            )
+        with self.store.transaction():
+            self.publications.insert_runtime_publication(
+                publication_id=publication_id,
+                kind="process_launch",
+                pid=pid,
+                owner_instance_id=self.owner_instance_id,
+                plan={
+                    "launch_kind": launch_kind,
+                    "pid": pid,
+                    "parent_pid": parent_pid,
+                    "image_id": image_id,
+                    "artifact_owner": f"publication:{publication_id}",
+                    "operation_id": operation_id,
+                    "operation_binding_version": (
+                        1 if operation_id is not None else None
+                    ),
+                },
+            )
+            if operations is not None and operation_id is not None:
+                operations.bind_runtime_publication(
+                    operation_id,
+                    publication_id=publication_id,
+                    publication_kind="process_launch",
+                    expected_kind="runtime",
+                    expected_name=expected_name,
+                    expected_actor=expected_actor,
+                    expected_pid=expected_pid,
+                )
         return publication_id
+
+    def _begin_controlled_launch(
+        self,
+        pid: str,
+        launch_kind: str,
+        image_id: str,
+        parent_pid: str | None,
+    ) -> tuple[str, contextlib.ExitStack]:
+        publication_id = self._begin_launch_publication(
+            pid=pid,
+            launch_kind=launch_kind,
+            image_id=image_id,
+            parent_pid=parent_pid,
+        )
+        control_scope = contextlib.ExitStack()
+        control_scope.enter_context(
+            trusted_process_control_mutation(
+                pid,
+                allowed_statuses={ProcessStatus.CREATED},
+                reason=f"process.{launch_kind} initializes a new process",
+            )
+        )
+        return publication_id, control_scope
+
+    def _commit_launch_publication(
+        self,
+        publication_id: str,
+        *,
+        receipt: dict[str, Any],
+    ) -> None:
+        """Commit launch evidence and its operation in the caller's transaction."""
+
+        if not self.publications.advance_runtime_publication(
+            publication_id,
+            state="committed",
+            phase="committed",
+            receipt=receipt,
+            expected_states={"applying"},
+        ):
+            raise ProcessError(f"cannot commit process publication: {publication_id}")
+        publication = self.publications.get_runtime_publication(publication_id)
+        if publication is None:
+            raise ProcessError(f"process publication disappeared: {publication_id}")
+        self._reconcile_launch_publication_operation(
+            publication,
+            OperationOutcome.SUCCEEDED,
+        )
 
     def _publication_phase(
         self,
@@ -1999,7 +2684,7 @@ class ProcessManager:
         phase: str,
         **receipt: Any,
     ) -> None:
-        if not self.store.advance_runtime_publication(
+        if not self.publications.advance_runtime_publication(
             publication_id,
             state="applying",
             phase=phase,
@@ -2008,56 +2693,419 @@ class ProcessManager:
         ):
             raise ProcessError(f"process publication is no longer applicable: {publication_id}")
 
-    def _rollback_launch_publication(self, publication_id: str, pid: str, exc: BaseException) -> None:
-        self.store.advance_runtime_publication(
-            publication_id,
-            state="rollback_pending",
-            phase="compensating",
-            error={"code": "process_launch_failed", "error_type": type(exc).__name__},
-            expected_states={"planning", "applying"},
-        )
-        try:
-            self._cleanup_failed_launch_strict(pid)
-        except Exception as cleanup_exc:
-            self.store.advance_runtime_publication(
+    def _record_launch_capability_artifacts(
+        self,
+        publication_id: str,
+        pid: str,
+        *,
+        exclude_ids: frozenset[str] = frozenset(),
+    ) -> None:
+        for capability in self._authority.list_capabilities(pid):
+            if capability.cap_id in exclude_ids:
+                continue
+            if not self.publications.record_runtime_publication_artifact(
                 publication_id,
-                state="failed",
-                phase="compensation_failed",
-                error={
-                    "code": "publication_compensation_failed",
-                    "error_type": type(cleanup_exc).__name__,
+                {
+                    "artifact_id": f"capability:{capability.cap_id}",
+                    "kind": "capability",
+                    "capability_id": capability.cap_id,
+                    "resource": capability.resource,
                 },
-                expected_states={"rollback_pending"},
+                expected_states={"planning", "applying"},
+            ):
+                raise ProcessError(
+                    "process publication changed while recording capability: "
+                    f"{publication_id}"
+                )
+
+    @contextlib.contextmanager
+    def _launch_capability_receipts(
+        self,
+        publication_id: str,
+        pid: str,
+    ) -> Iterator[None]:
+        """Commit every launch-created capability with its exact receipt."""
+
+        with self.memory.ownership_locked(), self.store.transaction(
+            include_object_payloads=True
+        ):
+            existing_ids = frozenset(
+                capability.cap_id
+                for capability in self._authority.list_capabilities(pid)
             )
-            raise ExceptionGroup(
+            yield
+            self._record_launch_capability_artifacts(
+                publication_id,
+                pid,
+                exclude_ids=existing_ids,
+            )
+
+    def _rollback_launch_publication(
+        self,
+        publication_id: str,
+        pid: str,
+        exc: BaseException,
+    ) -> bool:
+        """Compensate one failed launch, returning true if it already committed.
+
+        The initial rollback transition is a CAS.  A false result or storage
+        exception cannot be treated as an ordinary launch failure: effects may
+        already exist while another durable state owns their disposition.
+        Re-read that state and either honor a resolved publication or fail
+        mutation admission closed until startup recovery can compensate it.
+        """
+
+        try:
+            rollback_started = self.publications.advance_runtime_publication(
+                publication_id,
+                state="rollback_pending",
+                phase="compensating",
+                error={
+                    "code": "process_launch_failed",
+                    "error_type": type(exc).__name__,
+                },
+                expected_states={"planning", "applying"},
+            )
+        except BaseException as transition_error:
+            transition_failure = BaseExceptionGroup(
+                "process launch and rollback transition failed",
+                [exc, transition_error],
+            )
+            return self._resolve_failed_launch_rollback_transition(
+                publication_id,
+                transition_failure,
+            )
+        if not rollback_started:
+            transition_failure = BaseExceptionGroup(
+                "process launch rollback transition lost",
+                [
+                    exc,
+                    ProcessError(
+                        "process publication changed before compensation: "
+                        f"{publication_id}"
+                    ),
+                ],
+            )
+            return self._resolve_failed_launch_rollback_transition(
+                publication_id,
+                transition_failure,
+            )
+        try:
+            publication = self.publications.get_runtime_publication(publication_id)
+            if publication is None:
+                raise ProcessError(f"process publication disappeared: {publication_id}")
+            self._cleanup_failed_launch_strict(publication)
+        except BaseException as cleanup_exc:
+            compensation_failure = BaseExceptionGroup(
                 "process launch and compensation failed",
                 [exc, cleanup_exc],
-            ) from exc
-        self.store.advance_runtime_publication(
+            )
+            self._fence_failed_launch(publication_id, compensation_failure)
+            try:
+                with self._recovery_terminalization_scope(publication_id):
+                    self._terminalize_launch_publication(
+                        publication_id,
+                        state="failed",
+                        phase="compensation_failed",
+                        outcome=OperationOutcome.UNKNOWN,
+                        error={
+                            "code": "publication_compensation_failed",
+                            "error_type": type(cleanup_exc).__name__,
+                        },
+                    )
+            except BaseException as terminal_error:
+                self._raise_pending_launch_outcome(
+                    publication_id,
+                    BaseExceptionGroup(
+                        "process launch compensation terminalization failed",
+                        [compensation_failure, terminal_error],
+                    ),
+                    recovery_already_required=True,
+                )
+            raise compensation_failure from exc
+        try:
+            self._terminalize_launch_publication(
+                publication_id,
+                state="rolled_back",
+                phase="compensated",
+                outcome=OperationOutcome.FAILED,
+                receipt={"phase": "compensated", "pid": pid},
+            )
+        except BaseException as terminal_error:
+            terminal_failure = BaseExceptionGroup(
+                "process launch compensation terminalization acknowledgement failed",
+                [exc, terminal_error],
+            )
+            return self._resolve_failed_launch_rollback_transition(
+                publication_id,
+                terminal_failure,
+            )
+        return False
+
+    def _finish_failed_launch(
+        self,
+        publication_id: str,
+        pid: str,
+        error: BaseException,
+    ) -> str:
+        """Return a concurrently committed launch or propagate its failure."""
+
+        if self._rollback_launch_publication(publication_id, pid, error):
+            if isinstance(error, Exception):
+                return pid
+        raise error
+
+    def _resolve_failed_launch_rollback_transition(
+        self,
+        publication_id: str,
+        cause: BaseException,
+    ) -> bool:
+        """Resolve a lost/failed rollback CAS from its durable publication."""
+
+        resolved_state: str | None = None
+        try:
+            with self.store.transaction():
+                publication = self.publications.get_runtime_publication(
+                    publication_id
+                )
+                if publication is None:
+                    raise ProcessError(
+                        f"process publication disappeared: {publication_id}"
+                    )
+                state = str(publication["state"])
+                if state == "committed":
+                    self._reconcile_launch_publication_operation(
+                        publication,
+                        OperationOutcome.SUCCEEDED,
+                    )
+                    resolved_state = state
+                elif state == "rolled_back":
+                    self._reconcile_launch_publication_operation(
+                        publication,
+                        OperationOutcome.FAILED,
+                    )
+                    resolved_state = state
+        except BaseException as resolution_error:
+            # A failed read or terminal-operation reconciliation leaves the
+            # durable outcome unknown to this Runtime.  Fence before reporting
+            # the diagnostic failure so no later mutation can build on it.
+            resolution_failure = BaseExceptionGroup(
+                "process launch rollback resolution failed",
+                [cause, resolution_error],
+            )
+            self._fence_failed_launch(publication_id, resolution_failure)
+            if not isinstance(resolution_failure, Exception):
+                raise resolution_failure from cause
+            raise ProcessError(
+                "cannot resolve process publication after rollback transition "
+                f"failure: {publication_id}"
+            ) from resolution_failure
+
+        if resolved_state == "committed":
+            if not isinstance(cause, Exception):
+                raise cause
+            return True
+        if resolved_state == "rolled_back":
+            raise cause
+
+        # Planning/applying/rollback_pending as well as retryable failed/manual
+        # states still own partial launch artifacts.  Keep the linked operation
+        # pending when its exact current binding is intact, and always poison
+        # mutation admission before performing diagnostic association reads.
+        self._fence_failed_launch(publication_id, cause)
+        self._raise_pending_launch_outcome(
             publication_id,
-            state="rolled_back",
-            phase="compensated",
-            receipt={"phase": "compensated", "pid": pid},
-            expected_states={"rollback_pending"},
+            cause,
+            recovery_already_required=True,
+        )
+        raise AssertionError("pending launch publication signal did not raise")
+
+    def _terminalize_launch_publication(
+        self,
+        publication_id: str,
+        *,
+        state: str,
+        phase: str,
+        outcome: OperationOutcome,
+        receipt: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        with self.store.transaction():
+            if not self.publications.advance_runtime_publication(
+                publication_id,
+                state=state,
+                phase=phase,
+                receipt=receipt,
+                error=error,
+                expected_states={"rollback_pending"},
+            ):
+                raise ProcessError(
+                    "process publication changed during terminalization: "
+                    f"{publication_id}"
+                )
+            publication = self.publications.get_runtime_publication(publication_id)
+            if publication is None:
+                raise ProcessError(
+                    f"process publication disappeared: {publication_id}"
+                )
+            self._reconcile_launch_publication_operation(publication, outcome)
+
+    def _mark_launch_recovery_required(self, publication_id: str) -> None:
+        if self._recovery_required_callback is not None:
+            self._recovery_required_callback(publication_id=publication_id)
+
+    def _fence_failed_launch(
+        self,
+        publication_id: str,
+        cause: BaseException,
+    ) -> None:
+        """Preserve both the launch failure and any fence interruption."""
+
+        try:
+            self._mark_launch_recovery_required(publication_id)
+        except BaseException as fence_error:
+            fence_failure = BaseExceptionGroup(
+                "process launch recovery fence failed",
+                [cause, fence_error],
+            )
+            fallback = self._recovery_required_fallback
+            if fallback is None:
+                raise fence_failure from cause
+            try:
+                fallback(publication_id=publication_id)
+            except BaseException as fallback_error:
+                raise BaseExceptionGroup(
+                    "process launch recovery fence and fallback failed",
+                    [fence_failure, fallback_error],
+                ) from cause
+            raise fence_failure from cause
+
+    def _raise_pending_launch_outcome(
+        self,
+        publication_id: str,
+        cause: BaseException,
+        *,
+        recovery_already_required: bool = False,
+    ) -> None:
+        try:
+            publication = self.publications.get_runtime_publication(publication_id)
+        except BaseException as diagnostic_error:
+            diagnostic_failure = BaseExceptionGroup(
+                "process launch publication diagnostic failed",
+                [cause, diagnostic_error],
+            )
+            if not recovery_already_required:
+                self._fence_failed_launch(publication_id, diagnostic_failure)
+            self._raise_launch_failure_preserving_control_flow(
+                f"cannot inspect pending process publication: {publication_id}",
+                diagnostic_failure,
+                cause=cause,
+            )
+        unresolved = publication is None or publication["state"] not in {
+            "committed",
+            "rolled_back",
+        }
+        if unresolved and not recovery_already_required:
+            self._fence_failed_launch(publication_id, cause)
+        if publication is not None and publication["state"] in {
+            "planning",
+            "applying",
+            "rollback_pending",
+        }:
+            operation_id = str(publication["plan"].get("operation_id") or "")
+            operations = self.audit.operations
+            current_operation_id = (
+                str(operations.current_id() or "")
+                if operations is not None
+                else ""
+            )
+            try:
+                operation = (
+                    self._evidence.get_operation(operation_id)
+                    if (
+                        operations is not None
+                        and operation_id
+                        and operation_id == current_operation_id
+                    )
+                    else None
+                )
+            except BaseException as diagnostic_error:
+                diagnostic_failure = BaseExceptionGroup(
+                    "process launch operation diagnostic failed",
+                    [cause, diagnostic_error],
+                )
+                self._raise_launch_failure_preserving_control_flow(
+                    "cannot inspect pending process publication operation: "
+                    f"{publication_id}",
+                    diagnostic_failure,
+                    cause=cause,
+                )
+            if operation is not None and operation.state != OperationState.TERMINAL:
+                pending = RuntimePublicationPending(
+                    publication_id=publication_id,
+                    operation_id=operation_id,
+                    state=str(publication["state"]),
+                    phase=str(publication["phase"]),
+                )
+                if not isinstance(cause, Exception):
+                    raise BaseExceptionGroup(
+                        "process launch interruption remains publication pending",
+                        [cause, pending],
+                    ) from cause
+                raise pending from cause
+        self._raise_launch_failure_preserving_control_flow(
+            f"cannot terminalize process publication: {publication_id}",
+            cause,
+            cause=cause,
         )
 
-    def _cleanup_failed_launch_strict(self, pid: str) -> None:
+    @staticmethod
+    def _raise_launch_failure_preserving_control_flow(
+        message: str,
+        failure: BaseException,
+        *,
+        cause: BaseException,
+    ) -> NoReturn:
+        if not isinstance(failure, Exception):
+            if cause is failure:
+                raise failure
+            raise failure from cause
+        raise ProcessError(message) from failure
+
+    def _cleanup_failed_launch_strict(self, publication: dict[str, Any]) -> None:
+        pid = str(publication["pid"])
+        if self._failed_launch_artifact_cleanup is not None:
+            self._failed_launch_artifact_cleanup(publication)
         self.memory.release_process_owned(pid)
         namespace = self.memory.process_namespace(pid)
         namespace_resource = f"object_namespace:{namespace}"
-        with self.store.transaction(include_object_payloads=True) as cur:
-            cur.execute("DELETE FROM capabilities WHERE subject = ? OR resource = ?", (pid, namespace_resource))
-            cur.execute("DELETE FROM process_resource_reservations WHERE parent_pid = ? OR child_pid = ?", (pid, pid))
-            cur.execute("DELETE FROM llm_pending_actions WHERE pid = ?", (pid,))
-            cur.execute("DELETE FROM authority_manifests WHERE pid = ?", (pid,))
-            cur.execute("DELETE FROM tool_candidates WHERE pid = ?", (pid,))
-            cur.execute("DELETE FROM process_messages WHERE sender = ? OR recipient_pid = ?", (pid, pid))
-            cur.execute("DELETE FROM object_namespaces WHERE namespace = ? AND created_by = ?", (namespace, pid))
-            cur.execute("DELETE FROM processes WHERE pid = ?", (pid,))
+        self.store.delete_process_scaffold(
+            pid,
+            namespace=namespace,
+            namespace_resource=namespace_resource,
+        )
+        if self._failed_launch_artifact_cleanup is not None:
+            self._failed_launch_artifact_cleanup(publication)
+
+    def finalize_exec_capability_revocations(
+        self,
+        pid: str,
+        rollback_token: str,
+    ) -> None:
+        self.capabilities.finalize_exec_revocations(
+            pid,
+            rollback_token=rollback_token,
+        )
 
     def cleanup_failed_launch(self, pid: str) -> None:
         """Remove partial process state created by a failed external launch."""
-
+        publications = [
+            publication
+            for publication in self.publications.list_runtime_publications(pid=pid)
+            if publication["kind"] == "process_launch"
+        ]
+        if publications and self._failed_launch_artifact_cleanup is not None:
+            self._failed_launch_artifact_cleanup(publications[-1])
         self._cleanup_failed_launch(pid)
 
     def _release_rejected_exit_result(self, pid: str, result: ObjectHandle | None) -> None:
@@ -2099,6 +3147,15 @@ class ProcessManager:
             )
         return self.store.append_process_memory_roots(process.pid, [handle])
 
+    def add_handle_to_process_view(
+        self,
+        pid: str,
+        handle: ObjectHandle,
+    ) -> AgentProcess:
+        """Publish one handle through the Process repository's CAS path."""
+
+        return self._add_handle_to_process_view(self._get(pid), handle)
+
     def _wake_parent_waiting_on_child(self, child: AgentProcess) -> None:
         if child.parent_pid is None:
             return
@@ -2107,17 +3164,14 @@ class ProcessManager:
             return
         if parent.status != ProcessStatus.WAITING_EVENT:
             return
-        if parent.status_message != f"waiting for {child.pid}":
+        if not isinstance(parent.wait_state, ChildProcessWait):
             return
-        parent.status = ProcessStatus.RUNNABLE
-        parent.status_message = None
-        parent.updated_at = utc_now()
-        self.store.transition_process(
-            parent.pid,
-            ProcessStatus.RUNNABLE,
-            expected_revision=parent.revision,
-            expected_status=ProcessStatus.WAITING_EVENT,
-            status_message=None,
+        if parent.wait_state.child_pid != child.pid:
+            return
+        self.transitions.wake(
+            self.transitions.wait_token(parent),
+            control=True,
+            reason="terminal child wakes its waiting parent",
         )
         self.audit.record(
             actor="process",

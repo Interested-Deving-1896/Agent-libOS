@@ -16,6 +16,7 @@ class ExplainBoundaryDescriptor:
     expected_roles: tuple[str, ...] = ("audit",)
     result_pid: bool = False
     preflight_method: str = ""
+    lifecycle_lock_attr: str = ""
 
     def __post_init__(self) -> None:
         if not all((self.component, self.method, self.kind, self.name)):

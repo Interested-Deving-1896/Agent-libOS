@@ -1,6 +1,7 @@
 from agent_libos.sdk.protected_operations import (
     AuthorityMode,
     PostProviderFailureMode,
+    ProviderRegistryBinding,
     ProtectedOperation,
     ProtectedOperationContract,
     ProtectedOperationEvidence,
@@ -16,6 +17,7 @@ from agent_libos.sdk.protected_operations import (
 __all__ = [
     "AuthorityMode",
     "PostProviderFailureMode",
+    "ProviderRegistryBinding",
     "ProtectedOperation",
     "ProtectedOperationContract",
     "ProtectedOperationEvidence",

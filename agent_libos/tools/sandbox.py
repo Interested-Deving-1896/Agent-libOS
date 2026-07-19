@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -16,13 +17,13 @@ import time
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import psutil
 
 from agent_libos.capability.profiles import SandboxProfileBuilder
 from agent_libos.config import DEFAULT_CONFIG
-from agent_libos.models.exceptions import SandboxError
+from agent_libos.models.exceptions import ProviderHostError, SandboxError
 from agent_libos.models import ValidationResult
 from agent_libos.substrate import (
     CommandMetrics,
@@ -32,6 +33,10 @@ from agent_libos.substrate import (
     WindowsJobObject,
 )
 from agent_libos.tools.observability import ensure_json_size
+from agent_libos.utils.public_errors import (
+    provider_error_envelope,
+    provider_error_envelope_from_mapping,
+)
 from agent_libos.utils.serde import to_jsonable
 
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
@@ -406,7 +411,15 @@ class DenoTypescriptSandbox(SandboxBackend):
             raise SandboxError(f"Deno supervisor produced invalid readiness frame: {ready_line[:200]!r}") from exc
         if ready_frame != {"type": "supervisor_ready", "version": 1}:
             raise SandboxError(f"unexpected Deno supervisor readiness frame: {ready_frame!r}")
-        await self._write_frame(proc, {"type": "run", "args": to_jsonable(args)})
+        provider_error_proof = secrets.token_urlsafe(32)
+        await self._write_frame(
+            proc,
+            {
+                "type": "run",
+                "args": to_jsonable(args),
+                "provider_error_proof": provider_error_proof,
+            },
+        )
         stdout_bytes = 0
         rpc_calls = 0
         while True:
@@ -452,9 +465,38 @@ class DenoTypescriptSandbox(SandboxBackend):
             if frame_type == "error":
                 await self._kill_process(proc)
                 stderr, _stderr_truncated = await self._finish_stderr(stderr_task)
-                message = str(frame.get("message") or stderr or "Deno JIT tool failed")
-                raise SandboxError(message)
+                self._raise_runner_error(
+                    frame,
+                    stderr,
+                    provider_error_proof=provider_error_proof,
+                )
             raise SandboxError(f"unknown Deno JIT protocol frame: {frame_type!r}")
+
+    @staticmethod
+    def _raise_runner_error(
+        frame: dict[str, Any],
+        stderr: str,
+        *,
+        provider_error_proof: str,
+    ) -> NoReturn:
+        frame_proof = frame.get("provider_error_proof")
+        proof_matches = isinstance(frame_proof, str) and secrets.compare_digest(
+            frame_proof,
+            provider_error_proof,
+        )
+        public_error = (
+            provider_error_envelope_from_mapping(frame)
+            if proof_matches
+            else None
+        )
+        if public_error is not None:
+            raise ProviderHostError(
+                code=public_error["code"],
+                error_type=public_error["error_type"],
+                correlation_id=public_error["correlation_id"],
+            )
+        message = str(frame.get("message") or stderr or "Deno JIT tool failed")
+        raise SandboxError(message)
 
     async def _monitor_process(
         self,
@@ -578,14 +620,31 @@ class DenoTypescriptSandbox(SandboxBackend):
                 {"type": "syscall_result", "id": frame_id, "ok": True, "payload": to_jsonable(result)},
             )
         except Exception as exc:
+            public_error = provider_error_envelope(exc)
             await self._write_frame(
                 proc,
                 {
                     "type": "syscall_result",
                     "id": frame_id,
                     "ok": False,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
+                    "error": (
+                        public_error["message"]
+                        if public_error is not None
+                        else str(exc)
+                    ),
+                    "error_type": (
+                        public_error["error_type"]
+                        if public_error is not None
+                        else type(exc).__name__
+                    ),
+                    **(
+                        {
+                            "code": public_error["code"],
+                            "correlation_id": public_error["correlation_id"],
+                        }
+                        if public_error is not None
+                        else {}
+                    ),
                 },
             )
 
@@ -1159,33 +1218,69 @@ class DenoTypescriptSandbox(SandboxBackend):
     def _runner_source(self) -> str:
         return textwrap.dedent(
             """
-            import { run } from "./candidate.ts";
-
-            const decoder = new TextDecoder();
-            const encoder = new TextEncoder();
-            const stdout = Deno.stdout.writable.getWriter();
-            const stdin = Deno.stdin.readable.getReader();
+            const decoder = new TextDecoder(), encoder = new TextEncoder();
+            const stdout = Deno.stdout.writable.getWriter(), stdin = Deno.stdin.readable.getReader();
+            const NativeError = Error, nativeString = String, apply = Reflect.apply;
+            const jsonParse = JSON.parse, jsonStringify = JSON.stringify;
+            const objectCreate = Object.create, objectKeys = Object.keys;
+            const hasOwnProperty = Object.prototype.hasOwnProperty;
+            const stringIndexOf = String.prototype.indexOf, stringSlice = String.prototype.slice;
+            const stringTrim = String.prototype.trim;
+            const weakMapGet = WeakMap.prototype.get, weakMapSet = WeakMap.prototype.set;
+            const stdinRead = stdin.read, stdoutWrite = stdout.write;
+            const decode = decoder.decode, encode = encoder.encode, exit = Deno.exit;
+            const hostSyscallErrors = new WeakMap<object, Record<string, unknown>>();
             let buffer = "";
 
             console.log = (...args: unknown[]) => console.error(...args);
 
+            function rememberHostSyscallError(error: Error, frame: Record<string, unknown>): void {
+              apply(weakMapSet, hostSyscallErrors, [error, {
+                code: ownFrameValue(frame, "code"),
+                error_type: ownFrameValue(frame, "error_type"),
+                correlation_id: ownFrameValue(frame, "correlation_id"),
+              }]);
+            }
+
+            function ownFrameValue(frame: Record<string, unknown>, key: string): unknown {
+              return apply(hasOwnProperty, frame, [key]) ? frame[key] : undefined;
+            }
+
+            function hostSyscallErrorDetails(error: unknown): Record<string, unknown> | undefined {
+              if (
+                error === null
+                || (typeof error !== "object" && typeof error !== "function")
+              ) {
+                return undefined;
+              }
+              return apply(weakMapGet, hostSyscallErrors, [error]) as
+                Record<string, unknown> | undefined;
+            }
+
             async function readFrame(): Promise<Record<string, unknown>> {
               while (true) {
-                const newline = buffer.indexOf("\\n");
+                const newline = apply(stringIndexOf, buffer, ["\\n"]);
                 if (newline >= 0) {
-                  const line = buffer.slice(0, newline);
-                  buffer = buffer.slice(newline + 1);
-                  if (line.trim().length === 0) continue;
-                  return JSON.parse(line);
+                  const line = apply(stringSlice, buffer, [0, newline]);
+                  buffer = apply(stringSlice, buffer, [newline + 1]);
+                  if (apply(stringTrim, line, []).length === 0) continue;
+                  return jsonParse(line);
                 }
-                const chunk = await stdin.read();
-                if (chunk.done) throw new Error("stdin closed before protocol frame");
-                buffer += decoder.decode(chunk.value, { stream: true });
+                const chunk = await apply(stdinRead, stdin, []);
+                if (chunk.done) throw new NativeError("stdin closed before protocol frame");
+                buffer += apply(decode, decoder, [chunk.value, { stream: true }]);
               }
             }
 
             async function writeFrame(frame: Record<string, unknown>): Promise<void> {
-              await stdout.write(encoder.encode(JSON.stringify(frame) + "\\n"));
+              const protocolFrame = objectCreate(null) as Record<string, unknown>;
+              const keys = objectKeys(frame);
+              for (let index = 0; index < keys.length; index += 1) {
+                const key = keys[index];
+                protocolFrame[key] = frame[key];
+              }
+              const serialized = jsonStringify(protocolFrame) + "\\n";
+              await apply(stdoutWrite, stdout, [apply(encode, encoder, [serialized])]);
             }
 
             const libos = {
@@ -1196,25 +1291,42 @@ class DenoTypescriptSandbox(SandboxBackend):
                   const frame = await readFrame();
                   if (frame.type !== "syscall_result" || frame.id !== id) continue;
                   if (frame.ok) return frame.payload;
-                  const error = new Error(String(frame.error ?? "libOS syscall failed"));
-                  (error as Error & { details?: unknown }).details = frame;
+                  const error = new NativeError(nativeString(frame.error ?? "libOS syscall failed"));
+                  rememberHostSyscallError(error, frame);
                   throw error;
                 }
               },
             };
 
+            let providerErrorProof: string | undefined;
             try {
               const frame = await readFrame();
-              if (frame.type !== "run") throw new Error("first protocol frame must be run");
+              if (frame.type !== "run") throw new NativeError("first protocol frame must be run");
+              providerErrorProof = typeof frame.provider_error_proof === "string"
+                ? frame.provider_error_proof
+                : undefined;
+              const candidate = await import("./candidate.ts");
+              if (typeof candidate.run !== "function") {
+                throw new NativeError("candidate module must export a run function");
+              }
+              const run = candidate.run as (
+                args: unknown,
+                libos: typeof libos,
+              ) => unknown | Promise<unknown>;
               const value = await run(frame.args ?? {}, libos);
               await writeFrame({ type: "result", value });
             } catch (error) {
+              const details = hostSyscallErrorDetails(error);
               await writeFrame({
                 type: "error",
-                message: error instanceof Error ? error.message : String(error),
-                stack: error instanceof Error ? error.stack : undefined,
+                message: error instanceof NativeError ? error.message : nativeString(error),
+                stack: error instanceof NativeError ? error.stack : undefined,
+                code: details?.code,
+                error_type: details?.error_type,
+                correlation_id: details?.correlation_id,
+                provider_error_proof: details === undefined ? undefined : providerErrorProof,
               });
-              Deno.exit(1);
+              apply(exit, Deno, [1]);
             } finally {
               stdout.releaseLock();
               stdin.releaseLock();
