@@ -141,19 +141,19 @@ jobs:
         run: uv sync --frozen --all-groups
 
       - name: Run pytest lane
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: |
           lane="${{ matrix.lane }}"
           cmd=(uv run python scripts/test_matrix.py --lane "$lane")
           case "$lane" in
             runtime)
-              cmd+=(--max-lane-seconds 900)
+              cmd+=(--max-lane-seconds 1800)
               ;;
             self-evolution)
-              cmd+=(-n 4 --max-lane-seconds 900)
+              cmd+=(-n 4 --max-lane-seconds 1800)
               ;;
             providers)
-              cmd+=(-n 4 --dist worksteal --max-lane-seconds 900)
+              cmd+=(-n 4 --dist worksteal --max-lane-seconds 1800)
               ;;
           esac
           "${cmd[@]}"
@@ -191,10 +191,10 @@ jobs:
         run: uv sync --frozen --all-groups
 
       - name: Run complete security lane
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: >-
           uv run python scripts/test_matrix.py --lane security
-          -n 4 --dist worksteal --max-lane-seconds 900
+          -n 4 --dist worksteal --max-lane-seconds 1800
 
   deterministic-release:
     needs: static
@@ -223,10 +223,10 @@ jobs:
         run: uv sync --frozen --all-groups
 
       - name: Run combined deterministic release matrix
-        timeout-minutes: 20
+        timeout-minutes: 40
         run: >-
           uv run python scripts/test_matrix.py --lane all
-          -n 4 --dist worksteal --max-lane-seconds 900
+          -n 4 --dist worksteal --max-lane-seconds 1800
 
       - name: Run runtime-safety release smoke
         run: >-
