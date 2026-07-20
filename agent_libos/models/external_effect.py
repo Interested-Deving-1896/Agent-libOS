@@ -38,6 +38,19 @@ class ExternalEffectRollbackStatus(StrEnum):
     UNKNOWN = "unknown"
 
 
+def default_external_effect_rollback_status(
+    rollback_class: ExternalEffectRollbackClass,
+) -> ExternalEffectRollbackStatus:
+    """Return the conservative omitted status for a rollback class."""
+
+    return {
+        ExternalEffectRollbackClass.IRREVERSIBLE: ExternalEffectRollbackStatus.NOT_SUPPORTED,
+        ExternalEffectRollbackClass.ROLLBACKABLE: ExternalEffectRollbackStatus.NOT_APPLIED,
+        ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED: ExternalEffectRollbackStatus.NOT_REQUIRED,
+        ExternalEffectRollbackClass.UNKNOWN: ExternalEffectRollbackStatus.UNKNOWN,
+    }[rollback_class]
+
+
 @dataclass(frozen=True)
 class ExternalEffectClassification:
     rollback_class: ExternalEffectRollbackClass

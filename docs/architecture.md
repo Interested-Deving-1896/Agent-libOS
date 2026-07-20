@@ -27,9 +27,11 @@ Agent personality / application
      - primitive managers
      - data-flow manager and Host Sink trust registry
      - capability manager
+     - resource manager
      - event bus
      - checkpoint manager
      - operation/explain manager
+     - protected-operation SDK and evidence retention
      - audit manager
   -> Resource Provider Substrate
      - filesystem provider
@@ -112,11 +114,19 @@ that reserves ordinary/release capabilities and prepares the effect intent.
 Low-level effect-ledger functions remain Runtime-internal for the SDK and
 startup reconciliation.
 
-Providers are also the source of truth for successful external-effect rollback
-classification. Effectful provider calls must expose a classifier to the
-primitive; the runtime persists the result for checkpoint reports, but v1 does
-not apply external compensation. Filesystem mutation, clock, shell, and PTY
-spawn paths use explicit finite-use reservations around the provider boundary.
+Providers are normally the source of truth for successful external-effect
+rollback classification, and contracts require a provider classifier by
+default. A trusted primitive or executor may instead supply an explicit
+`classification_override` when it has stronger phase-specific knowledge that a
+generic provider classifier cannot express—for example, the fixed
+irreversible/information-flow result of a completed LLM request or a validated
+pre-call/state-only result. The override is runtime code, not model- or
+provider-supplied metadata, and the SDK still applies the completed-phase
+state-mutation/information-flow floor so it cannot under-classify work already
+observed. The runtime persists the selected classification for checkpoint
+reports, but v1 does not apply external compensation. Filesystem mutation,
+clock, shell, and PTY spawn paths use explicit finite-use reservations around
+the provider boundary.
 A filesystem, clock, shell, human-output/terminal-I/O, PTY, JSON-RPC, or live
 MCP primitive also persists a conservative `unknown` external-effect intent
 immediately before entering that boundary. On a classified success or
@@ -128,12 +138,13 @@ the provider may have run, the pending `unknown` row remains durable and is
 visible to checkpoint, Explain, and benchmark consumers instead of creating a false
 absence of evidence.
 
-Each intent also records a canonical argument hash, idempotency key, and an
-irreversible transaction state (`prepared`, `dispatched`, `committed`,
-`failed`, `unknown`, or `compensated`). A unique process/idempotency-key index
-blocks duplicate dispatch. Startup may call a provider reconciliation hook to
-query an existing receipt; it never replays the effect. Providers without that
-hook leave the transaction `unknown`.
+Each intent also records a canonical argument hash, idempotency key, and a
+transaction state (`prepared`, `authorized`, `approved`, `dispatched`,
+`committed`, `failed`, `unknown`, or `compensated`); not every operation uses
+every intermediate state. A unique process/idempotency-key index blocks
+duplicate dispatch. Startup may call a provider reconciliation hook to query an
+existing receipt; it never replays the effect. Providers without that hook
+leave the transaction `unknown`.
 
 A provider may raise `ProviderEffectNotStarted` only when it can certify that
 its selected call did not begin. The primitive abandons the pending intent only
@@ -192,6 +203,20 @@ subclass-only fields there. The builder validates that contract before opening
 an owned store. Custom Runtime subclasses must be created through their
 `open`/`aopen` entrypoints or `RuntimeBuilder`; invoking a custom subclass
 constructor directly is outside this lifecycle contract.
+
+Before the lifecycle becomes `OPEN`, the assembled Runtime holds a dedicated
+recovery lease and drains durable startup work in dependency order: prepared
+protected operations, stale capability-use reservations, pending external
+effects, resource-usage reservations, process-exec publications, process-launch
+publications, checkpoint-restore publications, missing volatile Object
+payloads, registered JIT rehydration, stale Explainable Operations, stale
+process execution leases, and Object Tasks. Recovery queries use configured,
+hard-bounded keyset pages. External providers may reconcile an existing receipt
+but are never replayed; ambiguous resource reservations are charged to their
+maximum envelope. Process/image/checkpoint publications carry durable plans,
+phase receipts, exact recovery leases, and operation bindings so recovery can
+compensate or terminalize a specific owner rather than infer success from
+adjacent rows. A failed or manual publication keeps mutation admission closed.
 
 Before an async entrypoint offloads allocation or assembly, its event-loop
 caller atomically installs an identity-only `StoreAssemblyReservation`. New
@@ -283,6 +308,9 @@ The assembled graph includes:
   methods, never the concrete Runtime.
 - `CapabilityManager` coordinates separate evaluation, finite-use lease, and
   mutation services.
+- `ResourceManager` validates hierarchical budgets, reserves maximum provider
+  usage envelopes before dispatch, settles exact usage, and recovers ambiguous
+  reservations conservatively on startup.
 - `DataFlowManager` owns the versioned Host Sink registry, source/version
   validation, conditional releases, file label bindings, and append-only flow
   decisions. Registry writes require configured `data_flow_sink_registry:*`
@@ -301,8 +329,18 @@ The assembled graph includes:
   JIT lifecycle respectively.
 - `SkillManager` registers standard Skill packages and activates them into
   process tool tables and prompt context without granting resource authority.
-- `ProcessManager` owns process lifecycle, working directories, and child
-  relationships; `ProcessLaunchService` owns launch/exec transitions.
+- `ProcessManager` owns process lifecycle, working directories, child
+  relationships, and durable spawn/fork publications; `ProcessLaunchService`
+  owns launch authority and path policy.
+- `ProcessTransitionService` is the ordinary semantic status/wait/outcome write
+  boundary; dedicated exec and checkpoint publication paths use narrower
+  transactional transitions that enforce the same typed-state contract. Row
+  `revision`, wait `state_generation`, and exact scheduler
+  execution-generation/owner/lease tokens separately fence stale updates,
+  repeated-wait ABA wakeups, and detached quantum writes.
+- `ImageBootService` owns image preflight, process-exec admission leases,
+  phased boot publications, exact rollback snapshots, compensation, and
+  startup reconciliation.
 - `SimpleScheduler` runs runnable processes and wakes waiting work.
 - `ObjectTaskManager` coordinates execution while dedicated state and
   notification services own durable transitions and wake/message publication.
@@ -423,7 +461,8 @@ The runtime store keeps durable metadata and append-only records:
 
 - processes, working directories, loaded Skills, and tool tables,
 - Object Memory metadata and namespace directories,
-- capabilities and object handles,
+- capabilities, finite capability-use reservations, and object handles,
+- resource usage plus durable maximum-usage reservations,
 - process messages and human requests,
 - tools and JIT candidates,
 - Skill registry and trust rows,
@@ -432,9 +471,12 @@ The runtime store keeps durable metadata and append-only records:
 - JSON-RPC endpoint registry rows,
 - MCP server registry rows,
 - checkpoints and checkpoint payload snapshots,
+- runtime publications and phase receipts for process launch, process exec, and
+  checkpoint restore,
 - durable LLM pending-action generations, Responses tool outputs, and context
   generations used to validate opt-in provider chaining,
 - provider-decided finalized external effects and conservative pending intents,
+  including record-level payload-retention tier/digest provenance,
 - events and audit records,
 - LLM call records with provider ids, model/API mode, usage, errors, and
   full prompt, visible tools, output, tool calls, reasoning metadata, raw
@@ -443,22 +485,35 @@ The runtime store keeps durable metadata and append-only records:
   fine-tuning pipelines; this may include sensitive prompt, tool, reasoning,
   and provider payload fields. Set `llm.persist_full_io: false` to opt out and
   store only previews plus hashes for those fields. Conditional LLM release
-  rows apply the same policy before Human approval: the exact pending request
-  stays in memory, while SQL receives only hashes and non-sensitive resume
-  metadata.
+  rows apply the same policy before Human approval: with full-I/O persistence
+  enabled, SQL stores the prepared request; with it disabled, SQL receives only
+  hashes and non-sensitive resume metadata while the exact pending request
+  stays in executor memory.
+
+Payload retention is an explicit Host maintenance surface, not startup
+recovery. It is disabled by default. When enabled and applied, bounded keyset
+pages may reduce eligible terminal LLM-call and external-effect payloads
+monotonically from `full` to content-free `summary` and then `hash_only` while
+preserving row identity, causal links, classifications, timestamps, and stable
+payload digests. Pending/uncertain effects and LLM rows still needed for
+continuation or recovery are ineligible. The applied batch and its payload-free
+maintenance audit summary commit together; see
+[Evidence and LLM Payload Retention](evidence_payload_retention.md).
 
 Object payloads are not ordinary durable object rows. They live in runtime
 memory, while SQL object rows store only a runtime-memory marker. Rows whose
 live payload cache cannot be reconstructed are released fail-closed on reopen.
 Persistent stores take an active-runtime lease so two writable Runtime
 instances cannot concurrently open the same database. File-backed SQLite
-canonicalizes the database path for both the connection and lease. On systems
-with `fcntl` and `O_NOFOLLOW`, its sidecar is opened no-follow, regular-file and
-inode checked, and protected by `flock`; database/lease/journal/WAL/SHM files
-are owner-only (`0600`). The fallback uses SQLite's
-kernel-managed exclusive database lock. PostgreSQL derives its advisory-lock
-key from the current database and schema. A clean close releases the lease and
-permits a later reopen.
+canonicalizes the database path for both the connection and lease. On the
+tested POSIX path, `O_NOFOLLOW` plus `fchmod` enables file-type/symlink checks
+and owner-only (`0600`) tightening for the database and sidecars; current-user
+ownership is also required where `getuid` is available. Separately, `fcntl`
+plus `O_NOFOLLOW` enables the hardened no-follow sidecar `flock` lease. Where
+that lease mechanism is unavailable, SQLite's kernel-managed exclusive database
+lock is the fallback, without claiming unavailable POSIX mode/ownership
+hardening. PostgreSQL derives its advisory-lock key from the current database
+and schema. A clean close releases the lease and permits a later reopen.
 Checkpoint and image artifact payloads are explicit durable snapshot
 exceptions.
 
@@ -495,14 +550,17 @@ agent_libos/
   api/             CLI and GUI HTTP/SSE server entrypoints
   capability/      capability grant, revoke, check, and object handles
   config/          typed runtime, LLM, tool, memory, launcher, and script defaults
+  evidence/        protected evidence classification and payload-retention policy
   human/           HumanObject query, approval, interrupt, and output primitives
   images/          built-in AgentImage definitions
   llm/             prompt, context, OpenAI-compatible client, executor, action parser
   memory/          typed Object Memory and MemoryView implementation
   models/          dataclass and enum models split by runtime domain
   modules/         trusted startup Runtime Module loader, registry, and core module
+  ports/           narrow subsystem protocols and dependency-inversion boundaries
   primitives/      libOS primitives for filesystem, clock, shell, JSON-RPC, and MCP
   runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
+  sdk/             public protected-operation lifecycle and provider-facing contracts
   skills/          Skill schema, strict loader, trust registry, and SkillManager
   substrate/       provider interfaces and local host-backed implementations
   storage/         runtime store backends

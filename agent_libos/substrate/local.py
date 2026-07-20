@@ -45,6 +45,7 @@ from agent_libos.models import (
     McpToolSpec,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.models.external_effect import default_external_effect_rollback_status
 from agent_libos.substrate.base import (
     CommandMetrics,
     CommandResult,
@@ -2104,11 +2105,7 @@ class SdkMcpProvider:
         rollback_class = ExternalEffectRollbackClass(str(context["rollback_class"]))
         rollback_status = context.get("rollback_status")
         if rollback_status is None:
-            rollback_status = (
-                ExternalEffectRollbackStatus.NOT_REQUIRED
-                if rollback_class == ExternalEffectRollbackClass.NO_ROLLBACK_REQUIRED
-                else ExternalEffectRollbackStatus.NOT_SUPPORTED
-            )
+            rollback_status = default_external_effect_rollback_status(rollback_class)
         return ExternalEffectClassification(
             rollback_class=rollback_class,
             rollback_status=ExternalEffectRollbackStatus(str(rollback_status)),

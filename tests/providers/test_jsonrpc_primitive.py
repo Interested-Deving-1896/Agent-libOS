@@ -337,10 +337,50 @@ class TestJsonRpcPrimitive:
         runtime = Runtime.open('local')
         try:
             runtime.jsonrpc.register_endpoint_from_yaml_text(_manifest('valid', 'https://api.example.test/jsonrpc'), actor='cli', require_capability=False)
-            invalid_cases = [_manifest('bad-http', 'http://api.example.test/jsonrpc'), _manifest('bad-userinfo', 'https://user:pass@example.test/jsonrpc'), _manifest('bad-fragment', 'https://api.example.test/jsonrpc#secret'), _manifest('bad:colon', 'https://api.example.test/jsonrpc'), _manifest('bad-private-ip', 'https://10.0.0.10/jsonrpc'), _manifest('bad-metadata-ip', 'https://169.254.169.254/jsonrpc'), _manifest('bad-metadata-host', 'https://metadata.google.internal/jsonrpc'), _manifest('missing-class', 'https://api.example.test/jsonrpc', rollback_class=None), _manifest('literal-header', 'https://api.example.test/jsonrpc', literal_header=True), _manifest('bad-prefix', 'https://api.example.test/jsonrpc', header_prefix='Bearer literal-secret '), _manifest('bad-suffix', 'https://api.example.test/jsonrpc', header_suffix=' literal-secret'), _manifest('bad-bool', 'https://api.example.test/jsonrpc', state_mutation='"false"'), _manifest('dup-method', 'https://api.example.test/jsonrpc', duplicate_method=True), _manifest('bad-port', 'https://api.example.test:99999/jsonrpc'), _manifest('bad-timeout', 'https://api.example.test/jsonrpc', timeout_s='.nan'), _manifest('bad-bool-bytes', 'https://api.example.test/jsonrpc', max_request_bytes='true')]
+            invalid_cases = [_manifest('bad-http', 'http://api.example.test/jsonrpc'), _manifest('bad-userinfo', 'https://user:pass@example.test/jsonrpc'), _manifest('bad-fragment', 'https://api.example.test/jsonrpc#secret'), _manifest('bad:colon', 'https://api.example.test/jsonrpc'), _manifest('bad-private-ip', 'https://10.0.0.10/jsonrpc'), _manifest('bad-metadata-ip', 'https://169.254.169.254/jsonrpc'), _manifest('bad-metadata-host', 'https://metadata.google.internal/jsonrpc'), _manifest('missing-class', 'https://api.example.test/jsonrpc', rollback_class=None), _manifest('empty-status', 'https://api.example.test/jsonrpc', rollback_status='""'), _manifest('literal-header', 'https://api.example.test/jsonrpc', literal_header=True), _manifest('bad-prefix', 'https://api.example.test/jsonrpc', header_prefix='Bearer literal-secret '), _manifest('bad-suffix', 'https://api.example.test/jsonrpc', header_suffix=' literal-secret'), _manifest('bad-bool', 'https://api.example.test/jsonrpc', state_mutation='"false"'), _manifest('dup-method', 'https://api.example.test/jsonrpc', duplicate_method=True), _manifest('bad-port', 'https://api.example.test:99999/jsonrpc'), _manifest('bad-timeout', 'https://api.example.test/jsonrpc', timeout_s='.nan'), _manifest('bad-bool-bytes', 'https://api.example.test/jsonrpc', max_request_bytes='true')]
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.jsonrpc.register_endpoint_from_yaml_text(text, actor='cli', require_capability=False)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ('rollback_class', 'rollback_status', 'expected_status'),
+        [
+            pytest.param('irreversible', None, 'not_supported', id='irreversible-default'),
+            pytest.param('rollbackable', None, 'not_applied', id='rollbackable-default'),
+            pytest.param('no_rollback_required', None, 'not_required', id='not-required-default'),
+            pytest.param('unknown', None, 'unknown', id='unknown-default'),
+            pytest.param('rollbackable', 'unknown', 'unknown', id='explicit-override'),
+        ],
+    )
+    def test_manifest_rollback_status_defaults_and_explicit_override(
+        self,
+        rollback_class: str,
+        rollback_status: str | None,
+        expected_status: str,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            endpoint_id = f'rollback-status-{rollback_class}-{rollback_status or "default"}'
+            runtime.jsonrpc.register_endpoint_from_yaml_text(
+                _manifest(
+                    endpoint_id,
+                    'https://api.example.test/jsonrpc',
+                    rollback_class=rollback_class,
+                    rollback_status=rollback_status,
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+
+            endpoint = runtime.jsonrpc.inspect_endpoint(
+                endpoint_id,
+                require_capability=False,
+            )
+
+            assert endpoint['methods'][0]['rollback_class'] == rollback_class
+            assert endpoint['methods'][0]['rollback_status'] == expected_status
         finally:
             runtime.close()
 
@@ -1376,7 +1416,7 @@ class _FailingJsonRpcProvider(_RecordingJsonRpcProvider):
         self.calls.append(request_body)
         raise RuntimeError('transport-secret')
 
-def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_rollback_required', state_mutation: bool | str=False, with_header: bool=True, literal_header: bool=False, duplicate_method: bool=False, header_prefix: str='Bearer ', header_suffix: str='', rpc_method: str='demo.echo', params_schema: str='', timeout_s: str='5', max_request_bytes: str='65536', max_response_bytes: str='1048576') -> str:
+def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_rollback_required', rollback_status: str | None=None, state_mutation: bool | str=False, with_header: bool=True, literal_header: bool=False, duplicate_method: bool=False, header_prefix: str='Bearer ', header_suffix: str='', rpc_method: str='demo.echo', params_schema: str='', timeout_s: str='5', max_request_bytes: str='65536', max_response_bytes: str='1048576') -> str:
     header = ''
     if literal_header:
         header = '\nheaders:\n  Authorization: "Bearer literal-secret"\n'
@@ -1385,6 +1425,7 @@ def _manifest(endpoint_id: str, url: str, *, rollback_class: str | None='no_roll
         if header_suffix:
             header += f'    suffix: "{header_suffix}"\n'
     rollback = f'    rollback_class: {rollback_class}\n' if rollback_class is not None else ''
+    rollback += f'    rollback_status: {rollback_status}\n' if rollback_status is not None else ''
     second = '\n  - method_id: echo\n    rpc_method: demo.echo2\n    right: read\n    rollback_class: no_rollback_required\n    state_mutation: false\n    information_flow: true\n' if duplicate_method else ''
     state = 'true' if state_mutation is True else 'false' if state_mutation is False else state_mutation
     schema = f'    params_schema:{params_schema}' if params_schema else ''

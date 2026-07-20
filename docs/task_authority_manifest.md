@@ -17,7 +17,7 @@ A manifest records:
 - authorized and image-required capability specs;
 - permitted provider effect classes;
 - resource budget, approval policy, and process receive-domain data-flow policy;
-- operator metadata that does not contain task payloads or credentials.
+- opaque operator metadata supplied at the Host/admin boundary.
 
 Root launch compiles only the authorized capability specs. Child launch uses
 the intersection of the parent manifest, current capability policy, and the
@@ -30,22 +30,28 @@ capability and may only stay equal or decrease across a transition.
 Checkpoint fork creates a new hashed manifest for every remapped process in
 the same transaction as its process and capability rows. Explicit source
 manifests retain their effect, approval, expiry, budget, and data-flow
-ceilings. An implicit source manifest remains an empty model-request contract,
-so copied Host authority does not silently become requestable authority.
+ceilings. A fork derived from an implicit source records an empty model-request
+contract, so copied Host authority does not silently become requestable
+authority.
 
 Every launch receives a durable manifest record. When the Host does not supply
-an explicit template, that implicit record is still an empty model-request
-contract: arbitrary permission requests are denied. It is not, however, a
-transition ceiling for capabilities the Host deliberately grants after launch.
-Only an explicit Host manifest (and manifests derived beneath it) constrains
-later child/fork authority and manifest budgets. Derived manifests inherit the
-parent approval, effect, expiry, and data-flow ceilings unless the Host supplies
-a narrower child template. Omitted child fields inherit those ceilings. An
-explicit child template cannot add or replace parent data-flow or approval
-policy keys,
-request authority outside the parent's authorized/requestable space, extend the
-parent expiry, or widen a concrete or deny-all effect ceiling to unrestricted
-`null` (or to patterns outside the parent's ceiling).
+an explicit template, the implicit record contains any capability specs the
+Host supplied through the launch `capabilities` argument; it is empty only when
+that argument is empty. Those recorded specs compile into root capabilities and
+bound model requests, so requests outside them are denied. An implicit root
+manifest is not a transition ceiling for authority the Host deliberately grants
+after launch. Supplying an empty object `{}` is different from omission: it
+marks the resulting manifest as explicit and therefore as a transition ceiling;
+its authorized list is empty only when the separate launch `capabilities`
+argument is also empty. Only an explicit Host manifest (and manifests derived
+beneath it) constrains later child/fork authority and manifest budgets. Derived
+manifests inherit the parent approval, effect, expiry, and data-flow ceilings
+unless the Host supplies a narrower child template. Omitted child fields inherit
+those ceilings. An explicit child template cannot add or replace parent
+data-flow or approval policy keys, request authority outside the parent's
+authorized/requestable space, extend the parent expiry, or widen a concrete or
+deny-all effect ceiling to unrestricted `null` (or to patterns outside the
+parent's ceiling).
 
 Model permission requests are checked against the manifest before a Human
 request is created. `approval_policy.requestable_capabilities` declares
@@ -74,6 +80,37 @@ version in the one-shot capability. The capability reservation carries that
 same id into the provider intent, so a same-argument call cannot create a
 different approved effect ledger entry.
 
+## Closed input schema
+
+Manifest input is closed at the top level. The supported fields are
+`authorized_capabilities`, `permitted_effects`, `resource_budget`,
+`approval_policy`, `data_flow_policy`, `expires_at`, `issued_by`, and
+`metadata`. Process identity, image requirements, parent linkage, hashes, and
+timestamps are runtime-owned and cannot be supplied as input. Any unknown
+top-level field fails validation; for example, misspelling `permitted_effects`
+or `expires_at` cannot silently remove an effect or expiry ceiling.
+
+Each entry in `authorized_capabilities` and
+`approval_policy.requestable_capabilities` is also closed. It accepts only:
+
+- required `resource` and `rights` fields;
+- optional `constraints`, `delegable`, `revocable`, `expires_at`,
+  `uses_remaining`, and `max_delegation_depth` fields.
+
+Unknown capability-entry fields fail validation instead of being discarded.
+`resource_budget` is validated against `ResourceBudget`, while
+`data_flow_policy` has the separate closed schema below. Capability
+`constraints`, other `approval_policy` values, and `metadata` are deliberately
+policy-defined mappings rather than self-authorizing fields.
+
+The entire manifest is trusted Host/admin-plane input, not model-authored task
+content. `metadata` is opaque: it is persisted and covered by the manifest
+hash, but the runtime does not scan or redact its values. The Host is therefore
+responsible for excluding task payloads, credentials, and unnecessary personal
+data. Metadata cannot grant authority, and runtime-owned keys such as
+`launch_authority_mode`, `explicit`, `transition_ceiling`, and effect-policy
+provenance are set by the runtime rather than trusted from the supplied mapping.
+
 CLI example:
 
 ```bash
@@ -91,7 +128,8 @@ uv run agent-libos spawn \
 
 `POST /api/processes` and `POST /api/workflows/run` accept the same object as
 `authority_manifest`. Explain summaries show the manifest id/hash, declared
-authority, unmet image requirements, effect ceiling, budget, and policies.
+authority, unmet image requirements, effect ceiling, budget, and policies. They
+do not reproduce opaque operator `metadata`.
 
 The manifest is not a substitute for primitive capability checks. Tool
 projection, Skills, image metadata, and requirement declarations remain
@@ -110,9 +148,10 @@ visibility or planning inputs only.
 ```
 
 Unknown keys, unsupported versions, wildcard/`mixed` entries, malformed
-identities, and non-list fields fail closed. A child/fork manifest inherits the
-parent sets when omitted and may only keep or remove entries. Empty sets allow
-only data without a tenant/principal.
+identities, and non-list fields fail closed. JSON inputs require arrays and the
+Python mapping API requires `list` values; Python tuples are rejected. A
+child/fork manifest inherits the parent sets when omitted and may only keep or
+remove entries. Empty sets allow only data without a tenant/principal.
 
 This policy controls what identity domain a process may receive through a
 goal, message, result, Object Task notification, memory merge, fork, or exec.

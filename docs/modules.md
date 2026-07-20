@@ -124,6 +124,60 @@ perform arbitrary external trusted host-side effects that the runtime cannot
 compensate, so hooks should be kept small and idempotent and should not treat a
 registration rollback as an external-effect rollback.
 
+There are two deliberately different context lifecycles:
+
+1. The entrypoint receives a buffered `ModuleContext`. Its `runtime` member is
+   only a `ModuleRuntimeView` exposing `config`; attempts to reach other Runtime
+   attributes fail before preflight. The entrypoint may call
+   `register_tool`, `register_image`, `register_syscall`,
+   `register_provider_hook`, `add_startup_hook`, and
+   `bind_durable_object_release_finalizer`. Every registered name/id must appear
+   in the corresponding manifest `provides` list.
+2. After buffered registrations pass preflight and are applied, each declared
+   provider/startup hook receives a `ModuleHookContext`. The context is backed
+   by `ModuleHookServices`, and every supported registration or installed
+   module-owned attribute records an inverse in the module's registration
+   journal.
+
+`ModuleHookServices.from_host(...)` is the assembly/test boundary that captures
+the explicit services used to build hook contexts. Its current public fields
+are `config`, `workspace_root`, `audit`, `events`, `shell`, `human`,
+`resources`, `data_flow`, `operations`, `memory`, `process`, `capability`,
+`protected_operations`, `store`, `substrate`, `images`, `tools`,
+`image_registry`, `syscalls`, `provider_hooks`, `lifecycle`, `state`, and
+`add_handle_to_process_view`. Normal module code receives the narrower
+`ModuleHookContext`, not this dataclass or the concrete Runtime.
+
+The hook context exposes read/operational properties for `module_id`, `actor`,
+`config`, `workspace_root`, `audit`, `events`, `shell`, `human`, `resources`,
+`data_flow`, `operations`, `memory`, `process`, `capability`,
+`protected_operations`, `store`, `substrate`, and a deep-copied read-only
+`images` mapping. `substrate` rejects attribute writes; module-owned additions
+must use `set_substrate_attribute`. `memory` blocks private/non-journaled bind
+access while forwarding ordinary public operations and exposing journaled
+Object finalizer binding.
+
+Hook-only mutation and lifecycle methods are:
+
+- `register_tool(..., scope=None, ephemeral=False)`, `register_image(...,
+  source=None)`, `register_syscall(...)`, and `register_provider_hook(...)`;
+- `bind_shutdown_finalizer(...)`, `bind_recovery_cleanup(...)`,
+  `bind_object_release_finalizer(...)`, and
+  `bind_durable_object_release_finalizer(...)`;
+- `set_runtime_attribute(...)` for new names beginning `_agent_libos_`, and
+  `set_substrate_attribute(...)` for new public substrate attributes;
+- `get_runtime_attribute(...)`, `add_handle_to_process_view(...)`, and
+  `require_recovery_cleanup_lease()` for installed adapters.
+
+The registry deactivates the hook context in a `finally` block as soon as that
+synchronous hook returns or raises. Registration, binding, and setter methods
+then reject later calls. Installed adapters may retain the context for its
+operational services; `get_runtime_attribute`, `add_handle_to_process_view`,
+and the lifecycle-scoped `require_recovery_cleanup_lease` remain callable.
+Hooks must not return awaitables. If a hook or its evidence sink fails, journal
+rollback removes its owned registrations in reverse order; this rollback does
+not compensate arbitrary external I/O performed directly by trusted Python.
+
 The runtime serializes module resolution, import, buffered application, hook
 execution, rollback, failed-record publication, and shutdown cleanup with the
 same re-entrant registry lifecycle lock used by ToolBroker and ImageRegistry.
@@ -162,7 +216,7 @@ capabilities.
 registrations have been applied.
 
 Inside a trusted startup hook,
-`runtime.bind_recovery_cleanup(fn)` registers an idempotent, process-local
+`ctx.bind_recovery_cleanup(fn)` registers an idempotent, process-local
 teardown callback for recovery-diagnostics handoff. This is deliberately
 separate from `bind_shutdown_finalizer`: ordinary shutdown callbacks are never
 implicitly recovery-safe and are not called by handoff. A recovery cleanup may
@@ -196,7 +250,19 @@ Spawn, read, write, resize, close, automatic exit cleanup, and compensating
 close phases use the same [Protected Operation SDK](protected_operation_sdk.md)
 contracts as core providers; the module does not manage effect intents or
 finite-use reservations through a private lifecycle.
-PTY spawn and write additionally use the common data-flow gate. The session
+The declared data-flow directions are:
+
+| Operation | Direction | Flow behavior |
+| --- | --- | --- |
+| public `pty_create` / `primitive.pty.spawn` | bidirectional | `argv` plus `cwd` egress to the resolved executable Sink; provider/session output is external ingress |
+| `pty_read` / `primitive.pty.read` | ingress | returned output/status observes the session's accumulated ingress context |
+| internal `primitive.pty.ingest` | ingress | the continuous reader drains provider output under the session ingress context |
+| `pty_write` / `primitive.pty.write` | egress | text goes to the pinned session Sink and raises the session label high-water on success or ambiguous dispatch |
+| `pty_resize` / `primitive.pty.resize` | egress | dimensions are a control payload to the pinned session Sink |
+| public `pty_close` / `primitive.pty.close` | egress | force/timeout controls go to the pinned session Sink; lifecycle-only internal close has runtime-internal authority rather than a process payload |
+| `pty_list` | local ingress observation | no provider call/effect is created; labels from all returned readable sessions are aggregated into the caller context |
+
+The session
 pins the resolved executable identity and Sink trust snapshot established at
 spawn; a later write cannot switch the session to another trusted executable.
 Every successful write raises the session's data-flow high-water mark and the

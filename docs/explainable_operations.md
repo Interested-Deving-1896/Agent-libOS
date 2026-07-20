@@ -144,17 +144,41 @@ reports waiting, interruption, unknown outcome, or a pending provider effect.
 Each LLM action-selection records one metadata-only manifest containing:
 
 - process/view id, policy, effective token budget, and context generation;
-- final context Object id/version, rendered tokens, and SHA-256;
-- each source Object id/version/type;
+- final LLM-context Object id/version, final rendered token count, and final
+  rendered SHA-256;
+- each source-view candidate's Object id/version/type;
 - included/omitted disposition and reason (`selected`, `filter_mismatch`,
-  `capability_denied`, `token_budget`, or `missing`);
-- transformation (`verbatim`, `compacted`, or `truncated`) and rendered token/hash
-  metadata.
+  `capability_denied`, `token_budget`, or `missing`), plus the appended final
+  context entry with reason `llm_context`;
+- per-entry security `labels` (`sensitivity`, `trust_level`, `integrity`,
+  `origin`, `tenant`, `principal`, and `declassification_authority`) when the
+  source was readable;
+- transformation (`verbatim`, `compacted`, or `truncated`) and per-entry
+  rendered token/hash metadata; and
+- final-context compaction mode, timestamp, and transformation.
+
+The source entries and final-context entry have different roles. Source entries
+describe the Object snapshots considered by `memory.materialize_context`; their
+per-entry token/hash values describe those rendered source chunks. The Runtime
+then updates or creates the process's append-only LLM-context Object and appends
+a separate included entry whose reason is `llm_context`. Top-level
+`context_oid`, `context_version`, `rendered_tokens`, and `rendered_sha256`
+identify that final Object snapshot and the LLM-context text prepared for the
+provider request. The same Object id may consequently appear once as an earlier
+source snapshot and again as the newer final snapshot; consumers must use the
+reason and version rather than deduplicating by Object id.
+
+Labels are metadata, not payload copies. An omitted `missing` or
+`capability_denied` entry can have `labels=null` because the materializer could
+not safely read the Object metadata. The `llm_context` reason is distinct from
+the source-selection reasons and is not evidence that every source candidate
+was included.
 
 The manifest does not copy Object payloads, rendered prompt text, Human answers,
 or provider responses. Direct `memory.materialize_context` calls return the same
-per-Object selection metadata in memory; durable manifest rows are created when
-the final LLM context is prepared.
+source-candidate selection metadata in memory, but do not append the final
+`llm_context` entry or create a durable manifest row. Durable rows are created
+only when the final LLM context is prepared for an LLM action-selection.
 
 ## Host Interfaces
 
@@ -199,7 +223,9 @@ Responses preserve routing ids, statuses, rights, targets, hashes, counts, and
 rollback classification. They apply observability redaction to decisions,
 payload-like fields, credentials, Human content, LLM raw I/O, Object payloads,
 raw command arguments and environments, stdout/stderr, and provider metadata.
-The original append-only audit/effect records remain unchanged.
+Explain rendering leaves the original audit and external-effect records
+unchanged; it does not rewrite their source fields while producing a redacted
+projection.
 
 Unlinked rows are not backfilled or heuristically reconstructed. The 0.3
 schema requires the explanation tables and explicit links; an older or

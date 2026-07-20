@@ -63,9 +63,11 @@ Package validation is bounded by `AgentLibOSConfig.skills`: `SKILL.md` is read
 with `skill_md_max_bytes` for process-driven workspace registration and the
 hard host limit is `skill_md_hard_limit_bytes`; bundled resources are limited
 by `resource_read_max_bytes`, `package_max_bytes`, and `max_package_files`.
-Prompt instructions are clipped to `max_prompt_instruction_chars`; Skill JIT
-sources use `max_jit_source_chars`; tool, action, JIT, and
-required-capability counts use their corresponding `max_*` settings.
+Packages whose prompt instructions exceed `max_prompt_instruction_chars` are
+rejected during parsing/registration; an oversized package is not accepted by
+clipping its instructions. Loaded snapshots are validated against the same
+bound before use. Skill JIT sources use `max_jit_source_chars`; tool, action,
+JIT, and required-capability counts use their corresponding `max_*` settings.
 The package SHA-256 binds the normalized Skill metadata, the prompt
 instructions, JIT source hashes, declared resource metadata, and the actual
 bundled resource bytes. A package snapshot whose stored resource content no
@@ -129,13 +131,25 @@ already has the corresponding directory and file read authority; it does not
 grant or prompt for ambient package-directory reads just to discover optional
 resources.
 
-Global Skills are read only from configured global Skill directories. Their
-full package SHA-256 must be trusted before registration:
+Global Skills are read only from configured global Skill directories. With the
+default `skills.global_requires_trust: true`, their full package SHA-256 must
+be trusted before registration, either through configured
+`trusted_global_package_sha256` values or a durable trust record:
 
 ```bash
 uv run agent-libos --db .agent_libos.sqlite skills trust ~/.agent-libos/skills/review-helper
 uv run agent-libos --db .agent_libos.sqlite skills register ~/.agent-libos/skills/review-helper --source-type global
 ```
+
+Setting `skills.global_requires_trust: false` disables only this hash-trust
+gate. Directory containment, package validation, Skill capabilities, JIT
+sandboxing, and primitive authority checks still apply, but every otherwise
+valid package under a configured global directory can then be registered
+without prior hash pinning. This materially widens the trusted prompt/tool
+control plane: changing a file in such a directory can change instructions,
+tool visibility, and bundled JIT source accepted at the next registration.
+Disable the gate only when those directories and every writer to them are part
+of the Host's trusted computing base.
 
 Admin CLI registration can read and snapshot a workspace package directly:
 
@@ -166,13 +180,18 @@ filesystem authority for each package file it snapshots.
 
 ## Activation And Unload
 
-Process-mediated catalog reads, registration, trust changes, activation, and
-unload reauthorize their complete allow/deny decisions after entering the
-operation's `AuthorityTransaction`, then reserve any finite-use
-Skill/process-admin grants before the durable mutation. Business rows,
-event/audit evidence, and finite-use settlement share that transaction. A
-failure before commit therefore restores the exact reservation token; an
-explicit revoke still wins over late cleanup.
+Registration, trust changes, activation, and unload reauthorize their complete
+allow/deny decisions after entering the operation's `AuthorityTransaction`,
+then reserve any finite-use Skill/process-admin grants before the durable
+mutation. Business rows, event/audit evidence, and finite-use settlement share
+that transaction. A failure before commit therefore restores the exact
+reservation token; an explicit revoke still wins over late cleanup.
+
+Process-mediated `discover` and `inspect` are read-only catalog operations.
+They reserve the selected finite read decision before constructing the result,
+restore it if result construction fails, and commit it after a successful
+read; they do not create a business mutation or event/audit publication and do
+not use the mutation `AuthorityTransaction` path.
 
 `activate_skill` is atomic across the process tool table, loaded Skill metadata,
 process-local JIT rows, executable handles, and name aliases. The runtime

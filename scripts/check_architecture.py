@@ -137,6 +137,7 @@ _TYPED_STORAGE_REPOSITORY_CLASSES = frozenset(
         "SnapshotCheckpointRepository",
         "EvidenceRepository",
         "RuntimeModuleRepository",
+        "PayloadRetentionRepository",
     }
 )
 

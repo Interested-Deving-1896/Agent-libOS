@@ -18,12 +18,17 @@ The current built-in tool surface includes tools for:
   files.
 - Filesystem: read/write text, list/create/delete directories, and delete files.
 - Human I/O: ask questions, output messages, and request permission.
-- Capabilities: list, inspect, delegate, and revoke capabilities owned by the
-  current process.
+- Capabilities: list/inspect the current process's authority, delegate an
+  attenuated delegable capability to a child, relinquish its own revocable
+  `allow` capability, or revoke as the issuer or with covering
+  `revoke`/`admin` authority. A holder cannot use self-revocation to remove a
+  restrictive `ask` or `deny` capability.
 - Clock: current time and async sleep through `clock:now`/`clock:sleep` read
   authority.
 - Process lifecycle: fork, spawn, wait, list children, signal, merge memory,
   exec, exit, cwd get/set, and process messages.
+- Object tasks: `start_object_task`, `get_object_task`, `list_object_tasks`,
+  `wait_object_task`, `watch_object_task_owner`, and `cancel_object_task`.
 - Context: `compact_process_context` compresses the caller's
   `llm_context:<pid>` object through a `context-compressor:v0` child process.
 - Shell: argv-only subprocess execution through policy.
@@ -35,9 +40,51 @@ The current built-in tool surface includes tools for:
 - Checkpoint: create, list, inspect, diff, restore, and fork.
 - Skills: discover, activate, read bundled resources, and unload.
 - JIT: propose, validate, and register Deno/TypeScript tools.
+- Lazy tool projection: discover and activate image-authorized tool groups
+  without changing the underlying process tool table or resource authority.
 - Utility actions such as `echo` and `parse_pytest_log`.
 
 Use `uv run agent-libos tools` to inspect registered tools in a runtime.
+
+## Lazy Tool Groups
+
+An image with `metadata.lazy_tool_groups: true` starts with a small model-tool
+projection instead of exposing every authorized schema at once. The initial
+projection is the intersection of the image's `default_tools` with:
+
+- `discover_tool_groups`, `activate_tool_group`, and `process_exit`;
+- `request_permission`, `ask_human`, and `human_output`;
+- `read_memory_object`, `create_memory_object`, and
+  `append_memory_object`; and
+- `get_current_time`.
+
+This changes model visibility only. The process tool table remains the
+image-authorized table, and activating a group does not grant capabilities.
+`discover_tool_groups` reports only groups with at least one tool in that
+table; its `tool_count` is the number of authorized tools in the group and
+`active` means all of those tools are already in the model projection.
+`activate_tool_group` adds the authorized intersection to the model projection
+and records the before/after schema counts and bytes in audit evidence.
+
+The built-in groups are:
+
+| Group | Configured tool names |
+| --- | --- |
+| `filesystem` | `read_text_file`, `write_text_file`, `read_directory`, `write_directory`, `delete_file`, `delete_directory`, `create_object_from_file`, `write_object_to_file`, `get_working_directory`, `set_working_directory` |
+| `process` | `list_child_processes`, `spawn_child_process`, `fork_child_process`, `wait_child_process`, `signal_child_process`, `merge_child_memory`, `send_process_message`, `read_process_messages`, `receive_process_messages`, `exec_process` |
+| `remote` | `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, `call_jsonrpc_method`, `list_mcp_servers`, `inspect_mcp_server`, `list_mcp_tools`, `call_mcp_tool` |
+| `checkpoint` | `create_checkpoint`, `list_checkpoints`, `inspect_checkpoint`, `diff_checkpoint`, `fork_checkpoint`, `restore_checkpoint`, `commit_checkpoint_to_image` |
+| `memory` | `create_memory_namespace`, `list_memory_namespace`, `create_memory_object`, `append_memory_object`, `read_memory_object`, `create_object_from_file`, `write_object_to_file` |
+| `skills` | `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill` |
+| `object_tasks` | `start_object_task`, `get_object_task`, `list_object_tasks`, `wait_object_task`, `watch_object_task_owner`, `cancel_object_task` |
+| `self_evolution` | `load_image_package`, `propose_jit_tool`, `validate_jit_tool`, `register_jit_tool` |
+| `authority` | `list_capabilities`, `inspect_capability`, `delegate_capability`, `revoke_capability` |
+| `shell` | `run_shell_command`, `parse_pytest_log` |
+| `context` | `compact_process_context` |
+| `clock` | `sleep` |
+
+A tool may appear in more than one group. Group membership is a fixed model
+projection convenience, not an authority declaration.
 
 ## Context Compaction
 
@@ -112,7 +159,19 @@ Successful tasks create the usual tool result object and link the owner object
 to that result with `PRODUCED`. Notifications are ordinary process messages
 from `object_task:<task_id>` on the `object-task` channel by default, with
 `normal` or `interrupt` kind. The `result_oid` in a notification is only a
-reference; it is not an object capability.
+reference by default; it is not itself an object capability.
+
+`start_object_task` may set `grant_result_to_notify: true` when the notification
+recipient differs from the creator. In that mode, result publication requires
+the creator to authorize `grant` on the exact result object and the recipient's
+Task Authority data-flow domain to accept the result labels. The runtime
+reserves any finite-use grant, then commits the recipient's read/materialize/link
+handle, terminal success row, delivered notification, and reservation
+consumption in one transaction. If delivery fails, that transaction rolls back,
+the exact still-live reservation is restored, and terminal success is recorded
+without the recipient handle. Concurrent revoke or disable still wins and
+cannot be undone by cleanup. If the creator lacks grant authority, the task
+fails and its uncommitted result is discarded.
 
 When `owner_watch` is enabled, Object Memory `updated` and outgoing `linked`
 events on the owner object are delivered to the runner process as ordinary
@@ -126,7 +185,10 @@ Ordinary process messages delivered to a waiting runner use the same
 message-wait resume path. Child-process termination can also resume a runner
 blocked in `wait_child_process`. Auto-resume is limited to tools with explicit
 safe replay semantics, currently `receive_process_messages` and
-`wait_child_process`.
+`wait_child_process`. A `WAITING_HUMAN` task is resumed separately through its
+exact stored human-request id after the request settles; a rejected
+`request_permission` resumes so the tool can return the denial, while rejection
+of another human-waiting tool fails the task.
 
 ## Writing Python Tools
 
@@ -154,18 +216,31 @@ are intentionally not supported.
 
 The manual lifecycle is:
 
-1. `propose_jit_tool`: store candidate metadata and TypeScript source.
-2. `validate_jit_tool`: run static source checks, import allowlist checks,
-   schema/source/test size validation, and configured tests under the sandbox
-   backend.
+1. `propose_jit_tool`: validate the spec and size bounds, then store candidate
+   metadata, TypeScript source, tests, and requested-capability declarations.
+2. `validate_jit_tool`: run static source checks, schema/source/test validation,
+   and configured tests under the sandbox backend. Current JIT source must be
+   import-free.
 3. `register_jit_tool`: add the validated tool only to the registering process
    tool table.
 
-Each lifecycle transition commits its durable row, process-local alias, audit
-record, TypeScript source, and in-memory executable handle atomically. JIT
-registration and resolver calls share the runtime registry lifecycle lock; the
-source/handle is installed before the durable alias commits and removed again
-if commit or observability fails, so no resolver observes only one side.
+The three transitions publish different artifacts:
+
+- Proposal atomically inserts the durable candidate row (including source and
+  tests), creates its immutable Object Memory descriptor, and records the
+  proposal audit entry. It creates no tool alias or executable handle.
+- Validation runs the sandbox work, then atomically updates the owned
+  candidate to `validated` or `rejected` and records bounded validation audit
+  evidence. It creates no tool alias or executable handle. Registering a
+  merely proposed candidate invokes this validation first in its own
+  transition.
+- Registration atomically inserts the ephemeral durable Tool row, marks the
+  candidate `registered`, updates both process-local tool tables, publishes the
+  in-memory executable source/handle, and records the registration audit entry.
+
+JIT registration and resolver calls share the runtime registry lifecycle lock;
+the source/handle is installed before the durable alias commits and removed
+again if commit or observability fails, so no resolver observes only one side.
 Snapshot-based process exec holds that same lock through its terminal
 publication, which serializes concurrent process-local candidate, Tool, and
 Skill mutations after either commit or compensation. If compensation succeeds
@@ -176,13 +251,19 @@ entire runtime in `CLOSE_FAILED`, so Tool, Skill, memory, process, capability,
 and all other public mutation boundaries reject admission without persisting
 new state. The fence also revokes older admission epochs; a Tool or Skill
 mutation that was already waiting for the shared registry barrier revalidates
-after it acquires the lock and is rejected before publication. Orderly close
-remains available; a successful reopen performs
-startup recovery and restores normal mutation admission.
-Manual validation failures remain inspectable as rejected candidates. Composite
-Skill activation or image package boot discards candidates that it created when
-the enclosing operation fails, including their Object Memory descriptors, so
-unpublished source and aliases do not accumulate as failed-boot residue.
+after it acquires the lock and is rejected before publication. Ordinary
+`close()`/`shutdown()` is also fail-closed while this recovery-required fence is
+active. After capturing diagnostics, the owner must explicitly call
+`release_recovery_diagnostics()` (or its async form) to release the store
+without normal finalizers; only then can a fresh open perform startup recovery
+and restore normal mutation admission.
+Manual validation failures remain inspectable as rejected candidates. When
+composite Skill activation or image-package compensation succeeds, it discards
+candidates created by the enclosing operation, including their Object Memory
+descriptors, so unpublished source and aliases do not accumulate as residue.
+If compensation itself fails, the exact artifacts remain bound to the durable
+publication under the recovery fence until reopen reconciliation converges or
+marks the publication manual.
 
 Checkpoint image installation also treats a committed JIT candidate and its
 registered Tool as two distinct publication artifacts. Their durable rows,
@@ -289,10 +370,18 @@ cannot reset sensitivity to the default.
 
 ## RPC Protocol
 
-Python starts a Deno subprocess and writes one NDJSON run frame:
+Python starts the dedicated supervisor. Once host-lifetime containment is live,
+the supervisor writes the first NDJSON frame before spawning Deno:
 
 ```json
-{"type":"run","args":{}}
+{"type":"supervisor_ready","version":1}
+```
+
+Python rejects a missing, malformed, or unexpected readiness frame. It then
+writes one run frame with a fresh per-execution proof nonce:
+
+```json
+{"type":"run","args":{},"provider_error_proof":"<host-generated nonce>"}
 ```
 
 TypeScript may emit syscall frames:
@@ -305,14 +394,34 @@ Python responds with final syscall results:
 
 ```json
 {"type":"syscall_result","id":"1","ok":true,"payload":{}}
-{"type":"syscall_result","id":"1","ok":false,"error":"permission denied"}
+{"type":"syscall_result","id":"1","ok":false,"error":"provider failed","error_type":"RuntimeError","code":"provider_error","correlation_id":"..."}
 ```
 
-The tool returns:
+Handler exceptions include `error_type`; `code` and `correlation_id` are
+present only when the Host exception has a public provider-error envelope.
+Protocol-level failures such as an unavailable handler or an exceeded RPC-call
+limit may contain only `error`.
+
+The runner returns either a result frame:
 
 ```json
 {"type":"result","value":{}}
 ```
+
+or an error frame:
+
+```json
+{"type":"error","message":"tool failed","stack":"..."}
+```
+
+When an uncaught error is the exact error created from a failed Host syscall,
+the runner also returns its `code`, `error_type`, `correlation_id`, and the
+matching `provider_error_proof`. The proof is held by the trusted runner wrapper
+and is not passed to candidate `run(args, libos)`. Python accepts those fields
+as a public `ProviderHostError` envelope only when the proof matches in constant
+time and the envelope validates. Candidate-authored fields, a fabricated
+proof, or a different thrown error are treated as an ordinary `SandboxError`;
+they cannot impersonate a Host provider failure.
 
 There is no public pending/retry state for human approval, child wait, or
 message wait. Blocking is an implementation detail inside the syscall.
@@ -369,16 +478,19 @@ it from absolute safe PATH entries and rejects executables under the runtime
 workspace/current root. Absolute executable paths are accepted only when they do
 not fall under configured forbidden roots.
 
-Static imports are limited to configured `jsr:` packages. The default allowlist
-is a small `@std/*` subset. Validation is the phase that may resolve pinned,
-allowlisted JSR imports and account for that dependency surface; runtime
-execution is cached-only. `npm:`, `node:`, `http:`, `https:`, `file:`, and
-dynamic imports are rejected. Static checking is lint, not the security
-boundary: it checks that the source exports `run(args, libos)`, blocks dynamic
-imports, rejects common runtime code generation forms such as `eval`,
-`Function`, `AsyncFunction`, `GeneratorFunction`, and member `constructor`
-access such as `.constructor` or `["constructor"]`, enforces source/test size
-limits, and restricts dependencies to the JSR allowlist. It intentionally does
+All static imports and re-exports from module specifiers are rejected,
+including pinned `jsr:`, `npm:`, `node:`, `http:`, `https:`, and `file:`
+specifiers. Dynamic `import()` is also rejected. The configured
+`tools.deno_jsr_allowlist` is retained in sandbox configuration and validation
+metadata, but it is not currently an exception to the import-free policy and
+must not be treated as permission to import. Runtime execution remains
+cached-only.
+
+Static checking is lint, not the security boundary: it checks that the source
+exports `run(args, libos)`, rejects imports, blocks common runtime code
+generation forms such as `eval`, `Function`, `AsyncFunction`,
+`GeneratorFunction`, and member `constructor` access such as `.constructor` or
+`["constructor"]`, and enforces source/test size limits. It intentionally does
 not try to blacklist every dangerous JavaScript spelling. Runtime safety comes
 from Deno no-permission cached-only execution, the libOS syscall protocol,
 primitive Capability checks, human approval, and resource budgets.
@@ -412,9 +524,13 @@ JIT validation errors, validation logs, and input/output schema failure details
 are persisted through the same bounded/redacted envelope; the direct tool call
 result can still return the original error to the caller.
 
-Full successful tool results are stored only as Tool Result Object Memory
-objects and are subject to a hard serialized payload limit. A failed tool
-result is also stored as a Tool Result Object whenever its trusted data-flow
+The canonical successful result carrier is a Tool Result Object Memory object,
+subject to a hard serialized payload limit. It is not necessarily the only
+durable copy: eligible OpenAI Responses continuation chains persist the exact
+action-result envelope (including its payload) in `llm_tool_outputs`, and with
+full LLM I/O persistence later call messages may retain the rendered result.
+Audit and event envelopes remain bounded/redacted as described above. A failed
+tool result is also stored as a Tool Result Object whenever its trusted data-flow
 context differs from the default context; this labeled carrier prevents error
 text derived from Object reads from becoming an untracked input to the next
 LLM action. Sync worker threads and timeout-managed async tasks return their

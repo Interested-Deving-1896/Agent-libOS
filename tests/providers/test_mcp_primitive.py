@@ -64,6 +64,57 @@ def _grant_stdio_spawn(
 
 
 class TestMcpPrimitive:
+    @pytest.mark.parametrize(
+        ('rollback_class', 'rollback_status', 'expected_status'),
+        [
+            pytest.param('irreversible', None, ExternalEffectRollbackStatus.NOT_SUPPORTED, id='irreversible-default'),
+            pytest.param('rollbackable', None, ExternalEffectRollbackStatus.NOT_APPLIED, id='rollbackable-default'),
+            pytest.param('no_rollback_required', None, ExternalEffectRollbackStatus.NOT_REQUIRED, id='not-required-default'),
+            pytest.param('unknown', None, ExternalEffectRollbackStatus.UNKNOWN, id='unknown-default'),
+            pytest.param('rollbackable', 'unknown', ExternalEffectRollbackStatus.UNKNOWN, id='explicit-override'),
+        ],
+    )
+    def test_manifest_rollback_status_defaults_and_explicit_override(
+        self,
+        rollback_class: str,
+        rollback_status: str | None,
+        expected_status: ExternalEffectRollbackStatus,
+    ) -> None:
+        runtime = Runtime.open('local')
+        try:
+            server_id = f'rollback-status-{rollback_class}-{rollback_status or "default"}'
+            runtime.mcp.register_server_from_yaml_text(
+                _stdio_manifest(
+                    server_id,
+                    rollback_class=rollback_class,
+                    rollback_status=rollback_status,
+                ),
+                actor='cli',
+                require_capability=False,
+            )
+            stored = runtime.store.get_mcp_server(server_id)
+            assert stored is not None
+            server, _metadata = stored
+            tool = server.tools[0]
+
+            classification = SdkMcpProvider().classify_external_effect(
+                'call_tool',
+                {
+                    'server_id': server_id,
+                    'transport': server.transport,
+                    'rollback_class': tool.rollback_class,
+                    'rollback_status': tool.rollback_status,
+                    'state_mutation': tool.state_mutation,
+                    'information_flow': tool.information_flow,
+                },
+                {'status': 'ok'},
+            )
+
+            assert classification.rollback_class == ExternalEffectRollbackClass(rollback_class)
+            assert classification.rollback_status == expected_status
+        finally:
+            runtime.close()
+
     def test_validate_and_call_uses_one_provider_session_and_settles_all_stages(self) -> None:
         runtime = Runtime.open('local')
         provider = _ValidatedCallMcpProvider()
@@ -1105,6 +1156,72 @@ class TestMcpPrimitive:
             for text in invalid_cases:
                 with pytest.raises(ValidationError):
                     runtime.mcp.register_server_from_yaml_text(text, actor="cli", require_capability=False)
+        finally:
+            runtime.close()
+
+    @pytest.mark.parametrize(
+        ("shape", "message"),
+        [
+            ("server", "unknown MCP server fields"),
+            ("stdio", "unknown MCP stdio fields"),
+            ("tool", "unknown MCP tool fields"),
+            ("http", "unknown MCP HTTP fields"),
+            ("header", "unknown MCP header Authorization fields"),
+            ("non-string", "unknown MCP server fields"),
+        ],
+    )
+    def test_manifest_validation_rejects_unknown_fields(
+        self,
+        shape: str,
+        message: str,
+    ) -> None:
+        if shape == "server":
+            manifest = _stdio_manifest("unknown-server-field") + "\nmax_reponse_bytes: 1"
+        elif shape == "stdio":
+            manifest = _stdio_manifest("unknown-stdio-field").replace(
+                "  command: python3",
+                "  command: python3\n  shell: true",
+            )
+        elif shape == "tool":
+            manifest = _stdio_manifest("unknown-tool-field").replace(
+                "    information_flow: true",
+                "    information_flow: true\n    approval: always",
+                1,
+            )
+        elif shape == "http":
+            manifest = _http_manifest(
+                "unknown-http-field",
+                "https://api.example.test/mcp",
+            ).replace(
+                "  url: https://api.example.test/mcp",
+                "  url: https://api.example.test/mcp\n  verify_tls: false",
+            )
+        elif shape == "header":
+            manifest = _http_manifest(
+                "unknown-header-field",
+                "https://api.example.test/mcp",
+            ).replace(
+                "prefix: 'Bearer '",
+                "prefix: 'Bearer ', forward: true",
+            )
+        else:
+            manifest = _stdio_manifest("unknown-non-string-field") + "\n2: invalid\ntypo: invalid"
+        runtime = Runtime.open("local")
+        try:
+            before_servers = runtime.store.list_mcp_servers()
+            before_effects = runtime.store.list_external_effects()
+            before_events = runtime.store.list_events()
+            before_audit = runtime.store.list_audit()
+            with pytest.raises(ValidationError, match=message):
+                runtime.mcp.register_server_from_yaml_text(
+                    manifest,
+                    actor="cli",
+                    require_capability=False,
+                )
+            assert runtime.store.list_mcp_servers() == before_servers
+            assert runtime.store.list_external_effects() == before_effects
+            assert runtime.store.list_events() == before_events
+            assert runtime.store.list_audit() == before_audit
         finally:
             runtime.close()
 
@@ -2826,6 +2943,7 @@ def _stdio_manifest(
     state_mutation: bool = False,
     right: str = "read",
     rollback_class: str = "no_rollback_required",
+    rollback_status: str | None = None,
 ) -> str:
     cwd_line = f"\n  cwd: {cwd}" if cwd is not None else ""
     env_block = f"\n  env:\n    DEMO_TOKEN: {env_source}" if env_source is not None else ""
@@ -2841,6 +2959,11 @@ def _stdio_manifest(
         if duplicate_tool
         else ""
     )
+    rollback_status_line = (
+        f"\n    rollback_status: {rollback_status}"
+        if rollback_status is not None
+        else ""
+    )
     return f"""
 schema_version: 1
 server_id: {server_id}
@@ -2852,7 +2975,7 @@ tools:
   - tool_id: echo
     mcp_name: {mcp_name}
     right: {right}
-    rollback_class: {rollback_class}
+    rollback_class: {rollback_class}{rollback_status_line}
     state_mutation: {str(state_mutation).lower()}
     information_flow: true
     input_schema:

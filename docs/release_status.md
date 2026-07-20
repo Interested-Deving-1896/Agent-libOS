@@ -1,6 +1,6 @@
-# Agent libOS 0.3.1 Status
+# Agent libOS 0.3.2 Status
 
-Agent libOS 0.3.1 is release-ready for the core Python runtime scope exercised
+Agent libOS 0.3.2 is release-ready for the core Python runtime scope exercised
 by the checked-in CI workflow and defined in `docs/support_matrix.md`. This is
 not a claim that every platform, desktop package, or real external-provider
 configuration has been release-validated.
@@ -168,15 +168,15 @@ configuration has been release-validated.
   trace-observed with exact SELECT/DML ledgers; the benchmark executes the real
   prepared-effect handler, verifies every surviving seeded identity and final
   marker, and checks page-bounded Runtime diagnostics.
-- The runtime-publication reconciliation profiles execute the real startup
-  handler over a 10k CI history and a one-million-row history with 1,001
-  incomplete records. Operation repair and the five-stage checkpoint payload
-  handshake stay keyset/page bounded; page, attempt, ACK guard, control-state,
-  operation-reconciliation, and invalid-domain plans use their exact indexes.
-  The profiles validate exact publication/operation convergence, attempt
+- The runtime-publication reconciliation `ci` profile executes the real startup
+  handler over a 10k history with 1,001 incomplete records. Operation repair
+  and the five-stage checkpoint payload handshake stay keyset/page bounded;
+  page, attempt, ACK guard, control-state, operation-reconciliation, and
+  invalid-domain plans use their exact indexes.
+  The profile validates exact publication/operation convergence, attempt
   terminalization, and zero remaining `preparing` work without materializing
   the historical ID set.
-- The 0.3.1 wheel and source distribution pass content, metadata, entrypoint,
+- The 0.3.2 wheel and source distribution pass content, metadata, entrypoint,
   isolated-install, dependency-consistency, CLI, GUI-server, and deterministic
   demo checks on Python 3.11. CI preserves the same validated distributions for
   release use.

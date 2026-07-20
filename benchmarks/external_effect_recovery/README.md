@@ -27,6 +27,15 @@ Elapsed seed and recovery times are recorded for diagnostics only. They are
 never pass/fail thresholds, so slow or noisy CI hosts do not create brittle
 results.
 
+## Profiles and automation
+
+The entrypoint has two named profiles:
+
+| Profile | Total history | Pending prepared rows | Page size | Automation |
+| --- | ---: | ---: | ---: | --- |
+| `ci` | 100,000 | 1,000 | 500 | Per-change release workflow |
+| `million` | 1,000,000 | 10,000 | 500 | Scheduled/manual scale workflow |
+
 Run the 100k-record CI profile:
 
 ```console
@@ -38,3 +47,22 @@ Run the one-million-record manual/nightly profile:
 ```console
 uv run python experiments/run_external_effect_recovery_scale.py --profile million
 ```
+
+`--total-records`, `--pending-records`, and `--page-size` override the selected
+profile. Values must be integers with `total-records > 0`,
+`0 <= pending-records <= total-records`, and `page-size > 0`. A custom size is
+not a named profile and should be reported with its explicit parameters.
+
+## Output
+
+By default the command writes
+`.benchmark_runs/external-effect-recovery-scale.json`; use `--output PATH` to
+select another file. The same JSON object is printed to stdout. It has
+`schema_version: 3`, the selected population/page sizes, expected and observed
+page/query/row/work-unit counts, startup and handler statement counts,
+convergence counts, required index and query plans, timing fields, and
+`timing_is_informational_only: true`. A structural-contract failure raises and
+the command exits nonzero instead of writing a favorable result.
+
+See the repository [benchmark guide](../../docs/benchmark.md#recovery-scale-gates)
+for how this gate relates to the runtime-safety and practical-workflow suites.

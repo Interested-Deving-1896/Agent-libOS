@@ -22,6 +22,33 @@ from agent_libos.utils.ids import new_id, utc_now
 from agent_libos.utils.serde import dumps
 
 
+_MANIFEST_INPUT_FIELDS = frozenset(
+    {
+        "authorized_capabilities",
+        "permitted_effects",
+        "resource_budget",
+        "approval_policy",
+        "data_flow_policy",
+        "expires_at",
+        "issued_by",
+        "metadata",
+    }
+)
+
+_CAPABILITY_SPEC_FIELDS = frozenset(
+    {
+        "resource",
+        "rights",
+        "constraints",
+        "delegable",
+        "revocable",
+        "expires_at",
+        "uses_remaining",
+        "max_delegation_depth",
+    }
+)
+
+
 class AuthorityManifestManager:
     """Create, compile, and enforce durable process launch contracts."""
 
@@ -59,13 +86,7 @@ class AuthorityManifestManager:
         requested = self._normalize_specs(list(authorized_capabilities))
         parent = self.get_for_process(parent_pid) if parent_pid is not None else None
 
-        if isinstance(supplied, str):
-            template = self.get(supplied)
-            payload = self._template_payload(template)
-        elif isinstance(supplied, TaskAuthorityManifest):
-            payload = self._template_payload(supplied)
-        else:
-            payload = dict(supplied or {})
+        payload = self._launch_payload(supplied)
 
         declared = self._normalize_specs(payload.get("authorized_capabilities", requested))
         if requested and payload:
@@ -401,6 +422,23 @@ class AuthorityManifestManager:
             raise NotFound(f"agent image not found: {image_id}")
         return image
 
+    def _launch_payload(
+        self,
+        supplied: TaskAuthorityManifest | dict[str, Any] | str | None,
+    ) -> dict[str, Any]:
+        if isinstance(supplied, str):
+            payload = self._template_payload(self.get(supplied))
+        elif isinstance(supplied, TaskAuthorityManifest):
+            payload = self._template_payload(supplied)
+        else:
+            payload = self._mapping(supplied, "authority manifest")
+        self._reject_unknown_fields(
+            payload,
+            _MANIFEST_INPUT_FIELDS,
+            label="authority manifest",
+        )
+        return payload
+
     def _normalize_specs(self, values: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(values, (list, tuple)):
             raise ValidationError("authority manifest capability collections must be lists")
@@ -408,14 +446,15 @@ class AuthorityManifestManager:
 
     def _normalize_data_flow_policy(self, value: Any) -> dict[str, Any]:
         selected = self._mapping(value, "data_flow_policy")
-        unknown = set(selected) - {
+        allowed = {
             "schema_version",
             "allowed_tenants",
             "allowed_principals",
         }
+        unknown = sorted(str(field) for field in selected if field not in allowed)
         if unknown:
             raise ValidationError(
-                f"data_flow_policy contains unsupported fields: {sorted(unknown)}"
+                f"data_flow_policy contains unsupported fields: {unknown}"
             )
         schema_version = selected.get("schema_version", 1)
         if schema_version != 1:
@@ -436,7 +475,7 @@ class AuthorityManifestManager:
 
     @staticmethod
     def _data_flow_identities(value: Any, label: str) -> list[str]:
-        if not isinstance(value, (list, tuple)):
+        if not isinstance(value, list):
             raise ValidationError(f"data_flow_policy.{label} must be a list")
         selected: set[str] = set()
         for raw in value:
@@ -477,6 +516,11 @@ class AuthorityManifestManager:
     def _normalize_spec(self, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValidationError("authority manifest capability entries must be objects")
+        self._reject_unknown_fields(
+            value,
+            _CAPABILITY_SPEC_FIELDS,
+            label="authority manifest capability entry",
+        )
         resource = str(value.get("resource") or "").strip()
         self.capabilities.parse_resource_pattern(resource)
         rights = sorted({CapabilityRight(str(right)).value for right in value.get("rights", [])})
@@ -637,6 +681,17 @@ class AuthorityManifestManager:
         if not isinstance(value, dict):
             raise ValidationError(f"{label} must be an object")
         return dict(value)
+
+    @staticmethod
+    def _reject_unknown_fields(
+        value: Mapping[str, Any],
+        allowed: frozenset[str],
+        *,
+        label: str,
+    ) -> None:
+        unknown = sorted(str(field) for field in value if field not in allowed)
+        if unknown:
+            raise ValidationError(f"{label} contains unsupported fields: {unknown}")
 
     @staticmethod
     def _optional_string(value: Any, label: str) -> str | None:

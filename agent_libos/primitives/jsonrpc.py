@@ -44,6 +44,7 @@ from agent_libos.models.exceptions import (
     ProviderHostError,
     ValidationError,
 )
+from agent_libos.models.external_effect import default_external_effect_rollback_status
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.storage import UnitOfWork
 from agent_libos.substrate import JsonRpcProvider, ProviderEffectNotStarted
@@ -1213,7 +1214,11 @@ class JsonRpcPrimitive:
             "method": {
                 "right": method.right,
                 "rollback_class": method.rollback_class,
-                "rollback_status": method.rollback_status or self._default_rollback_status(method.rollback_class),
+                "rollback_status": (
+                    method.rollback_status
+                    if method.rollback_status is not None
+                    else self._default_rollback_status(method.rollback_class)
+                ),
                 "state_mutation": method.state_mutation,
                 "information_flow": method.information_flow,
             },
@@ -1331,7 +1336,11 @@ class JsonRpcPrimitive:
             raise ValidationError("JSON-RPC method right must be read, write, or execute")
         try:
             rollback_class = ExternalEffectRollbackClass(method.rollback_class)
-            rollback_status = method.rollback_status or self._default_rollback_status(method.rollback_class)
+            rollback_status = (
+                method.rollback_status
+                if method.rollback_status is not None
+                else self._default_rollback_status(method.rollback_class)
+            )
             ExternalEffectRollbackStatus(rollback_status)
         except ValueError as exc:
             raise ValidationError("JSON-RPC method has invalid rollback_class or rollback_status") from exc
@@ -1610,7 +1619,11 @@ class JsonRpcPrimitive:
                     "right": method.right,
                     "resource": self.method_resource(endpoint.endpoint_id, method.method_id),
                     "rollback_class": method.rollback_class,
-                    "rollback_status": method.rollback_status or self._default_rollback_status(method.rollback_class),
+                    "rollback_status": (
+                        method.rollback_status
+                        if method.rollback_status is not None
+                        else self._default_rollback_status(method.rollback_class)
+                    ),
                     "state_mutation": method.state_mutation,
                     "information_flow": method.information_flow,
                     "params_schema": method.params_schema,
@@ -1625,12 +1638,9 @@ class JsonRpcPrimitive:
         }
 
     def _default_rollback_status(self, rollback_class: str) -> str:
-        selected = ExternalEffectRollbackClass(rollback_class)
-        if selected == ExternalEffectRollbackClass.ROLLBACKABLE:
-            return ExternalEffectRollbackStatus.NOT_APPLIED.value
-        if selected == ExternalEffectRollbackClass.IRREVERSIBLE:
-            return ExternalEffectRollbackStatus.NOT_SUPPORTED.value
-        return ExternalEffectRollbackStatus.NOT_REQUIRED.value
+        return default_external_effect_rollback_status(
+            ExternalEffectRollbackClass(rollback_class)
+        ).value
 
     def _profile_json(self, profile: Any) -> dict[str, Any]:
         return {

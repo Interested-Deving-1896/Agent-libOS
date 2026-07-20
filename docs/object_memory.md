@@ -27,11 +27,23 @@ explicit owner pair. Ordinary process-created objects start as
 transferring it to `owner_kind=process_result`, and ObjectTask results are
 transferred to `owner_kind=object_task`.
 
-Object release is centralized in `ObjectMemoryManager`. Releasing an object
-marks the row as `released`, removes its runtime payload, deletes links that
-touch it, and revokes stale `object:<oid>` capabilities. Released objects are
-not returned by oid lookup, name lookup, namespace listing, or materialization;
-their namespace-local names can be reused by new live objects.
+Online Object lifecycle release is centralized in `ObjectMemoryManager`.
+Releasing an object marks the row as `released`, removes its runtime payload,
+deletes links that touch it, and revokes stale `object:<oid>` capabilities.
+Released objects are not returned by oid lookup, name lookup, namespace
+listing, or materialization; their namespace-local names can be reused by new
+live objects.
+
+Runtime startup has one deliberate recovery-only exception. Before normal
+admission opens, the Object repository directly scans live rows whose durable
+`runtime_memory` marker has no reconstructable process-local payload. In
+bounded store transactions it marks those rows `released`, removes their
+links, and revokes active Object capabilities. This recovery sweep does not
+invoke `ObjectMemoryManager` release finalizers or its per-Object online audit
+path. Hash-anchored payloads from an interrupted checkpoint restore are
+rehydrated before the sweep. A runtime-only Object must therefore not be used
+as the sole durable record of a host resource that requires finalization after
+reopen.
 
 Ownership changes are lifecycle changes and increment the Object version.
 Create, update, append, transfer, and trusted delete all acquire the Object
@@ -41,11 +53,13 @@ the captured owner and version; a lost conditional update cannot report
 success, overwrite a concurrent owner, or revive a released Object. Owner
 cleanup enumerates candidates but deletes each one only if its `owner_kind`,
 `owner_id`, and version still match the captured tuple. Transfer increments the
-version and publishes the whole selected batch plus its audit row in one
-transaction; a conditional failure transfers none of the batch. Therefore a
-release racing an ownership transfer cannot delete the new owner's Object,
-including an A-to-B-to-A (ABA) cycle: returning to the same textual owner does
-not restore the old version.
+version. Every row whose captured owner/version still matches is updated, and
+the successfully transferred subset plus its audit row publish in one
+transaction; a missing, differently owned, or conditionally rejected row is
+skipped and is not reported as transferred. Therefore a release racing an
+ownership transfer cannot delete the new owner's Object, including an A-to-B-to-A
+(ABA) cycle: returning to the same textual owner does not restore the old
+version.
 
 Trusted delete holds the ownership lock while it snapshots and conditionally
 checks the Object. Host-resource finalizers then run outside the SQL transaction
@@ -94,9 +108,18 @@ runtime.memory.create_object(
 listing = runtime.memory.list_namespace(pid, "project/research")
 ```
 
-Namespace capabilities gate listing, lookup, and creation. They do not replace
-object capabilities. Reading `project/research/notes` requires namespace read
-authority and object read authority.
+Namespace capabilities gate listing, lookup, Object creation, and creation of
+a child namespace. Creating a child requires `write` on its existing parent;
+successful creation grants the creator `read`, `write`, and `admin` on the new
+namespace. Top-level namespace allocation is the explicit exception: when a
+namespace has no parent, `create_namespace` has no pre-existing namespace
+capability to check and grants those same rights to its creator. Consequently,
+untrusted callers that must not allocate global top-level names should not be
+given direct access to that API without a Host-owned naming policy.
+
+Namespace capabilities do not replace object capabilities. Reading
+`project/research/notes` requires namespace read authority and object read
+authority.
 
 ## Name Resolution
 
@@ -200,14 +223,54 @@ before the task reaches a terminal state; once the task is terminal, normal
 process-owned memory cleanup can release an owner whose creating process has
 already exited.
 
-Task start reserves finite-use owner authority before creating its runner and
-commits it with the durable task row. A pre-commit failure removes the runner
-before restoring those exact reservations; an executor handoff failure marks
-the task failed and removes the unstarted runner. Result creation and linking
-use a lifetime scope: failed wiring or a cancellation that wins the terminal
-transition releases the unpublished result and derived handles, terminalizes
-the runner, and releases the owner pin. Once the succeeded row is durable,
-later observability failures do not retract the published result.
+A terminal notification carries a `result_oid`, but the message is not itself
+Object authority. On success, a live creator receives a result handle with
+`read`, `materialize`, and `link`; a different notification recipient does not
+receive a new result handle by default. `grant_result_to_notify=True` opts into
+publishing the same rights to a related recipient (the creator itself, its
+parent, or one of its direct children). For a cross-process recipient the
+creator must hold `grant` on the produced Object. A missing `grant` decision
+fails the ObjectTask rather than silently publishing an unreadable result. The
+recipient's Task Authority data-flow domain must also accept the result labels;
+a label-domain denial suppresses the optional handle and normally makes the
+notification fail without retracting an otherwise successful task.
+
+Finite-use `grant` authority is reserved before terminal publication. The
+recipient handle, durable `succeeded` transition, delivered terminal message,
+and reservation commit are then settled under the Object ownership lock and
+one store transaction. If delivery is not confirmed, the recipient handle and
+transactional changes roll back, the exact still-live reservation is restored,
+and the task may still publish success without the optional cross-process
+handle. Cancellation or any earlier failure follows the same revoke-safe
+restore and releases an unpublished result; an explicit revoke still wins and
+cannot be undone by cleanup. The resulting recipient handle is an ordinary
+durable capability; it is the creator's finite-use `grant` decision, not the
+new handle, that is consumed once.
+
+The `grant_result_to_notify` start option is runtime-local rather than part of
+the durable ObjectTask row. This does not create a replay gap: an unfinished
+task is abandoned on ordinary reopen instead of being re-executed. A recipient
+handle that was atomically committed before shutdown remains an ordinary
+durable capability.
+
+Task start transactionally reauthorizes the complete owner-right decision set
+before reserving any finite use, then creates and bootstraps its runner. The
+durable task row, operation link, all owner-reservation commits, and start
+event/audit publish in one later transaction; a rejected reservation commit
+rolls that publication back. On a failure before this commit, the runtime
+attempts to remove the runner and restores the exact owner reservations only
+after that cleanup is confirmed. If cleanup cannot be confirmed, it leaves
+those reservations fail-closed and records diagnostics instead of reactivating
+authority alongside a residual runner; diagnostics are best-effort if the
+audit sink itself is unavailable. The independent `process:spawn`
+admission use is consumed immediately and is not refunded by either path. An
+executor handoff failure occurs after the authorization commit, so it marks the
+task failed, removes the unstarted runner, and does not refund the consumed
+owner use. Result creation and linking use a lifetime scope: failed wiring or a
+cancellation that wins the terminal transition releases the unpublished result
+and derived handles, terminalizes the runner, and releases the owner pin. Once
+the succeeded row is durable, later observability failures do not retract the
+published result.
 
 The creator can inspect and control its own task without a second owner-object
 grant. For another process, `get` and `wait` require owner-object `read`, list
@@ -270,8 +333,11 @@ Manifests and Explain expose labels alongside ids/hashes without copying Object
 payloads. Finite declassification authority is consumed atomically with the
 Object update, so a one-shot downgrade grant cannot be reused. Removing or
 replacing tenant/principal, changing declassification authority, or raising
-integrity/trust is the same privileged transition. Model-facing Object tools
-do not accept these trusted fields.
+integrity/trust is the same privileged transition. On creation, the standard
+model-facing memory tool may declare sensitivity, tenant/principal, and only
+the conservative `untrusted` or `unknown` trust/integrity values. It cannot
+request a privileged transition, elevate trust/integrity, or set a non-empty
+declassification authority; see [Data Flow](data_flow.md).
 
 For an LLM-derived Object, explicit `parent_oids` supplement rather than replace
 all Objects included in the active context materialization. Every parent must
@@ -292,10 +358,27 @@ Each process also has a mutable context object named `llm_context:<pid>`.
 The runtime appends new process facts and summaries to the end of that object so
 repeated prompt prefixes remain stable for prompt caching.
 
-The context payload also keeps a conservative `label_history`. Appending tool
-results, retry/repair, parallel batches, Human/message resume, compaction,
-checkpoint, fork, exec, and reopen cannot reset a previously observed higher
-sensitivity or narrower identity evidence to defaults.
+Context state has two persistence planes. The live context Object plane
+contains the runtime-local payload, append-only `entries`, captured-delta
+signatures, and its working OID/version. The Object row and metadata are
+durable evidence, but that OID does not remain a live, materializable context
+when its runtime payload is lost. A separate durable per-process row stores the
+provider-chain context generation and conservative `label_history` high-water
+mark. Appending tool results, retry/repair, parallel batches, Human/message
+resume, compaction, checkpoint, fork, exec, and reopen cannot reset a
+previously observed higher sensitivity or narrower identity evidence to
+defaults.
+
+On an ordinary persistent-store reopen, the startup payload sweep releases the
+old context Object because its payload cache is gone. The next `ensure` creates
+a new context Object with a new OID and freshly initialized entries; it does
+not reconstruct the previous append-only entry history. The new Object imports
+the durable label high-water mark, while the durable context generation
+continues to scope eligible provider continuation state. Exact payload recovery
+is available only through checkpoint/image mechanisms that explicitly capture
+and restore it. A durable Context Materialization Manifest records the old
+OID/version/hash as evidence, but does not contain enough prompt content to
+rebuild that Object.
 
 The `compact_process_context` tool is the explicit exception to the append-only
 shape: after validation it atomically replaces older entries with one
@@ -332,8 +415,10 @@ Ordinary object payloads are runtime-only; `objects.payload_json` stores a
 runtime-memory marker rather than the user payload for both SQLite and
 PostgreSQL backends.
 
-If a reopen cannot materialize a live payload cache for a marker row, the object
-is released fail-closed instead of treating the marker as user payload.
+If a reopen cannot materialize a live payload cache for a marker row, the
+storage-layer startup recovery sweep releases the object fail-closed instead of
+treating the marker as user payload. This is the recovery-only release path
+described above, not an invocation of the manager's online release finalizers.
 
 Scoped checkpoint snapshots and image artifacts can explicitly capture object
 payloads needed to reconstruct a process subtree, subject to configured

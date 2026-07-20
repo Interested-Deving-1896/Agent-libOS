@@ -36,12 +36,22 @@ their own retention tier merely by resembling an internal envelope. New effect
 inserts and provider finalization accept only `full`; the retention CAS is the
 only store operation that can advance those provenance columns.
 
-For LLM calls the payload fields are messages, visible tools, response content,
-tool calls, reasoning, raw provider response, and provider error text. Call
-identity, process/image, purpose, provider/model/request/response ids, request
-options, usage, status, and timestamps remain intact. For external effects the
-provider metadata and provider receipt are reduced; ledger identity and
-classification remain intact.
+For LLM calls the content-bearing payload fields are messages, visible tools,
+response content, tool calls, reasoning, raw provider response, and provider
+error text. Each present value is replaced by its tier-appropriate content-free
+envelope; absent optional reasoning, raw-response, or error fields remain
+`null`.
+The entire `observability` mapping is also replaced; retention does not preserve
+selected observability keys or field previews. Its replacement contains only
+the retention schema version, tier, aggregate retained-payload hash, and a
+SHA-256 of the original observability mapping. Thus prior observability content
+such as trace details remains verifiable only by digest, not readable after
+retention.
+
+Call identity, process/image, purpose, provider/model/request/response ids,
+request options, usage, status, and timestamps remain intact. For external
+effects the provider metadata and provider receipt are reduced; ledger identity
+and classification remain intact.
 
 The LLM marker remains the authoritative payload provenance. Storage also
 persists its current tier as a checked indexing projection. Inserts derive that
@@ -161,8 +171,10 @@ audit failure rolls back the batch.
 `persist_full_io=false` rows written by earlier releases contain bounded
 observation previews. The retention service recognizes those rows as the
 summary tier and can normalize them to the new content-free summary envelope;
-it never restores missing content. A legacy truncated tool-call preview remains
-protected when runtime-dependency safety cannot be proven.
+normalization also replaces the complete legacy `observability` mapping with
+the retention marker described above. It never restores missing content. A
+legacy truncated tool-call preview remains protected when runtime-dependency
+safety cannot be proven.
 
 Retention is therefore an additional maximum-retention policy, not an override
 that can weaken `persist_full_io=false` or reconstruct redacted data. Operators

@@ -141,7 +141,8 @@ The command rejects broad real-model runs unless `--limit 1` or exactly one
 - `metadata.json`: selected suite, tasks, runners, LLM mode, process id, and
   CLI-run provenance.
 - `results.jsonl`: one `BenchmarkResult` row per task/runner.
-- `effects.jsonl`: one `EffectRecord` row per modeled effect.
+- `effects.jsonl`: one `EffectRecord` row per normalized observed, denied,
+  simulated, not-started, or unknown effect.
 - `summary.json`: result/effect/ok/safety counts, selected runner and task id
   lists, plus `runner_failures` and `invalid_runs` counts.
 - `metrics.json`: aggregate metrics.
@@ -178,6 +179,10 @@ rows; complete per-run diagnostics remain in `results.jsonl`.
 - `audit_completeness`
 - `valid`
 - `invalid_reasons`
+- `errors`
+- `workspace`
+- `metadata`, including `metadata.self_evolution_counts` for per-run
+  self-evolution attempts.
 
 Agent-libOS runner result metadata also includes an `explainability` object with
 `operation_count`, `causal_root_count`, `evidence_complete_root_count`, and
@@ -185,18 +190,17 @@ Agent-libOS runner result metadata also includes an `explainability` object with
 diagnostic provenance counts, not additional rate columns or a safety score.
 The existing `audit_completeness` metric keeps its historical benchmark
 definition and is not reinterpreted as semantic explanation quality.
-- `errors`
-- `workspace`
-- `metadata`, including `metadata.self_evolution_counts` for per-run
-  self-evolution attempts.
 
-Every `effects.jsonl` row has a non-empty per-run `effect_id`, an `outcome`,
-and an `evidence` source. Outcomes are `performed`, `denied`, `not_started`,
-`simulated`, or `unknown`; compatibility booleans (`performed`, `denied`, and
-`simulated`) must agree with that outcome. Type-specific fields include `path`,
-`argv`, `namespace`, `name`, `skill_id`, `tool`, `image`, `checkpoint`,
-`endpoint`, `method`, `provider`, `operation`, plus `performed`, `denied`,
-`simulated`, `classification`, and `error`.
+Every generated `effects.jsonl` row has `effect_id`, `task_id`, `runner`,
+`type`, `performed`, `denied`, `simulated`, `outcome`, and `evidence`.
+Outcomes are `performed`, `denied`, `not_started`, `simulated`, or `unknown`;
+the three compatibility booleans must agree with that outcome. The row also
+contains nullable type-specific fields `path`, `argv`, `namespace`, `name`,
+`skill_id`, `tool`, `image`, `checkpoint`, `resource`, `operation`, `endpoint`,
+`method`, and `provider`, plus `error`, `classification`, and the `metadata`
+mapping. A valid scored effect has classification `allowed` or `forbidden`.
+See the [schema-v1 reference](../benchmarks/runtime_safety/schema.md#run-output-evidence)
+for the full task and output contract.
 
 Agent libOS runners use persisted runtime `external_effects` as primary provider
 evidence and correlated audit records for internal runtime mutations. An exact
@@ -309,6 +313,43 @@ the number of result rows, the rate denominators above count different qualified
 subsets of normalized effect records, and `tool_calls` / `primitive_calls` are
 runner-reported execution trace counts. `metrics.json` records these units in
 `count_units`.
+
+## Recovery scale gates
+
+Two SQLite reopen benchmarks supplement the task×runner workload with
+structural scale checks. They emit one machine-readable JSON object to stdout
+and to `--output`; elapsed times are diagnostic fields, never pass/fail
+thresholds.
+
+The [external-effect recovery benchmark](../benchmarks/external_effect_recovery/README.md)
+has two named profiles:
+
+- `ci`: 100,000 total rows, 1,000 pending rows, page size 500. The per-change
+  release workflow runs this profile.
+- `million`: 1,000,000 total rows, 10,000 pending rows, page size 500. The
+  scheduled/manual scale workflow runs this profile.
+
+```bash
+uv run python experiments/run_external_effect_recovery_scale.py \
+  --profile ci \
+  --output .benchmark_runs/external-effect-recovery-ci.json
+```
+
+The [runtime-publication reopen benchmark](../benchmarks/runtime_publication_recovery/README.md)
+currently has one named profile, `ci`: 10,000 terminal publications, 1,001
+unreconciled rows, and page size 500. Both the per-change release workflow and
+the scheduled/manual scale workflow run that same 10k profile; there is no
+named one-million-publication profile.
+
+```bash
+uv run python experiments/run_publication_reconciliation_scale.py \
+  --profile ci \
+  --output .benchmark_runs/publication-reconciliation-ci.json
+```
+
+Both entrypoints accept explicit size and page overrides for focused tests or
+manual experiments. Such a custom invocation is not evidence that a named
+profile or checked-in workflow was exercised.
 
 ## Historical Deterministic Validation Snapshot
 

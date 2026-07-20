@@ -19,8 +19,6 @@ from agent_libos.evidence import (
     PayloadRetentionKind,
     PayloadRetentionRequest,
 )
-from agent_libos.models.exceptions import HumanApprovalRequired, LibOSError, NotFound
-from agent_libos.models.exceptions import ValidationError as LibOSValidationError
 from agent_libos.models import (
     CapabilityEffect,
     CapabilityRight,
@@ -39,6 +37,9 @@ from agent_libos.models import (
     ViewMode,
     process_state_to_mapping,
 )
+from agent_libos.models.exceptions import HumanApprovalRequired, LibOSError, NotFound
+from agent_libos.models.exceptions import ValidationError as LibOSValidationError
+from agent_libos.modules import ModuleLoader
 from agent_libos.runtime.runtime import Runtime
 from agent_libos.storage import display_store_target
 from agent_libos.utils.serde import to_jsonable
@@ -223,11 +224,7 @@ def main(argv: list[str] | None = None) -> None:
     spawn_parser.add_argument("--image")
     spawn_parser.add_argument("--goal", required=True)
     spawn_parser.add_argument("--llm-profile", help="Optional host-selected LLM profile id for the new process.")
-    spawn_parser.add_argument(
-        "--authority-manifest-json",
-        default="{}",
-        help="Host-authored TaskAuthorityManifest template as a JSON object.",
-    )
+    _add_spawn_authority_manifest_parser_arg(spawn_parser)
     cd_parser = sub.add_parser("cd", help="Set an AgentProcess working directory")
     cd_parser.add_argument("pid")
     cd_parser.add_argument("path")
@@ -306,7 +303,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("human", help="Process pending human messages in terminal order")
     args = parser.parse_args(argv)
     selected_config = _load_runtime_config(args.config, parser)
-    load_module_manifests = [] if args.command == "modules" and args.modules_command == "verify" else args.module_manifest
+    if args.command == "modules" and args.modules_command == "verify":
+        return _print_json(_verify_module_manifest(selected_config, args))
     try:
         selected_db_display = display_store_target(args.db, config=selected_config)
     except LibOSValidationError as exc:
@@ -314,7 +312,7 @@ def main(argv: list[str] | None = None) -> None:
     runtime = Runtime.open(
         args.db,
         config=selected_config,
-        module_manifests=load_module_manifests,
+        module_manifests=args.module_manifest,
         trusted_modules=args.trusted_module,
         trusted_module_sha256=args.trusted_module_sha256,
     )
@@ -347,12 +345,15 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "object-task":
             _print_json(_run_object_task_command(runtime, args))
         elif args.command == "spawn":
-            manifest = _parse_json_mapping(args.authority_manifest_json, "--authority-manifest-json")
             pid = runtime.process.spawn(
                 image=args.image,
                 goal=args.goal,
                 llm_profile_id=args.llm_profile,
-                authority_manifest=manifest or None,
+                authority_manifest=(
+                    _parse_json_mapping(args.authority_manifest_json, "--authority-manifest-json")
+                    if args.authority_manifest_json is not None
+                    else None
+                ),
             )
             process = runtime.process.get(pid)
             _print_json(
@@ -416,6 +417,24 @@ def cli(argv: list[str] | None = None) -> None:
             }
         )
         raise SystemExit(1) from None
+
+
+def _add_spawn_authority_manifest_parser_arg(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--authority-manifest-json",
+        help=(
+            "Host-authored TaskAuthorityManifest template as a JSON object. "
+            "Omit to use an implicit launch manifest; an explicit '{}' is an empty authority ceiling."
+        ),
+    )
+
+
+def _verify_module_manifest(config: AgentLibOSConfig, args: argparse.Namespace) -> dict[str, Any]:
+    return ModuleLoader(
+        config,
+        trusted_modules=tuple(args.trusted_module),
+        trusted_sha256=tuple(args.trusted_module_sha256),
+    ).verify(args.path)
 
 
 def _resource_summary(runtime: Runtime, pid: str) -> dict[str, Any]:
@@ -482,8 +501,10 @@ def _add_workflow_parser_args(parser: argparse.ArgumentParser) -> None:
     run_parser.add_argument("--working-directory", help="Optional AgentProcess working directory.")
     run_parser.add_argument(
         "--authority-manifest-json",
-        default="{}",
-        help="Host/workflow-controller TaskAuthorityManifest template as a JSON object.",
+        help=(
+            "Host/workflow-controller TaskAuthorityManifest template as a JSON object. "
+            "Omit to permit controller-derived launch authority; an explicit '{}' suppresses it."
+        ),
     )
 
 
@@ -496,8 +517,9 @@ def _run_workflow_command(runtime: Runtime, args: argparse.Namespace) -> Any:
         image=args.image,
         goal=args.goal,
         working_directory=args.working_directory,
-        authority_manifest=(
-            _parse_json_mapping(args.authority_manifest_json, "--authority-manifest-json") or None
+        authority_manifest=_parse_optional_json_mapping(
+            args.authority_manifest_json,
+            "--authority-manifest-json",
         ),
     )
 
@@ -931,6 +953,12 @@ def _parse_json_mapping(value: str, label: str) -> dict[str, Any]:
     if not isinstance(decoded, dict):
         raise SystemExit(f"{label} must be a JSON object")
     return decoded
+
+
+def _parse_optional_json_mapping(value: str | None, label: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    return _parse_json_mapping(value, label)
 
 
 def _parse_json_value(value: str) -> Any:

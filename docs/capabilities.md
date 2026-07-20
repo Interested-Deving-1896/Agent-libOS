@@ -28,21 +28,26 @@ revokes the capability when the count reaches zero. If one-shot Object Memory
 authority is resolved through a namespace/name lookup, any handle minted from
 that lookup remains one-shot; name lookup cannot turn temporary authority into
 a persistent object handle.
-`require(...)` atomically consumes finite-use authority by default. For
-multi-step effects, primitives opt out with `consume=False`, reserve the exact
-use before creating human, Skill, ObjectTask, or provider side effects, and
-then commit or restore that reservation token. An explicit revoke invalidates
-outstanding tokens, so late cleanup cannot reactivate revoked authority.
+`require(...)` atomically consumes finite-use authority by default. Multi-step
+paths that need compensation opt out with `consume=False`, reserve the exact
+use before their effect, and then commit or restore that reservation token.
+This covers Human and provider effects, Skill mutations, and ObjectTask owner
+Object authority. ObjectTask's separate `process:spawn` admission check uses
+ordinary immediate consumption before runner bootstrap; a later bootstrap or
+publication failure does not refund that finite spawn use. An explicit revoke
+invalidates outstanding tokens, so late cleanup cannot reactivate revoked
+authority.
 Provider subsystems do not manage these tokens directly: the
 [`Protected Operation SDK`](protected_operation_sdk.md) reserves every distinct
 finite decision in the same transaction as local prepare state and the effect
 intent, then commits on the first effectful provider phase. The public
 `CapabilityManager.restore_reserved_use(...)` operation is revoke-safe; the SDK
 is its sole provider-effect caller.
-Reservations left in flight by a crashed runtime are abandoned fail-closed on
-the next open. A reserved use is restored only when an operation fails before
-the effect begins; after the commit/provider boundary, the one-shot use remains
-consumed even if the remote or follow-on result is a failure.
+On reopen, prepared protected operations first restore exact still-live
+reservations only when their durable intent proves that no provider phase
+began. After that reconciliation, every other stale `reserved` row is abandoned
+fail-closed. Once the commit/provider boundary was crossed, the one-shot use
+remains consumed even if the remote or follow-on result is a failure.
 Checkpoint inspect/diff/replay reserve the selected exact-checkpoint or
 checkpoint-process read lease across the diagnostic, restore it if the
 diagnostic raises, and commit it once on success. Actor-mode checkpoint list
@@ -86,7 +91,12 @@ or a changed supplied target version cannot consume that one-time capability.
 broad deny and issue narrower allow/deny records explicitly. The runtime does
 not implement hidden override precedence that could accidentally reopen a
 blocked resource, and primitive-specific candidate filtering must reapply the
-same deny-first ordering before making a decision.
+same deny-first ordering before making a decision. Candidate-based authorization
+also filters every supplied capability to the requested `subject`; a primitive
+cannot authorize one process by passing a matching capability owned by another
+process. Human-approved capability specifications apply the same isolation:
+their `subject` must equal the process that created the request (or be omitted
+and default to it), otherwise validation fails and the request remains pending.
 
 Authority derivation uses public CapabilityManager transition APIs.
 `derive_authority()` applies source authority and an optional manifest ceiling;
@@ -140,8 +150,6 @@ Important resource conventions include:
 - `process:spawn` for child process and ObjectTask runner creation.
 - `image:<image_id>` and `image:*` for image registration.
 - `skill:<skill_id>` and `skill:*` for Skill operations.
-- `skill_source:workspace:<relative_path>` and
-  `skill_source:global:<source_id>` for Skill source authority.
 - `skill_trust:*` or `skill_trust:<sha256>` for global Skill trust.
 - `checkpoint:process:<pid>`, `checkpoint:<checkpoint_id>`, and
   `checkpoint:*` for checkpoint operations.
@@ -239,12 +247,13 @@ All authority mutation goes through explicit operations:
   authority rule by selecting a narrower allow. The child record is not
   observable unless its process attachment, event, and audit evidence all
   commit.
-- `revoke(actor, cap_id)`: allowed for the original issuer, the holder
-  relinquishing its own capability, or an actor with covering `revoke`/`admin`
-  authority. Target mutation, finite authority reservation/commit, the revoke
-  event, and revoke audit all share one store transaction. A validation or
-  evidence-sink failure therefore neither publishes the revocation nor consumes
-  its finite authority.
+- `revoke(actor, cap_id)`: first requires the target record to be `revocable`.
+  The original issuer may then revoke it; the holder may relinquish only its own
+  `allow` capability, not an `ask` or `deny` record that restricts it; otherwise
+  the actor needs covering `revoke` or `admin` authority. Target mutation,
+  finite authority reservation/commit, the revoke event, and revoke audit all
+  share one store transaction. A validation or evidence-sink failure therefore
+  neither publishes the revocation nor consumes its finite authority.
 
 Runtime bootstrap, image bootstrap, human approval, admin CLI, checkpoint
 restore/fork, and tests use explicit embedding-host paths such as
@@ -336,8 +345,10 @@ registry generation, Task Authority manifest hash, source Object
 id/version/content hashes, label hash, canonical payload hash, operation, and
 target-state version. Any mismatch makes it unusable.
 
-The release request displays only Sink/label identity, size, and hashes. It
-does not change the Object label and does not replace the normal capability or
+The release request contains bounded metadata only—Sink, trust, registry,
+label/source/request identities, operation, sizes, hashes, and the exact
+requested one-shot capability binding—never the payload. It does not change
+the Object label and does not replace the normal capability or
 `permitted_effects` check. An `untrusted` Sink cannot be released above
 `normal`; a `trusted` Sink needs no release but still grants no ordinary right.
 Host Sink registry writes separately require `admin` on
@@ -361,13 +372,16 @@ For example, a process can see `write_text_file` and still fail to write
 
 Loading a Skill can add instructions, existing tools, and Deno/TypeScript JIT
 tools to one process table. It does not grant filesystem, shell, human, object,
-process, image, checkpoint, JSON-RPC, MCP, or Skill source authority. JIT
+process, image, checkpoint, JSON-RPC, or MCP authority, nor filesystem access or
+global hash trust for another Skill source. JIT
 syscalls bypass the LLM-facing tool table, but they still enter the same
 primitive authorization path as built-in tools.
 
-Default images expose `list_capabilities` and `inspect_capability` so a process
-can understand its own authority. `delegate_capability` and `revoke_capability`
-are registered static tools but are not included in default image tool tables.
+The built-in base, coding, review, and toolmaker images expose
+`list_capabilities` and `inspect_capability` so a process can understand its own
+authority; the context-compressor image does not. `delegate_capability` and
+`revoke_capability` are registered static tools but are not included in those
+default image tool tables.
 
 ## Process Messages
 
@@ -392,10 +406,16 @@ uv run agent-libos capabilities revoke <capability_id> [--reason "..."]
 uv run agent-libos capabilities explain <subject> <resource> <right>
 ```
 
-Without `--actor-pid`, CLI commands run as audited admin operations. With
-`--actor-pid`, the command is executed as that process and strict capability
-checks apply. `--actor-pid` is a `capabilities` command option and must appear
-before the subcommand, for example:
+Without `--actor-pid`, the capability CLI is in Host mode. `grant` and `revoke`
+use their explicit Host-authority bypasses, while `delegate` still validates
+the named parent's delegable authority and attenuation. Successful mutations
+emit their normal capability event and audit evidence. In contrast, Host-mode
+`list`, `inspect`, and `explain` are unchecked diagnostic reads and do not emit
+a command-level audit record. With `--actor-pid`, subcommands apply their
+process-scoped rules: cross-subject reads require the relevant `admin`
+authority, and authority mutations use their checked paths. `--actor-pid` is a
+`capabilities` command option and must appear before the subcommand, for
+example:
 
 ```bash
 uv run agent-libos capabilities --actor-pid <pid> list
@@ -475,6 +495,22 @@ For `stdio` MCP transports, actor-mode server registration, live tool refresh,
 and tool calls additionally require `process:spawn` `write`, because those
 operations can start a local child process. Host/admin paths that explicitly
 bypass actor capability checks remain audited host operations.
+
+For both JSON-RPC and MCP, one-time Human approval is bound to the immutable
+registry specification SHA-256 and a monotonic registry generation, as well as
+the concrete call arguments. The binding also represents an endpoint/server
+that is not registered yet, so an approval obtained before its first
+registration cannot authorize whatever specification is registered later.
+The persisted binding survives reopen and is revalidated before every provider
+phase; replacement or any other generation/specification change requires a new
+approval.
+
+Provider return values are untrusted Host-boundary inputs. JSON-RPC and MCP
+detach and validate the returned structure before runtime code accesses its
+fields. Malformed results and unknown failures after a provider return expose
+only the public code/type/correlation envelope; where response byte usage is
+unknown, settlement charges the active provider phase's configured ceiling
+rather than trusting provider-controlled metadata.
 
 ## Filesystem Authority
 
@@ -597,16 +633,23 @@ input.
 
 Shell command risk is classified by argv-token rules before the provider runs:
 
-- `harmless`: read-only status/version/inspection commands such as
-  `git status --short` or `python --version`.
+- `harmless`: exact read-only status/version/inspection argv recognized after
+  higher-risk executable-family checks, such as `git status --short`.
 - `low`: read-only project inspection such as `git diff`.
 - `medium`: project code execution such as `pytest`, pytest collection,
   `npm test`, or `uv run ...`.
 - `high`: package managers, network-capable tools, script interpreters,
   `python -m compileall`, service startup, and other commands likely to change
-  host state or cross a boundary.
-- `destructive`: delete/move/permission/system-control operations. These are
-  denied by the built-in rule set even under broad shell policy.
+  host state or cross a boundary. Because executable-family rules run before
+  exact harmless/custom rules, the current classifier also treats
+  `python --version` as a high-risk interpreter command and asks under the two
+  mixed automatic policies (`allowlist_auto_else_ask` and
+  `blocklist_ask_else_auto`).
+- `destructive`: commands whose direct or nested executable matches the
+  built-in delete/move/permission/system-control set. Recognized commands are
+  denied even under broad shell policy. This is a deterministic executable
+  classifier, not semantic proof that an arbitrary unrecognized program cannot
+  perform destructive work.
 
 The built-in shell policy levels then decide how to handle the classified rule:
 
@@ -614,7 +657,10 @@ The built-in shell policy levels then decide how to handle the classified rule:
 - `allowlist_auto_else_ask`: allow `allow` rules and ask for `ask` rules.
 - `blocklist_ask_else_auto`: use the same deterministic risk rules but is
   intended for broader local operation.
-- `always_allow`: allow non-destructive commands while still reporting risk.
+- `always_allow`: allow every command whose selected deterministic rule is not
+  `deny`, including rules otherwise classified `ask`/high risk, while still
+  reporting that risk. It does not expand the classifier's destructive-command
+  vocabulary.
 
 Those four strings are fixed semantic labels, not remappable config fields.
 Configuration can select `default_policy_level` and replace the argv rule lists,
@@ -625,12 +671,14 @@ The capability record's own effect is evaluated before its policy level, so an
 `ask` or `deny` shell-policy capability cannot be converted into an automatic
 allow by setting `shell_policy_level=always_allow`. A finite-use command or
 policy allow is reserved after validation and intent recording, immediately
-before provider execution. The exact reservation is restored only when the
-provider raises `ProviderEffectNotStarted`, certifying that execution never
-began. Timeout, resource-limit, cancellation, ordinary provider failure, or a
-post-effect classification failure commits the use and records a conservative
-`unknown` external effect; a failed tool result is not proof that the command
-did nothing.
+before provider execution. An abort during protected preparation, before the
+durable dispatch boundary, restores the exact still-live reservation. After
+dispatch begins, restoration is allowed only when the first provider phase
+raises `ProviderEffectNotStarted` and certifies that no execution or earlier
+information flow began. Timeout, resource-limit, cancellation, ordinary
+provider failure, or a post-effect classification failure commits the use and
+records a conservative `unknown` external effect; a failed tool result is not
+proof that the command did nothing.
 
 Rules match tokenized argv, not arbitrary substrings. Bare executable names do
 not match path-qualified executables by accident. The local provider executes

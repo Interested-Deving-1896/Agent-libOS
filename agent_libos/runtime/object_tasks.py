@@ -426,7 +426,12 @@ class ObjectTaskManager:
         selected_notify_pid = notify_pid or pid
         selected_owner_watch = self._normalize_owner_watch(owner_watch)
         self._require_related_notification_target(pid, selected_notify_pid)
-        owner_decisions = self._assert_owner_rights(pid, owner, {ObjectRight.READ.value, ObjectRight.WRITE.value, ObjectRight.LINK.value})
+        owner_rights = {
+            ObjectRight.READ.value,
+            ObjectRight.WRITE.value,
+            ObjectRight.LINK.value,
+        }
+        self._assert_owner_rights(pid, owner, owner_rights)
         if self._objects.get_object(owner.oid) is None:
             raise NotFound(f"object not found: {owner.oid}")
         handle = self._tools.resolve(tool_name, pid=pid)
@@ -436,7 +441,11 @@ class ObjectTaskManager:
         self._capabilities.require(pid, "process:spawn", CapabilityRight.WRITE)
 
         task_id = new_id("otask")
-        owner_reservations = self._reserve_owner_decisions(owner_decisions)
+        owner_reservations = self._reserve_owner_decisions(
+            pid,
+            owner,
+            owner_rights,
+        )
         runner_pid: str | None = None
         task_inserted = False
         try:
@@ -467,13 +476,21 @@ class ObjectTaskManager:
                 created_at=now,
                 updated_at=now,
             )
-            self._records.insert_object_task(task)
-            self._operations.link_evidence(
-                "object_task",
-                task.task_id,
-                "result",
-                metadata={"owner_oid": task.owner_oid, "status": task.status.value},
-            )
+            with self._records.transaction():
+                if self._objects.get_object(owner.oid) is None:
+                    raise NotFound(f"object not found: {owner.oid}")
+                self._require_concurrency_capacity(owner.oid)
+                if not owner_reservations:
+                    self._assert_owner_rights(pid, owner, owner_rights)
+                self._records.insert_object_task(task)
+                self._operations.link_evidence(
+                    "object_task",
+                    task.task_id,
+                    "result",
+                    metadata={"owner_oid": task.owner_oid, "status": task.status.value},
+                )
+                self._commit_owner_decisions(owner_reservations)
+                self._record_start_observability(task, owner, task_args)
             task_inserted = True
         except Exception:
             if not task_inserted:
@@ -489,18 +506,6 @@ class ObjectTaskManager:
                             "reason": "runner cleanup was not confirmed",
                         },
                     )
-            raise
-        try:
-            self._commit_owner_decisions(owner_reservations)
-        except Exception as exc:
-            self._abort_unscheduled_task(task_id, runner_pid, f"owner permission commit failed: {exc}")
-            raise
-        try:
-            # Persist start observability before making the coroutine runnable;
-            # otherwise a fast task can record RUNNING/COMPLETED before STARTED.
-            self._record_start_observability(task, owner, task_args)
-        except Exception as exc:
-            self._abort_unscheduled_task(task_id, runner_pid, f"object task start observability failed: {exc}")
             raise
         try:
             with self._lock:
@@ -1551,11 +1556,17 @@ class ObjectTaskManager:
             decisions.append(decision)
         return decisions
 
-    def _reserve_owner_decisions(self, decisions: list[Any]) -> list[str]:
+    def _reserve_owner_decisions(
+        self,
+        pid: str,
+        owner: ObjectHandle,
+        rights: set[str],
+    ) -> list[str]:
         reservations: list[str] = []
         reserved_capability_ids: set[str] = set()
-        try:
-            for decision in decisions:
+        with self._capabilities.store.transaction():
+            current = self._assert_owner_rights(pid, owner, rights)
+            for decision in current:
                 cap_id = decision.consume_capability_id
                 if cap_id is None or cap_id in reserved_capability_ids:
                     continue
@@ -1567,18 +1578,19 @@ class ObjectTaskManager:
                 if reservation_id is not None:
                     reservations.append(reservation_id)
                     reserved_capability_ids.add(str(cap_id))
-        except Exception:
-            self._restore_owner_decisions(reservations)
-            raise
         return reservations
 
     def _commit_owner_decisions(self, reservation_ids: list[str]) -> None:
         for reservation_id in reservation_ids:
-            self._capabilities.commit_reserved_use(
+            committed = self._capabilities.commit_reserved_use(
                 reservation_id,
                 committed_by="object_task",
                 reason="one-time object task owner permission committed",
             )
+            if not committed:
+                raise CapabilityDenied(
+                    "object task owner permission reservation could not be committed"
+                )
 
     def _restore_owner_decisions(self, reservation_ids: list[str]) -> None:
         for reservation_id in reservation_ids:
@@ -1589,15 +1601,24 @@ class ObjectTaskManager:
             )
 
     def _cleanup_uncommitted_runner(self, runner_pid: str, *, task_id: str) -> bool:
+        cleanup_error: str | None = None
         release_error: str | None = None
-        self._process.cleanup_failed_launch(runner_pid)
+        try:
+            self._process.cleanup_failed_launch(runner_pid)
+        except Exception as exc:
+            cleanup_error = f"{type(exc).__name__}: {exc}"
         try:
             self._process.release_child_budget(runner_pid)
         except Exception as exc:
             release_error = f"{type(exc).__name__}: {exc}"
         residual_process = self._records.get_process(runner_pid)
         residual_caps = self._capabilities.list_subject(runner_pid, include_inactive=True)
-        if residual_process is not None or residual_caps or release_error is not None:
+        if (
+            residual_process is not None
+            or residual_caps
+            or cleanup_error is not None
+            or release_error is not None
+        ):
             self._audit.record(
                 actor="object_task",
                 action="object_task.runner_cleanup_incomplete",
@@ -1606,6 +1627,7 @@ class ObjectTaskManager:
                     "task_id": task_id,
                     "process_present": residual_process is not None,
                     "capability_count": len(residual_caps),
+                    "cleanup_error": cleanup_error,
                     "release_error": release_error,
                 },
             )

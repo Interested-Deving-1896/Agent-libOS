@@ -34,6 +34,26 @@ The current lifecycle includes:
 
 Terminal statuses are `exited`, `failed`, and `killed`.
 
+The durable process state is a typed product, not a free-form status message.
+`waiting_event`, `waiting_human`, `waiting_tool`, and `paused` carry a matching
+tagged `wait_state`; terminal statuses carry a matching tagged `outcome`; other
+statuses carry neither. `ProcessTransitionService` is the semantic write
+boundary for those three fields. It increments `state_generation` on every
+transition, and a waiter captures both that generation and the exact wait
+payload in a `ProcessStateToken`. A stale wake therefore cannot wake a later,
+structurally identical wait after a wait/runnable/wait ABA cycle.
+
+`revision` is the optimistic compare-and-swap fence for persisted process-row
+updates. Scheduler execution has a separate
+`(execution_generation, execution_owner_id, execution_lease_id)` identity. A
+claim rotates the generation and installs an owner identity plus fresh opaque
+lease id; worker writes must present that exact `ProcessExecutionToken`. Completion,
+terminalization, trusted takeover, checkpoint restore, and exec rotate or clear
+the lease so a detached worker from an older quantum cannot publish late state.
+These counters have different jobs: `revision` rejects stale row updates,
+`state_generation` rejects stale semantic wakeups, and the execution tuple
+rejects stale quantum ownership.
+
 ## Images And Tool Tables
 
 An `AgentImage` defines the default process prompt, tool table, default Skills,
@@ -214,9 +234,12 @@ process-local ephemeral tools and are not copied into the workspace. Package
 artifacts persist only declared package content: `IMAGE.yaml`, the referenced
 prompt, declared `workspace/` content, referenced `tools/` JIT files, and
 `resources/`. Cache, VCS, likely secret, and platform-unsafe paths are rejected.
-Failed package boot or exec removes the private workspace, unpublished JIT
-tool rows and process aliases, candidate source rows, and candidate Object
-Memory descriptors before returning failure.
+When boot/exec compensation succeeds, it removes the private workspace,
+unpublished JIT tool rows and process aliases, candidate source rows, and
+candidate Object Memory descriptors before returning failure. If compensation
+cannot complete, the durable publication and residual artifacts remain under a
+recovery-required fence; a fresh Runtime reconciles or fail-closes that exact
+publication after the diagnostic store is explicitly released.
 
 ## Working Directory
 
@@ -313,10 +336,13 @@ provider, operation, and target. Repeated, stale, or cross-boundary finalization
 fails closed instead of adding another final record or altering unrelated
 evidence.
 
-Transaction outcome and rollback support are separate axes. A confirmed
-provider completion is `transaction_state: committed` even when rollback
-support remains `unknown`; only an explicit unknown provider outcome is
-`transaction_state: unknown` and propagates `unknown` to its operation tree.
+Transaction outcome and rollback support are separate axes. Recognized
+transaction states are `prepared`, `authorized`, `approved`, `dispatched`,
+`committed`, `failed`, `unknown`, and `compensated`; not every operation passes
+through every intermediate state. A confirmed provider completion is
+`transaction_state: committed` even when rollback support remains `unknown`;
+only an explicit unknown provider outcome is `transaction_state: unknown` and
+propagates `unknown` to its operation tree.
 
 `ProviderEffectNotStarted` is the only provider result that can prove its call
 boundary was not crossed. The primitive conditionally deletes a still-pending
@@ -345,6 +371,17 @@ reconciliation hook raises, that intent remains explicitly `unknown` and the
 runtime continues opening and reconciling other providers; the exception text
 is not persisted.
 
+All startup recovery runs while the new Runtime owns the lifecycle recovery
+lease and before normal mutation admission opens. The builder first reconciles
+prepared protected operations and stale finite capability reservations, then
+pending external effects and resource-usage reservations. It next recovers
+incomplete process-exec, process-launch, and checkpoint-restore publications,
+rehydrates recoverable Object/JIT state, interrupts stale operation/execution
+claims, and recovers Object Tasks. Each backlog is read in configured,
+hard-bounded keyset pages. Runtime publications are also durably bound to their
+Explainable Operation rows, so startup converges a terminal publication and its
+operation outcome instead of inferring an outcome from process state alone.
+
 For JSON-RPC and Streamable HTTP MCP, the pending intent and all finite remote
 authority reservations are durable before non-local DNS resolution. A
 successful DNS lookup, or an ordinary DNS failure after host observation, is
@@ -362,6 +399,29 @@ elapsed time comes from provider observations. Only
 reservation and abandon the intent. Any ordinary first-measurement exception,
 or any later sleep, cancellation, or second-measurement failure, consumes the
 reservation and finalizes the same id as `unknown`.
+
+## Evidence Payload Retention
+
+Evidence identity and payload retention are separate. The Host-controlled
+`PayloadRetentionMaintenance` service is disabled by default and is never run
+implicitly during startup. When explicitly enabled and applied, it advances
+eligible terminal LLM-call and external-effect payloads monotonically from
+`full` to content-free `summary` and then `hash_only`. It retains call/effect
+identity, provider and process identity, causal audit/event links, timestamps,
+canonical argument hashes, transaction/classification state, and an aggregate
+payload digest.
+
+External effects are eligible only when `effect_state` is `finalized` and
+`transaction_state` is `committed`, `failed`, or `compensated`;
+`effect_state=pending` and the `prepared`, `authorized`, `approved`,
+`dispatched`, and `unknown` transaction states are ineligible. LLM calls must
+likewise be terminal with a durable completion timestamp, and
+continuation/recovery heads remain protected until their executable semantics
+have another durable projection.
+Every request is a bounded, cursor-based preview or apply operation; applied
+updates and the payload-free maintenance audit summary commit atomically. See
+[Evidence and LLM Payload Retention](evidence_payload_retention.md) for the
+exact tiers and eligibility rules.
 
 ## Scheduler
 
@@ -469,12 +529,16 @@ is propagated. A subsequent `Runtime.open()` or `Runtime.aopen()` of the same
 target creates a fresh lifecycle and runs authoritative startup recovery before
 normal mutation admission resumes.
 
-Audit and event rows are append-only through the Runtime API and participate in
-the same store transactions as the state transitions they evidence. This is an
-application contract, not cryptographic tamper evidence: a database or storage
-administrator can edit the underlying store, and v1 does not externally anchor,
-sign, or hash-chain the log. Deployments that need evidence against storage
-administrators must add an external immutable audit sink or anchoring layer.
+Audit and event rows are append-only through the Runtime API. Domains that
+promise atomic state/evidence publication write them in the same store
+transaction as the transition they evidence. Other explicitly multi-phase
+publication paths append observability after their main-state commit and report
+an evidence failure as a warning or recovery input rather than retracting the
+committed state. These are application contracts, not cryptographic tamper
+evidence: a database or storage administrator can edit the underlying store,
+and v1 does not externally anchor, sign, or hash-chain the log. Deployments that
+need evidence against storage administrators must add an external immutable
+audit sink or anchoring layer.
 
 The GUI adds a service-level drain around this contract. It stops background
 scheduling, rejects new runtime users, waits for tracked request handlers, and
@@ -514,6 +578,16 @@ state, for the restored processes.
 Checkpoint-committed images do not store or restore resource budgets or usage;
 only the caller that starts the process may set launch-time resource limits.
 
+Provider-backed work that cannot know its final byte/token usage before
+dispatch first creates a durable reservation for the maximum envelope. Normal
+settlement is exactly once and charges the measured value within that envelope;
+an unknown provider outcome charges the maximum. On startup, an active
+reservation whose linked effect is absent or still `prepared` is released as
+certified pre-dispatch, while every reservation linked to a later effect state
+is charged maximally. Recovery may take usage over budget and atomically apply
+the corresponding resource-limit termination; it does not discard ambiguous
+provider consumption to make the budget appear valid.
+
 LLM token usage is charged after provider completion using provider-reported
 usage. If a token budget exists and the provider does not return billable usage,
 returns booleans/strings/negative values, or reports a total smaller than its
@@ -538,8 +612,12 @@ unaccounted budgeted command. Deno uses its separate POSIX/Windows supervisor
 and budget backend and fails closed when those controls cannot be installed; its
 host-lifetime supervisor is a POSIX death pipe or Windows `KILL_ON_JOB_CLOSE`
 Job Object, so a hard host exit does not orphan untrusted JIT code. In-process
-Python primitives are not hard CPU/RSS isolated; they remain bounded by call
-count, wall time, byte limits, and primitive-specific caps.
+Python primitives are not hard CPU/RSS isolated and generic synchronous tools
+are not preempted by a universal wall-time deadline. Elapsed scheduler-quantum
+time is charged after completion; direct ToolBroker and ObjectTask calls have
+no universal runtime-seconds enforcement. Call-count, byte, and
+primitive-specific limits still apply where wired, and a hard deadline exists
+only when the primitive/provider implements one explicitly.
 
 ## Human Queue
 
@@ -582,7 +660,8 @@ requests can be approved or rejected. The runtime can process human terminal
 messages, update the request, wake the process, and resume the original
 operation. Rejection returns a normal failure to the process instead of crashing
 the runtime, except `request_permission` rejection returns a structured
-`rejected` decision after installing the selected deny policy.
+`rejected` decision after installing the selected non-allow policy
+(`always_deny` or `ask_each_time`).
 Terminal queue selection claims the oldest pending request in one serialized
 critical section, but blocking provider input/output runs outside that lock.
 Concurrent drains therefore cannot deliver one output twice or install two
@@ -593,18 +672,21 @@ answer rechecks the durable pending state and is discarded after cancellation.
 Permission decisions must include a JSON boolean `approved` consistent with the
 terminal status and one explicit policy: `always_allow`, `always_deny`, or
 `ask_each_time`. Approval cannot install `always_deny`; rejection cannot install
-`always_allow`. `allow_once` remains a separate capability lease/API shape and
-is not a terminal permission-response policy. An approved `question` must carry
-a non-empty string `answer`; values are not coerced from numbers, objects, or
-missing fields.
+`always_allow`. Both an approval and a rejection may select `ask_each_time`;
+rejection therefore need not install a durable deny. `allow_once` remains a
+separate capability lease/API shape and is not a terminal permission-response
+policy. An approved `question` must carry a non-empty string `answer`; values
+are not coerced from numbers, objects, or missing fields.
 
 Automatic terminal policy belongs to one host run invocation. It is stored in
 an immutable `ContextVar`, copied into scheduler workers, and captured by a JIT
 syscall session, so concurrent runs cannot overwrite one another's human,
 auto-policy, or answer. Resolving one of several blocking requests leaves the
-process in `waiting_human` until no blocking request remains. Process exit,
-failure, kill, or terminal cancellation cancels all still-pending requests;
-terminal processes cannot create or receive new human decisions.
+process in `waiting_human` until no blocking request remains. After process
+exit, failure, kill, or terminal cancellation, a post-commit cleanup phase
+attempts to cancel all still-pending requests. That cancellation is best-effort
+and may leave diagnostic pending rows, but terminal-state checks still prevent
+the process from creating or receiving a new Human decision.
 
 ## Process Messages And IPC
 
@@ -625,9 +707,10 @@ Receivers use `read_process_messages` for non-blocking reads or
 Filters can match kind, sender, channel, correlation id, reply target, and exact
 message ids. An explicit empty message-id filter matches no messages; it never
 means "all messages." Read limits bound both returned messages and
-acknowledgement; a blocking receive must use a positive limit and a non-empty
-explicit id filter because zero-size receive windows cannot ever produce a
-message.
+acknowledgement. A blocking receive may omit `message_ids` and wait on the other
+filters (or on any unread message); if `message_ids` is supplied it must be
+non-empty, and an explicitly supplied limit must be positive. Zero-size receive
+windows cannot ever produce a message.
 An empty blocking read registers its wait atomically with message posting, so a
 matching concurrent post either satisfies the read or wakes the registered
 process; it cannot disappear between the mailbox query and wait-state update.
@@ -677,14 +760,40 @@ external authority by default.
 It never grants the target image's declared required capabilities
 automatically. Existing external capabilities are preserved only when explicitly
 requested; otherwise exec shrinks external authority.
-The core `ProcessManager.exec` transition commits the process image row,
-capability shrink, exec event, and exec audit atomically. Higher-level
-`Runtime.exec_process` then configures the target tool table, package/checkpoint
-state, and default Skills. A later boot-phase failure cleans package state and
-restores the captured process/Object/capability/tool state in a compensating
-transaction, then records `image.boot.failed`; those phases are not one SQL
-transaction. Hosts that call the embedded API concurrently must therefore
-provide Runtime-level serialization if intermediate reads are unacceptable.
+`ImageBootService.exec` owns the complete publication. Under the shared
+publication lock, it preflights the target and atomically captures the exact
+rollback snapshot, claims a new exec execution lease, and inserts a durable
+`process_exec` publication, binding it to the current Explainable Operation
+when one exists. Host exec accepts only a `runnable` process with no ambient
+lease; an in-quantum exec must present the exact active `running` execution
+token. Any typed wait is rejected before publication because exec has no atomic
+way to supersede the child, mailbox, Human, Tool, or Host-resume dependency it
+represents.
+
+The service then advances durable phases while applying the process image and
+capability shrink, configuring tools, instantiating fresh/package/checkpoint
+boot state, and configuring Skills. The success boundary is one final store
+transaction: it finalizes deferred capability revocations, commits the exec
+epoch back to `runnable`, writes exec event/audit evidence, advances the
+publication to `committed`, and reconciles the bound operation to `succeeded`.
+The preceding boot phases are intentionally not one SQL transaction, but the
+publication and exact admission lease fence competing process writes and make
+the outcome recoverable.
+
+On failure, artifact cleanup, exact snapshot restoration, and a durable
+`compensation_applied` marker commit together. A later transaction publishes
+`rolled_back`, the restored process receipt, the failed operation outcome, and
+`image.boot.failed`. If that later terminal transaction fails, startup may
+finish terminalization without replaying the already-applied snapshot over
+newer work. If compensation itself is incomplete, the Runtime is recovery
+fenced; startup claims the publication with a recovery lease, validates the
+recorded exec admission token, restores only when the applied marker is absent,
+and converges recoverable work to `rolled_back`. A publication that exhausts
+recovery or is already `manual` fails closed for operator diagnosis. Normal
+commit/rollback terminal receipts bind the image/status plus `revision`,
+`execution_generation`, and `state_generation`; recovery additionally compares
+the exact claim lease, preventing a stale publication owner from overwriting a
+newer process epoch.
 
 `wait_child_process` blocks the parent in `waiting_event`. Child exit wakes the
 parent and resumes the original wait action without asking the model for a new
@@ -710,9 +819,12 @@ erase or cross it, while a Host `ProcessManager.resume` clears it deliberately.
 ## Process Exit
 
 `process_exit` marks a process as `exited` or `failed` and can attach a final
-Object Memory result. Process-owned memory is released on exit unless retained
-as the process result. Cleanup follows explicit Object Memory owner fields, not
-the object's creator provenance, and release revokes stale object capabilities.
+Object Memory result. A root process releases its process-owned memory on exit
+except for any retained result. A non-root terminal child's process-owned
+memory remains available for its direct parent to merge or discard, and is
+released if that parent terminates without adopting it. Cleanup follows
+explicit Object Memory owner fields, not the object's creator provenance, and
+release revokes stale object capabilities.
 The terminal row, child-budget release, exit evidence, and parent wake commit
 together. Object/host finalizers and ObjectTask terminal notification run after
 that commit because their provider cleanup cannot be rolled back. Human-request

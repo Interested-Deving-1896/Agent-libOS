@@ -158,6 +158,16 @@ human         process pending human messages manually
 
 Run `uv run agent-libos <command> --help` for argparse-generated details.
 
+`--actor-pid` is a command-group option for `checkpoint`, `skills`,
+`capabilities`, `images`, `jsonrpc`, and `mcp`. Place it after the group name
+and before the subcommand; placing it after the subcommand is rejected by
+argparse. For example:
+
+```bash
+uv run agent-libos --db .agent_libos.sqlite capabilities --actor-pid <actor_pid> grant <subject_pid> filesystem:workspace:README.md --rights read
+uv run agent-libos --db .agent_libos.sqlite checkpoint --actor-pid <actor_pid> inspect <checkpoint_id>
+```
+
 ## Persistent Runtime Basics
 
 ```bash
@@ -389,9 +399,16 @@ uv run agent-libos spawn --goal "review" \
 ```
 
 The default mode is `manifest_required`. Image requirements are reported but
-not granted. The workflow controller may construct the exact target-image read
-authority needed by `exec_process`; it does so in the launch manifest rather
-than granting authority after spawn. See
+not granted. Omitting `--authority-manifest-json` asks the runtime to bind an
+implicit manifest. Explicitly passing `{}` instead binds an explicit empty
+authority ceiling: it authorizes no launch capabilities or later model
+permission requests, although omitted `permitted_effects` remains unrestricted.
+Use `"permitted_effects": []` to deny every provider effect class.
+
+For `workflow run`, omission also permits the trusted workflow controller to
+construct the exact target-image read authority needed by `exec_process`.
+Explicit `{}` suppresses that controller-derived authority. In both cases the
+authority is part of the launch manifest rather than a grant after spawn. See
 [task_authority_manifest.md](task_authority_manifest.md).
 
 ## Process Resources
@@ -730,9 +747,13 @@ uv run agent-libos --db .agent_libos.sqlite --module-manifest modules/pty/module
 ```
 
 `modules verify` resolves the entrypoint and computes the manifest hash and
-source hash without loading the module. For single-file modules the source hash
-is the entry file hash; for multi-file modules it is the inferred Python source
-package digest and includes the covered `source_files` list. The returned
+source hash without opening a Runtime, touching the selected database, loading
+the core module, or loading any module named by `modules.manifest_paths` or
+`--module-manifest`. The selected config still supplies verification limits and
+trust entries; `--db` is accepted as a global option but ignored by this static
+command. For single-file modules the source hash is the entry file hash; for
+multi-file modules it is the inferred Python source package digest and includes
+the covered `source_files` list. The returned
 `trust_key` is the copy-paste value for `--trusted-module`. `modules list` and
 `modules inspect` show persisted module load records for the opened runtime
 database. `--trusted-module-sha256 <manifest_sha256>:<source_sha256>` is

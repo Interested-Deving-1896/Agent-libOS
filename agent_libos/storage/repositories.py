@@ -3163,6 +3163,10 @@ class RuntimeModuleRepository(_RepositoryFacade):
 class PayloadRetentionRepository(_RepositoryFacade):
     """Typed, bounded maintenance boundary for durable provider payloads."""
 
+    def __init__(self, store: UnitOfWorkBackendProtocol) -> None:
+        super().__init__(store)
+        self._retention_backend: PayloadRetentionStore = store
+
     def scan_llm_call_payloads_for_retention(
         self,
         *,
@@ -3170,14 +3174,10 @@ class PayloadRetentionRepository(_RepositoryFacade):
         after: PayloadRetentionCursor | None,
         limit: int,
     ) -> PayloadRetentionPage[LLMCallRecord]:
-        return cast(
-            PayloadRetentionPage[LLMCallRecord],
-            self._delegate(
-                "scan_llm_call_payloads_for_retention",
-                older_than=older_than,
-                after=after,
-                limit=limit,
-            ),
+        return self._retention_backend.scan_llm_call_payloads_for_retention(
+            older_than=older_than,
+            after=after,
+            limit=limit,
         )
 
     def update_llm_call_payload_retention(
@@ -3187,13 +3187,10 @@ class PayloadRetentionRepository(_RepositoryFacade):
         expected_payload_sha256: str,
         expected_tier: PayloadRetentionTier,
     ) -> bool:
-        return bool(
-            self._delegate(
-                "update_llm_call_payload_retention",
-                record,
-                expected_payload_sha256=expected_payload_sha256,
-                expected_tier=expected_tier,
-            )
+        return self._retention_backend.update_llm_call_payload_retention(
+            record,
+            expected_payload_sha256=expected_payload_sha256,
+            expected_tier=expected_tier,
         )
 
     def scan_external_effect_payloads_for_retention(
@@ -3203,14 +3200,10 @@ class PayloadRetentionRepository(_RepositoryFacade):
         after: PayloadRetentionCursor | None,
         limit: int,
     ) -> PayloadRetentionPage[ExternalEffectRecord]:
-        return cast(
-            PayloadRetentionPage[ExternalEffectRecord],
-            self._delegate(
-                "scan_external_effect_payloads_for_retention",
-                older_than=older_than,
-                after=after,
-                limit=limit,
-            ),
+        return self._retention_backend.scan_external_effect_payloads_for_retention(
+            older_than=older_than,
+            after=after,
+            limit=limit,
         )
 
     def update_external_effect_payload_retention(
@@ -3222,15 +3215,12 @@ class PayloadRetentionRepository(_RepositoryFacade):
         expected_effect_state: str,
         expected_transaction_state: str,
     ) -> bool:
-        return bool(
-            self._delegate(
-                "update_external_effect_payload_retention",
-                record,
-                expected_payload_sha256=expected_payload_sha256,
-                expected_tier=expected_tier,
-                expected_effect_state=expected_effect_state,
-                expected_transaction_state=expected_transaction_state,
-            )
+        return self._retention_backend.update_external_effect_payload_retention(
+            record,
+            expected_payload_sha256=expected_payload_sha256,
+            expected_tier=expected_tier,
+            expected_effect_state=expected_effect_state,
+            expected_transaction_state=expected_transaction_state,
         )
 
 

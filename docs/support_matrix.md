@@ -46,7 +46,9 @@ Legend:
 | Suite | Default evidence | Boundary |
 | --- | --- | --- |
 | `benchmarks/runtime_safety` | Deterministic schema-v1 task×runner matrix, including `data_label_exfiltration`, fail-closed metrics, provenance-bearing CLI metadata | Early runtime-safety workload, not a complete paper evaluation or formal proof |
-| `benchmarks/practical_agent_workflows` | Separates `native-live`, `native-partial`, `mocked`, and `modeled`; native has no modeled fallback | Checked-in scenarios do not imply a real GitHub/provider integration |
+| `benchmarks/practical_agent_workflows` | Exactly two labels: `native-live` and `modeled`; native has no modeled fallback | Checked-in scenarios do not imply a real GitHub/provider integration |
+| `benchmarks/external_effect_recovery` | 100k-record `ci` profile on each change; one-million-record `million` profile in the manual/nightly workflow | Structural paging/index/convergence checks are gates; elapsed times are diagnostic, not SLAs |
+| `benchmarks/runtime_publication_recovery` | 10k terminal publications with 1,001 unreconciled rows in the only named profile, `ci` | No one-million-publication profile is currently implemented; custom sizes are explicit CLI overrides |
 | Real-model benchmark | One explicitly selected task with real LLM profile | Token/credential gate; results must retain model/profile/environment provenance |
 
 ## Release-gate policy

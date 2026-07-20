@@ -97,3 +97,40 @@ benchmark_attack_classes:
         assert any("'unknown_owner' maps to unknown invariant 'missing-invariant'" in error for error in errors)
         assert any("'missing_top_level' is declared on 'known-invariant'" in error for error in errors)
         assert any("task_without_mapping" in error for error in errors)
+
+    def test_documented_invariants_must_match_manifest_ids(self, tmp_path: Path) -> None:
+        documentation = tmp_path / "invariants.md"
+        documentation.write_text(
+            """
+## Current Invariant Groups
+
+- `documented`: Current claim.
+- `stale`: Removed claim.
+- `documented`: Accidental duplicate.
+""".lstrip(),
+            encoding="utf-8",
+        )
+        manifest = {
+            "invariants": [
+                {"id": "documented"},
+                {"id": "missing"},
+            ]
+        }
+        errors: list[str] = []
+
+        checker._check_documented_invariants(manifest, documentation, errors)
+
+        assert any("duplicate invariant ids: documented" in error for error in errors)
+        assert any("missing manifest invariant ids: missing" in error for error in errors)
+        assert any("unknown invariant ids: stale" in error for error in errors)
+
+    def test_repository_invariant_documentation_matches_manifest(self) -> None:
+        errors: list[str] = []
+
+        checker._check_documented_invariants(
+            checker._load_manifest(checker.MANIFEST),
+            checker.DOCUMENTATION,
+            errors,
+        )
+
+        assert errors == []

@@ -75,25 +75,47 @@ max_request_bytes: 65536
 max_response_bytes: 1048576
 ```
 
-Required endpoint fields:
+The accepted v1 shape is closed: unknown endpoint, method, or header fields are
+rejected instead of being ignored. `metadata` and JSON Schema contents remain
+application-defined mappings.
 
-- `endpoint_id`
-- `url`
-- non-empty `methods`
+| Mapping | Required fields | Optional fields and defaults |
+| --- | --- | --- |
+| endpoint | `endpoint_id`, `url`, non-empty `methods` | `schema_version: 1`, `headers: {}`, `timeout_s: config.jsonrpc.timeout_s`, `max_request_bytes: config.jsonrpc.max_request_bytes`, `max_response_bytes: config.jsonrpc.max_response_bytes`, `metadata: {}` |
+| method | `method_id`, `rpc_method`, `right`, `rollback_class`, `state_mutation`, `information_flow` | `rollback_status` as mapped below, `params_schema: {}`, `metadata: {}` |
+| header | `env` | `prefix: ""`, `suffix: ""` |
 
-`schema_version` is optional and defaults to `1` when omitted. Repository
-manifests should include it explicitly so future migrations are visible in
-review.
+`right` is one of `read`, `write`, or `execute`. `rollback_class` accepts
+`irreversible`, `rollbackable`, `no_rollback_required`, or `unknown`;
+`rollback_status`, when supplied, accepts `not_supported`, `not_applied`,
+`not_required`, or `unknown`. When `rollback_status` is omitted, the default
+provider maps it as follows:
 
-Required method fields:
+| `rollback_class` | Effective omitted `rollback_status` |
+| --- | --- |
+| `irreversible` | `not_supported` |
+| `rollbackable` | `not_applied` |
+| `no_rollback_required` | `not_required` |
+| `unknown` | `unknown` |
 
-- `method_id`
-- `rpc_method`
-- `right`: `read`, `write`, or `execute`
-- `rollback_class`: `irreversible`, `rollbackable`, or
-  `no_rollback_required`
-- `state_mutation`
-- `information_flow`
+An explicitly supplied `rollback_status` is preserved instead of applying this
+default mapping.
+
+A method cannot combine `no_rollback_required` with
+`state_mutation: true`. `params_schema`, when non-empty, must itself be a valid
+JSON Schema and is enforced on every call.
+
+With `DEFAULT_CONFIG`, omitted limits resolve to `timeout_s: 10`,
+`max_request_bytes: 65,536`, and `max_response_bytes: 1,048,576`. Manifest
+values must be positive and cannot exceed the active hard limits (60 seconds,
+1,048,576 request bytes, and 8,388,608 response bytes by default). The manifest
+text is capped at 262,144 bytes. Identifiers are capped at 96 characters,
+`rpc_method` at 256, header names at 128, and resolved header values at 8,192;
+deployments may lower or otherwise customize these values in
+`AgentLibOSConfig.jsonrpc`.
+
+`schema_version` defaults to `1` when omitted. Repository manifests should
+include it explicitly so future migrations are visible in review.
 
 `method_id` is the capability resource fragment. `rpc_method` is the JSON-RPC
 wire method sent in the request body. This separation prevents method-name
@@ -121,13 +143,18 @@ The registry rejects:
 
 Headers are environment-backed. The registry stores the environment variable
 name and a small approved prefix such as `Bearer `, never the resolved secret
-value. Missing environment variables, parameter schema failures, request-size
-failures, resource-budget preflight failures, and preflight external-effect
-classifier failures happen before finite method authority is reserved. DNS is
-different: the reservation and pending effect intent are durable first because
-resolving a non-local host is itself an external information-flow boundary. A
-successful lookup or an ordinary failure after host observation commits the
-use even though no HTTP request was sent.
+value. Environment names and their allowlist are checked at registration, but
+values are resolved only for a call. Parameter-schema and request-size
+validation occur before protected preparation; resource-budget and preflight
+classifier checks run in its pre-transaction portion. All four precede finite
+reservation and pending-intent creation. Header environment resolution is
+later: the protected operation
+has already reserved finite method authority and prepared its pending effect
+intent, but no provider phase has started. A missing or invalid value therefore
+contacts neither DNS nor HTTP; the no-provider-start path restores the exact
+reservation and abandons the pending intent. DNS is different: it is the first
+provider phase, so a successful lookup or an ordinary failure after host
+observation commits the use even though no HTTP request was sent.
 
 For remote HTTPS calls, the primitive passes the validated address set to the
 default provider, which opens the socket to one of those exact addresses while
@@ -211,10 +238,13 @@ The JSON-RPC provider classifies every call from the method spec:
 - `state_mutation`
 - `information_flow`
 
-After schema/environment/request-size/budget/classifier preflight, the runtime
-atomically reserves finite method authority and creates an `external_effects`
-row with provider `jsonrpc`, operation `call`, and `effect_state: pending`.
-Only then does it perform runtime DNS resolution and the live provider call.
+After schema/request-size/budget/classifier preflight, the runtime atomically
+reserves finite method authority and creates an `external_effects` row with
+provider `jsonrpc`, operation `call`, and `effect_state: pending`. It then
+resolves and validates header environment values inside that protected scope.
+If resolution fails, the first provider phase has not started and the
+reservation/intent are restored/abandoned together. Otherwise runtime DNS and
+the live provider call follow.
 Successful or failed transport results emit event/audit evidence, run the post-call
 classifier, and CAS that same `effect_id` to `finalized`. A post-call classifier
 failure falls back conservatively instead of dropping the effect. If event,

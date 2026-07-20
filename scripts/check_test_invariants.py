@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -12,12 +14,19 @@ from agent_libos.utils.yaml_loader import load_yaml_mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "tests" / "invariants.yaml"
+DOCUMENTATION = ROOT / "docs" / "invariants.md"
 VALID_LANES = {"unit", "runtime", "security", "self-evolution", "providers", "benchmark"}
+_DOCUMENTED_INVARIANT_PATTERN = re.compile(r"^- `([^`]+)`:", re.MULTILINE)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Validate the runtime invariant test manifest.")
     parser.add_argument("--manifest", default=str(MANIFEST), help="path to tests/invariants.yaml")
+    parser.add_argument(
+        "--documentation",
+        default=str(DOCUMENTATION),
+        help="path to docs/invariants.md",
+    )
     args = parser.parse_args(argv)
 
     manifest = _load_manifest(Path(args.manifest))
@@ -31,6 +40,7 @@ def main(argv: list[str] | None = None) -> int:
         errors,
     )
     _check_benchmark_attack_classes(manifest, invariant_ids, declared_attack_classes, errors)
+    _check_documented_invariants(manifest, Path(args.documentation), errors)
 
     if errors:
         for error in errors:
@@ -171,6 +181,51 @@ def _check_benchmark_attack_classes(
         if task.attack_class not in mapping:
             source = task.source_path.relative_to(ROOT) if task.source_path else task.id
             errors.append(f"{source}: attack_class {task.attack_class!r} is not mapped to an invariant")
+
+
+def _check_documented_invariants(
+    manifest: dict[str, Any],
+    documentation: Path,
+    errors: list[str],
+) -> None:
+    invariants = manifest.get("invariants")
+    if not isinstance(invariants, list):
+        return
+    manifest_ids = [
+        invariant.get("id")
+        for invariant in invariants
+        if isinstance(invariant, dict) and isinstance(invariant.get("id"), str)
+    ]
+    try:
+        text = documentation.read_text(encoding="utf-8")
+    except OSError as exc:
+        errors.append(f"cannot read invariant documentation {documentation}: {exc}")
+        return
+    documented_ids = _DOCUMENTED_INVARIANT_PATTERN.findall(text)
+    duplicate_ids = sorted(
+        invariant_id
+        for invariant_id, count in Counter(documented_ids).items()
+        if count > 1
+    )
+    if duplicate_ids:
+        errors.append(
+            "docs/invariants.md contains duplicate invariant ids: "
+            + ", ".join(duplicate_ids)
+        )
+    documented_set = set(documented_ids)
+    manifest_set = set(manifest_ids)
+    missing = [invariant_id for invariant_id in manifest_ids if invariant_id not in documented_set]
+    stale = [invariant_id for invariant_id in documented_ids if invariant_id not in manifest_set]
+    if missing:
+        errors.append(
+            "docs/invariants.md is missing manifest invariant ids: "
+            + ", ".join(missing)
+        )
+    if stale:
+        errors.append(
+            "docs/invariants.md contains unknown invariant ids: "
+            + ", ".join(stale)
+        )
 
 
 def _string_field(mapping: dict[str, Any], key: str, errors: list[str], prefix: str) -> str | None:

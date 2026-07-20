@@ -46,6 +46,40 @@ without a project-root config, `DEFAULT_CONFIG.runtime.local_store_target` is
 `local`, an in-memory SQLite store. Scripts and documentation that require state
 across separate CLI invocations should always pass `--db` explicitly.
 
+### Effective LLM profile precedence
+
+For a root spawn, an explicit Host-selected profile id wins, then the selected
+image's `llm_profile`, then `llm.default_profile_id`. An exec keeps the
+process's current profile unless the Host supplies a replacement; a child
+process likewise inherits its parent's profile unless explicitly overridden.
+The CLI reads config profiles only. The GUI may dynamically register a
+user-level profile, and a dynamically registered profile with the same id wins
+over the config profile while that Runtime is open.
+
+Within a resolved profile, a non-null profile field wins. Only the profile
+whose id equals `llm.default_profile_id` then inherits the matching legacy
+`OPENAI_*` environment value; other named profiles do not inherit ambient
+endpoint, model, or provider-policy settings. When neither is present,
+`llm.timeout_s`, `llm.max_retries`, `llm.api_mode`, `llm.store`,
+`llm.safety_identifier`, `llm.prompt_cache_key`,
+`llm.prompt_cache_retention`, `llm.responses_previous_response_id`,
+`llm.parallel_tool_calls`, `llm.auto_wait_on_empty_tool_calls`,
+`llm.temperature`, and `llm.max_tokens` supply their group defaults. The
+legacy mappings are
+`OPENAI_BASE_URL`; `OPENAI_LANGUAGE_MODEL` then `OPENAI_MODEL`;
+`OPENAI_TIMEOUT`; `OPENAI_MAX_RETRIES`; `OPENAI_API_MODE`; `OPENAI_STORE`;
+`OPENAI_REASONING_EFFORT`; `OPENAI_VERBOSITY`; `OPENAI_SAFETY_IDENTIFIER`;
+`OPENAI_PROMPT_CACHE_KEY`; `OPENAI_PROMPT_CACHE_RETENTION`;
+`OPENAI_RESPONSES_PREVIOUS_RESPONSE_ID`; and
+`OPENAI_PARALLEL_TOOL_CALLS`.
+
+Secrets are the exception to that fallback description: every profile reads
+its API key only from the environment variable named by its `api_key_env`.
+`safety_identifier_env`, when set and no literal `safety_identifier` is set,
+is read before the default profile's legacy safety identifier. A custom base
+URL is permitted when either the profile sets `allow_custom_base_url: true` or
+the Host sets `AGENT_LIBOS_ALLOW_CUSTOM_LLM_BASE_URL=1`.
+
 ## Inspecting exact defaults
 
 Defaults change with the code. Print the exact values for the current checkout
@@ -84,8 +118,16 @@ same change.
 | `scripts` | `ask_file_max_bytes`, `ask_file_max_quanta`, `document_summary_max_bytes`, `document_summary_max_read_bytes`, `document_summary_max_quanta`, `document_context_min_tokens`, `document_context_slack_tokens`, `document_context_max_tokens`, `object_copy_max_quanta`, `llm_write_smoke_max_quanta`, `clock_demo_iterations`, `clock_demo_interval_s`, `clock_demo_timezone`, `chat_max_turns`, `chat_context_tokens`, `chat_quanta_per_turn`, `chat_quanta_overhead` |
 
 The table is checked against the dataclass fields by
-`tests/unit/test_configuration_docs.py`. Values and nested `LLMProfile` fields
-remain authoritative in the live dump and typed source. Optional Runtime
+`tests/unit/test_configuration_docs.py`.
+
+Each entry under `llm.profiles.<profile_id>` accepts exactly these fields:
+
+| Profile | Fields |
+| --- | --- |
+| `llm.profiles.<profile_id>` | `kind`, `base_url`, `model`, `api_key_env`, `api_mode`, `timeout_s`, `max_retries`, `store`, `reasoning_effort`, `verbosity`, `safety_identifier`, `safety_identifier_env`, `prompt_cache_key`, `prompt_cache_retention`, `responses_previous_response_id`, `parallel_tool_calls`, `auto_wait_on_empty_tool_calls`, `temperature`, `max_tokens`, `allow_custom_base_url` |
+
+The same test checks this nested inventory. Exact values remain authoritative
+in the live dump and typed source. Optional Runtime
 Modules may also own module-local settings that are not fields of
 `AgentLibOSConfig`.
 

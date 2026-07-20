@@ -15,6 +15,8 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
   referenced Object as subtree-owned state,
 - process namespaces and object links,
 - subtree capabilities,
+- parent/child resource-budget reservations whose two processes are both in
+  the captured subtree,
 - process tool tables,
 - JIT candidates and registered process-local JIT tools,
 - compatibility Skill registry rows associated with loaded Skills (never
@@ -25,7 +27,8 @@ A checkpoint captures scoped state needed to reconstruct the owner subtree:
   prepared state according to the active `llm.persist_full_io` retention
   policy,
 - image definitions needed by the subtree,
-- checkpoint-derived image artifacts needed by those image definitions,
+- embedded boot artifacts needed by those image definitions, for both
+  `checkpoint_commit` and `image_package` boot kinds,
 - loaded startup Runtime Module ids and source hashes.
 
 Transient `running` state is normalized to `runnable` at snapshot time. Forking
@@ -47,8 +50,9 @@ Ownership defines the destructive scope. Process- and process-result-owned
 Objects, plus scoped ObjectTask results, are captured as reconstructable state.
 A root in a `MemoryView` is only a reference: checkpointing a borrower does not
 claim ownership of the lender's Object, payload, namespace, or capability.
-Legacy snapshots that mixed roots into `object_oids` are reinterpreted from the
-captured owner fields before restore/fork.
+The canonical version-4 artifact records owned and referenced Object sets
+separately, and restore/fork derive their destructive scope from captured owner
+fields rather than from borrowed roots.
 
 ## Append-Only Boundary
 
@@ -58,7 +62,7 @@ Restore never deletes:
 - events,
 - LLM call records,
 - checkpoint records,
-- human interaction history.
+- human interaction history,
 - Sink trust registry generations/history, data-flow decisions, and file label
   binding/tombstone history.
 
@@ -74,12 +78,15 @@ checkpoint `skills` rows remain readable compatibility data, not a host
 registry mutation.
 
 Host filesystem, shell, JSON-RPC/MCP remote calls, and provider effects are not
-rolled back. Image registry rows are internal runtime metadata: snapshots capture
-the image definitions needed by the checkpointed subtree and any referenced
-checkpoint-derived image artifacts. Destructive restore re-upserts those captured
-image rows so the restored subtree can run against its snapshotted image
-definitions; it does not copy image-package source directories or provider-side
-state.
+rolled back. Image registry rows are internal runtime metadata: snapshots
+capture the image definitions needed by the checkpointed subtree and any
+referenced `checkpoint_commit` or `image_package` artifact payloads.
+Destructive restore re-upserts those captured image and artifact rows so the
+restored subtree can run against its snapshotted image definitions. For an
+image package, the captured artifact is the normalized package payload,
+including its declared files and workspace/JIT metadata; restore does not
+revisit or copy from the package's original host source path, and it does not
+restore provider-side state.
 
 Sink trust is Host-global external policy, not reconstructable subtree state.
 Checkpoint restore neither replaces it nor lowers its active generation. Any
@@ -118,17 +125,19 @@ imply that no outside-world effect occurred. LLM, filesystem/clock/shell, human
 output, PTY spawn/write/resize/close, and live JSON-RPC/MCP calls persist this
 uncertainty before the provider boundary as a pending external-effect intent,
 then conditionally finalize the same id. If any post-provider sink fails,
-checkpoint diff/restore still reports that durable `unknown` row. Cleaning up a
-failed PTY session publication does not remove its uncertain spawn history.
+checkpoint diff/restore still reports the durable uncertainty, either as a
+dispatched pending row or as a finalized `unknown` row. Cleaning up a failed
+PTY session publication does not remove its uncertain spawn history.
 
 Restore reports provider-recorded effects in
 `external_effects_since_checkpoint`, summarizes them in
 `external_effect_summary`, and returns `restore_external_policy:
 "report_only"`. The summary includes `by_state` counts and an explicit
 `pending` count in addition to rollback class and provider/operation totals. In
-v1, `rollbackable` means the provider says a future
-compensation layer could reason about the effect; restore still does not apply
-external compensation.
+this report-only restore contract, `rollbackable` means the provider says a
+future compensation layer could reason about the effect; restore still does
+not apply external compensation. This contract is independent of the snapshot,
+restore-plan, and image-artifact version numbers described below.
 
 ## Capability Model
 
@@ -161,9 +170,10 @@ LLM-facing tools:
 - `fork_checkpoint`
 - `commit_checkpoint_to_image` for checkpoint-derived AgentImage commits
 
-Default images expose low-risk create/list/inspect/diff tools. Restore and fork
-tools are registered but require explicit tool visibility plus checkpoint
-authority.
+The built-in base, coding, and review images expose the low-risk
+create/list/inspect/diff tools; the toolmaker and context-compressor defaults do
+not. Restore and fork tools are registered globally but require explicit tool
+visibility plus checkpoint authority.
 
 Checkpoint inspect process rows expose the snapshot's canonical tagged
 `wait_state` and `outcome` mappings together with `state_generation`. The
@@ -179,8 +189,12 @@ JIT syscalls:
 - `checkpoint.diff`
 - `checkpoint.restore`
 - `checkpoint.fork`
-- `checkpoint.replay_to_event`
+- `checkpoint.replay`
 - `image.commit_checkpoint`
+
+`checkpoint.replay_to_event` remains a compatibility alias for the canonical
+`checkpoint.replay` JIT syscall. The Python manager method is named
+`replay_to_event`, and the CLI subcommand is `checkpoint replay`.
 
 CLI commands:
 
@@ -267,17 +281,36 @@ Restore has three explicit phases:
    the publication remains recoverable, the linked operation is `unknown`, and
    mutation admission is fenced until the Runtime is reopened.
 
+Restore never rewinds a process concurrency token. For every restored PID,
+`revision`, `execution_generation`, and `state_generation` are each advanced to
+one greater than their durable high-water floor, where that floor includes both
+the current live row and the checkpoint row. `execution_owner_id` and
+`execution_lease_id` are cleared. Stale process CAS writers and pre-restore
+execution tokens therefore cannot publish after restore, and a second restore
+advances the three values again.
+
+Finite capability consumption is also monotonic. A captured capability is
+revalidated against its current active/expiry/restrictive-policy state, and an
+existing capability keeps its current `uses_remaining` rather than the larger
+value in the checkpoint. Outstanding capability-use reservations in the
+restored process/Object scope are invalidated before capability rows are
+replaced, so a late provider completion cannot refund a consumed use. This is
+distinct from captured parent/child `process_resource_reservations`, which are
+reconstructable subtree state and are restored from the checkpoint.
+
 A successful commit returns `main_state_committed: true`. If every
 post-commit phase succeeds, `status` is `restored`; otherwise `status` is
 `restored_with_warnings` and `post_commit_failures` identifies each failed
 reconciliation/finalizer phase and error. Each recordable failure appends a
 `checkpoint.restore.post_commit_failure` audit record. Callers must not retry a
 `restored_with_warnings` result as though the main restore had rolled back.
-The result also returns `publication_id` and `reconciliation_pending: true`;
-the current Runtime is in `close_failed`. Ordinary `close()`/`shutdown()` stays
-fail closed and deliberately retains the diagnostic store and backend lease.
-After diagnostics have been captured, the owner must call
-`Runtime.release_recovery_diagnostics()` (or await
+Every result includes its `publication_id`. A `restored_with_warnings` result
+also has `reconciliation_pending: true` and leaves the current Runtime in
+`close_failed`; an all-success `restored` result has no pending reconciliation
+and leaves ordinary admission open. In the warning case,
+`close()`/`shutdown()` stays fail closed and deliberately retains the diagnostic
+store and backend lease. After diagnostics have been captured, the owner must
+call `Runtime.release_recovery_diagnostics()` (or await
 `Runtime.arelease_recovery_diagnostics()`) before a fresh Runtime can reopen the
 target and perform authoritative startup recovery.
 Post-commit control-flow interruptions are re-raised without type conversion
@@ -367,56 +400,59 @@ internal startup workers from reusing the same recovery lease and running
 finalizer work twice.
 Cross-Runtime concurrency remains outside the documented one-writer boundary.
 
-Legacy flow carriers are normalized while snapshot rows are prepared. A valid
-minimal pending/message label object is written back in canonical form so later
-message-observation CAS uses the exact persisted bytes. An incomplete or
-malformed active pending action is restored with conservative
-secret/untrusted labels and a durable reconciliation marker; completed pending
-history is relabeled conservatively without failing its process. After the
-registry, ownership, and Store lifecycle locks are released, the same startup
-terminal reconciler commits a non-terminal process's FAILED transition,
-reservation release, and parent wakeup, then cancels Human/ObjectTask work and
-runs normal Object/Host terminal finalization. An already-terminal row preserves
-its status/result and completes only missing cleanup. Result Objects and
-mergeable child memory remain available until parent cleanup. A cleanup failure
-is a post-commit warning and leaves a retryable marker; it does not roll the
-restored rows back or replay a provider.
+Flow metadata is fail closed, not repaired during restore. Every captured
+`llm_pending_actions` row, including completed history, must contain a canonical
+`data_flow_context_json`; every captured process message must contain canonical
+`data_labels` and `source_oids` metadata. Restore and fork validate all such
+rows before publishing any process-state mutation. Missing, incomplete, or
+malformed metadata rejects the artifact instead of assigning conservative
+labels. Fork additionally requires any message `label_carrier_oid` to belong to
+the cloned Object scope and remaps that carrier to the forked Object id.
 
 All post-checkpoint pending human requests for restored processes are cancelled.
-Post-checkpoint mailbox entries are kept in history but marked as superseded by
-restore so they are not delivered as unread by default.
+Among messages created after the checkpoint, only entries that are still
+**unread** are marked `superseded_by_restore`; acknowledged or
+already-superseded post-checkpoint history is left unchanged. Captured message
+rows are restored to their checkpoint delivery state, so a message that was
+unread at capture may become unread again.
 
-ObjectTask rows are append-only execution history rather than reconstructable
-worker state. Restore still refuses any active task in the affected process or
-Object scope. If a scoped task reached a terminal state after the checkpoint,
-restore keeps its row but changes the status to `superseded_by_restore`, clears
-the now-invalid runner/result references, and stores the previous status,
-runner, result, and error in the task's wait metadata. The restore response,
-event, and audit list those task ids as `superseded_object_tasks`. A task that
-was already terminal at checkpoint time keeps its ordinary status because its
-referenced process/Object state was part of the captured scope. This boundary
-uses the task's terminal `completed_at`, not `updated_at`: late notification
-delivery may update the row after checkpoint creation without changing when
-the task actually became terminal. Legacy rows that have no `completed_at`
-fall back conservatively to `updated_at`.
+ObjectTask rows are durable execution history, but they are not append-only and
+are not themselves checkpoint rows. Restore refuses any active task in the
+affected process or Object scope. If a scoped task reached a terminal state
+after the checkpoint, restore updates the existing row to
+`superseded_by_restore`, clears the now-invalid runner/result references, and
+stores the previous status, runner, result, and error in the task's wait
+metadata. The restore response, event, and audit list those task ids as
+`superseded_object_tasks`. A task that was already terminal at checkpoint time
+keeps its ordinary status; if reopen had degraded its unavailable result,
+restore can update that row and reconnect the checkpointed runner/result Object.
+This boundary uses the task's terminal `completed_at`, not `updated_at`: late
+notification delivery may update the row after checkpoint creation without
+changing when the task actually became terminal. Legacy rows that have no
+`completed_at` fall back conservatively to `updated_at`.
 
 After restored process rows are written, restore reconciles wait states against
 the restored runtime facts. A process waiting on an already-terminal child or a
-now-available matching message is made runnable. A process waiting on a human
-request that restored as approved resumes; a restored `permission_request`
-wait also becomes runnable so the permission path can re-check the current
-capability state. Other resolved human waits become paused with an explanatory
-status message. This keeps checkpoint state from preserving stale waits whose
-blocking condition has already resolved in the restored snapshot.
+now-available matching unread message is made runnable; an unresolved typed
+child/message wait remains waiting, while an invalid event-wait shape is
+paused. A `WAITING_TOOL` process is paused with an explanatory status because
+restore rejects scoped active ObjectTasks and will not revive a missing,
+terminal, or mismatched task binding. A valid human wait remains waiting while
+any referenced request is pending. Once all requests are resolved, approved
+requests resume; a resolved `permission_request` also resumes regardless of its
+recorded decision so the permission path can re-check current capability state;
+other rejection/cancellation outcomes pause the process. Missing or malformed
+human wait identities also pause it. These transitions and their
+`state_generation` bumps commit atomically with the restored rows.
 
 Restored `llm_pending_actions` remain durable wait generations. Before the next
 quantum, the executor synchronizes its in-memory human/child/message waiter with
 the restored row and `resume_token`, so a pre-restore cached generation cannot
 claim or clear it. Restore also assigns every restored process a fresh durable
 LLM context generation inside the main transaction. Provider-side Responses
-history is append-only and is not rolled back, so this generation change forces
-the next LLM request to reset stateless instead of chaining to a response made
-from post-checkpoint local state.
+state is outside checkpoint rollback and is not rewound by restore, so this
+generation change forces the next LLM request to reset stateless instead of
+chaining to a response made from post-checkpoint local state.
 
 When `llm.persist_full_io=false`, a conditional LLM release row contains only
 hash-bound resume metadata. It can resume only while the matching prepared
@@ -440,8 +476,9 @@ retaining the exact work item and the linked operation remains `unknown`; it is
 never silently marked committed.
 
 If irreversible provider effects exist after the checkpoint, restore still
-continues by default. The irreversible effects stay in append-only history and
-in the restore report.
+continues by default. Their durable external-effect evidence stays in runtime
+history and in the restore report; restore neither deletes it nor compensates
+the provider.
 
 JSON-RPC endpoint and MCP server registry rows are host provider configuration
 and are not captured or restored. Restored capabilities that reference a
@@ -452,7 +489,8 @@ provider configuration explicitly.
 
 A checkpoint can be committed into a new `AgentImage`, similar in spirit to a
 Docker image commit but scoped to Agent libOS reconstructable runtime state.
-The v1 commit captures only the checkpoint owner root process:
+The checkpoint-to-image artifact captures only the checkpoint owner root
+process:
 
 - Object Memory metadata and payloads both referenced by and owned/captured for
   that process (borrowed roots without captured payloads are excluded),
@@ -466,11 +504,12 @@ It does not copy the real filesystem, shell state, remote JSON-RPC/MCP state,
 human UI output, network effects, resource budgets/usage, or any other
 provider-side state. It also does not restore JSON-RPC endpoint registrations,
 MCP server registrations, or global Skill trust rows; those are host registry
-decisions, not image state. Provider effects remain append-only
-`external_effects` records. Resource limits for a process booted from the
-committed image must come from the caller that starts that process. Use an
-image package `workspace/` seed when an image needs filesystem content at boot
-time.
+decisions, not image state. Provider effects remain in durable external-effect
+history and are not packaged or rolled back by image commit.
+The underlying intent row may still follow its guarded finalize or payload-
+retention state machine. Resource limits for a process booted from the committed
+image must come from the caller that starts that process. Use an image package
+`workspace/` seed when an image needs filesystem content at boot time.
 
 External capabilities in the checkpoint are converted into image
 `required_capabilities` declarations. They are not restored as live authority
@@ -500,7 +539,9 @@ Fork creates a new isolated process subtree from checkpoint state. It remaps
 pids, owned object ids, capability ids, namespace ids, ephemeral JIT tool ids,
 and JIT candidate ids. Candidate Object payloads and loaded-Skill JIT mappings
 are rewritten to those new identities, so unloading or replacing a forked tool
-cannot retire the source process's registration.
+cannot retire the source process's registration. Each forked process starts a
+new concurrency identity with `revision`, `execution_generation`, and
+`state_generation` set to zero and with no copied execution owner or lease.
 
 Executable JIT handles/sources are prepared before publication. The missing
 Image/artifact rows, all fork rows, Object payload cache entries, and any parent
@@ -510,15 +551,21 @@ scheduler cannot claim a fork root whose process-local JIT assets are only
 partially installed.
 
 Fork is non-destructive for the global image registry: it restores only missing
-image definitions, and restores checkpoint-derived image artifacts only for the
-missing images it reintroduces. It never replaces an image id that already
-exists. When actor capability checks are enabled, fork therefore requires both
-`execute` on the checkpoint and `write` on each missing `image:<image_id>`
-resource it would reintroduce.
+image definitions, and restores embedded `checkpoint_commit` or `image_package`
+artifacts only for the missing images it reintroduces. It never replaces an
+image id that already exists. When actor capability checks are enabled, fork
+therefore requires both `execute` on the checkpoint and `write` on each missing
+`image:<image_id>` resource it would reintroduce.
 
 Fork also never replaces the global Skill registry. Forked processes consume
 their captured `loaded_skills.package_snapshot`; checkpoint compatibility rows
 are not upserted into host Skill state.
+
+Fork intentionally drops all captured `llm_pending_actions`. A pending action
+contains source-process provider/tool/request identities and resume tokens that
+must not be replayed under the forked PID. Forked transient wait states are
+normalized to `runnable`, and the new process must issue fresh requests under
+its own identity.
 
 The forked subtree must not gain authority wider than the checkpointed subtree
 held. It does not share the original process private namespace or result
@@ -571,15 +618,28 @@ external side effects.
 
 Checkpoint defaults live in `CheckpointDefaults`:
 
-- snapshot version,
 - checkpoint list limit,
 - payload capture limit,
 - snapshot hard byte limit,
 - diff preview size.
 
-The current checkpoint snapshot codec is version 4. Version 4 adds canonical
-typed process wait/outcome fields and their state generation; earlier snapshot
-shapes are rejected rather than interpreted using `status_message` strings.
+Snapshot version is not a `CheckpointDefaults` setting. The checkpoint snapshot
+codec is the fixed `CHECKPOINT_SNAPSHOT_VERSION`, currently version 4. Version
+4 requires canonical typed process wait/outcome fields and their state
+generation; earlier snapshot shapes are rejected rather than interpreted using
+`status_message` strings.
+
+Independent version namespaces appear in this document:
+
+- the durable checkpoint snapshot schema is version 4;
+- the checkpoint-restore publication/reconciliation plan is currently version
+  2, while startup recovery accepts an exact immutable legacy version-1 plan;
+- checkpoint-to-image commits use the separately configured
+  `image_commit.artifact_version`, whose default is 2;
+- image-package artifacts use their own fixed `artifact_version` 1.
+
+Changing one of these versions does not change or authorize either of the
+others.
 
 Checkpoint list callers may request only positive integer limits no larger
 than `CheckpointDefaults.list_limit`; `0`, negative values, booleans, and larger

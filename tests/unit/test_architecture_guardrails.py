@@ -302,15 +302,30 @@ class TestArchitectureGuardrails:
         )
 
     @pytest.mark.parametrize(
-        "statement",
+        ("repository_class", "statement"),
         [
-            "self._delegate('get_process', pid)",
-            "getattr(self._process_backend, 'get_process')(pid)",
+            (
+                "ProcessRepository",
+                "self._delegate('get_process', pid)",
+            ),
+            (
+                "ProcessRepository",
+                "getattr(self._process_backend, 'get_process')(pid)",
+            ),
+            (
+                "PayloadRetentionRepository",
+                "self._delegate('scan_llm_call_payloads_for_retention')",
+            ),
+            (
+                "PayloadRetentionRepository",
+                "getattr(self._retention_backend, 'scan_llm_call_payloads_for_retention')()",
+            ),
         ],
     )
     def test_migrated_repository_reflection_bypass_fails(
         self,
         tmp_path: Path,
+        repository_class: str,
         statement: str,
     ) -> None:
         relative = "agent_libos/storage/repositories.py"
@@ -320,8 +335,8 @@ class TestArchitectureGuardrails:
         _write_source(
             tmp_path,
             relative,
-            "class ProcessRepository:\n"
-            "    def get_process(self, pid):\n"
+            f"class {repository_class}:\n"
+            "    def get_process(self, pid=None):\n"
             f"        return {statement}\n",
         )
 

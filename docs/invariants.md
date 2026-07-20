@@ -14,7 +14,9 @@ The checker accepts JSON-subset or YAML syntax and fails when a listed pytest
 node cannot be collected, an invariant lacks deterministic regression coverage,
 an invariant's `benchmark_attack_classes` declaration diverges from the
 top-level mapping, or a runtime-safety benchmark task uses an unmapped
-`attack_class`.
+`attack_class`. It also fails when the invariant ids documented below contain a
+duplicate, omit an id from the manifest, or retain an id that the manifest no
+longer defines.
 
 ## Current Invariant Groups
 
@@ -38,6 +40,9 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   malformed authority-rule fail-closed behavior, and ISO-normalized leases.
   Delegation publishes its row/process attachment/evidence atomically, and a
   multi-spec authority derivation is prevalidated and committed all-or-nothing.
+- `capability-subject-isolation`: preselected capability candidates are filtered
+  to the requested process subject, and Human-approved capability
+  specifications cannot redirect authority to another process.
 - `authority-mutations-revalidate-inside-one-transaction`: JSON-RPC, MCP,
   DataFlow, Skill registration/activation/unload/trust, capability issue/revoke, and
   checkpoint publication recompute the complete allow/deny decision after
@@ -61,9 +66,15 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `task-authority-manifest-bounds-launch`: image requirements are declarations;
   Host manifests compile launch grants and bound model requests, child
   transitions, budgets, approval policy, and provider effect classes.
+- `effect-ceilings-distinguish-unrestricted-and-deny-all`: omission of a Task
+  Authority effect ceiling remains unrestricted, while an explicit empty
+  ceiling is a versioned deny-all value that cannot be downgraded after reopen.
 - `effect-transactions-are-idempotent-and-reconcilable`: provider intents bind
   canonical arguments and idempotency keys, approval leases bind exact effects,
   and startup reconciliation queries but never replays providers.
+- `external-effect-recovery-is-keyset-bounded`: startup recovery scans only
+  nonterminal external effects through bounded indexed keyset pages and
+  converges the full backlog without materializing the full effect history.
 - `protected-provider-operations-use-sdk`: LLM, filesystem, clock, shell, JSON-RPC,
   MCP, Human, and PTY provider effects share one contract registry and one
   prepare/dispatch/finalize state machine. Static coverage rejects direct
@@ -86,6 +97,14 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   reservation. Provider exceptions cross public, Tool, syscall, LLM, and
   evidence surfaces only as a code/type/correlation envelope without host
   exception text.
+- `provider-results-are-decoded-at-the-host-boundary`: MCP and JSON-RPC provider
+  results are detached and validated before runtime field access; malformed or
+  unknown post-return failures expose only public envelopes, and unknown
+  response bytes settle at the active-stage ceiling.
+- `provider-approval-is-bound-to-versioned-spec`: JSON-RPC and MCP approvals
+  bind an immutable registry-specification digest and monotonic generation,
+  including absent first-registration state, and are revalidated before every
+  provider phase and after reopen.
 - `data-labels-propagate-conservatively`: derived Object sensitivity, trust,
   and integrity labels merge conservatively; manifests expose metadata only;
   label downgrade requires declassification authority.
@@ -160,6 +179,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
 - `storage-transactions-recover-or-fail-closed`: commit/savepoint finalization
   failure restores SQL and opted-in Object payload state; rollback failure
   poisons/closes the store.
+- `runtime-domain-storage-uses-exact-typed-facades`: Runtime, process, syscall,
+  data-flow, and Tool orchestration use exact typed storage facades; persisted
+  Object security projections are validated without materializing runtime-only
+  payloads.
 - `process-waits-and-outcomes-are-typed-and-generation-fenced`: every semantic
   process transition atomically persists status, typed wait/outcome, and a
   monotonic state generation. Wakeups compare the exact typed state and
@@ -202,6 +225,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   pending intents; they retain only length/hash observations, never raw
   prompt, answer, or provider exception text. Human output provider failures
   likewise retain only the error type.
+- `human-authority-and-evidence-commit-atomically`: Human requests, one-shot
+  authority reservations, operation links, events, and audit commit or roll
+  back as one unit, so an evidence-sink failure cannot publish a partial Human
+  authority transition.
 - `shell-and-jit-containment`: shell and Deno JIT execution stay policy-bound,
   including shell policy capability effects and finite-use leases, sandboxed,
   process-local, cached-only at runtime, and syscall-mediated. JIT lifecycle
@@ -307,16 +334,16 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   failed/manual checkpoint restores remain forward-recovery inputs. Orphaned
   `CREATED` processes are found by an indexed anti-join. Every backlog is fully
   processed while returned diagnostic ids remain bounded.
-- `checkpoint-restore-payload-replay-precedes-generic-release`: startup validates
-  the receipt-anchored checkpoint plan and snapshot, then selectively rehydrates
-  exact restored Object rows before the generic missing-payload sweep. A newer
-  Object with the same immutable creation identity (including a versioned owner
-  transfer), or a released Object, is never overwritten; missing, stale, or
-  creation-identity-drifted rows fail closed. Terminal
-  `pending`/`confirmed`/`completed` delivery receipts
-  keep the operation index dirty until startup services are ready, and a late
-  startup failure compensates back to `pending` before Store ownership is
-  released.
+- `runtime-publication-domain-is-closed`: publication kinds and states are
+  canonical at repository, backend, physical-schema, and reopen boundaries, so
+  an invalid row cannot be silently skipped by recovery.
+- `checkpoint-reconciliation-uses-exact-typed-storage-ports`: checkpoint
+  restore orchestration is limited to exact publication and operation storage
+  ports; architecture checks reject Any-typed, nested-store, reflection,
+  raw-SQL, malformed-record, and generic-publication escape paths.
+- `checkpoint-payload-delivery-is-attempt-fenced`: restored payload delivery is
+  paged and fenced by an exact durable attempt. Acknowledgment is owner-bound,
+  reconciliation-complete, read back, and safely compensated before any retry.
 - `startup-recovery-entrypoints-require-the-opaque-lifecycle-lease`: every
   mutation-capable recovery entry invoked by Runtime assembly (prepared
   protected effects, provider reconciliation, capability/resource
@@ -352,6 +379,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   hard-bounded `(created_at, reservation_id)` keyset. Ambiguous settlements,
   actual charges, and any resulting overage kill share one transaction, while
   diagnostics retain only one page of IDs plus the exact total.
+- `stale-operation-recovery-is-keyset-bounded`: stale running operations are
+  recovered through hard-bounded indexed keyset pages and a store-locked
+  temporary uncertainty index. Diagnostics remain bounded while descendant
+  unknown-effect outcomes are preserved.
 - `startup-recovery-diagnostics-are-bounded`: prepared-effect reconciliation,
   provider reconciliation, stale capability-use reservations, provider-usage
   reservations, volatile Object payloads, ObjectTask reconciliation, JIT
@@ -485,6 +516,10 @@ top-level mapping, or a runtime-safety benchmark task uses an unmapped
   persist only hashes and non-sensitive resume metadata before approval;
   same-runtime approval reuses the hash-bound in-memory request, while reopen
   fails closed without provider dispatch.
+- `payload-retention-preserves-runtime-evidence-and-recovery`: payload retention
+  is explicit, bounded, monotonic, and transactionally audited. It accepts only
+  canonical provenance-bound content-free targets and does not erase evidence
+  still required by live recovery.
 - `llm-responses-state-chain-is-lossless`: OpenAI Responses state chaining
   is opt-in and preserves every representable native tool output, including
   parallel batches and reopened waits. Missing/extra/redacted outputs, changed

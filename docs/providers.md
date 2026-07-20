@@ -21,9 +21,9 @@ provider hooks during startup. Every real provider boundary must use the
 | Clock | `LocalClockProvider` | Clock resource/right plus process resource budget | `now`, monotonic observation, sleep/asleep cancellation, and result classification use one protected operation; later failures remain unknown rather than refunding authority | Finite sleep limit, monotonic elapsed accounting, sync and async paths |
 | Shell | `LocalShellProvider` | Exact executable resource, shell policy rule, approval, cwd read authority, process budget | Intent exists before spawn; timeout/cancel/limit/classifier failures conservatively retain performed/unknown evidence | No shell command string by default, scrubbed environment, workspace cwd, stdout/stderr bounds, wall/CPU/RSS supervision, process-tree termination |
 | Human | `LocalHumanProvider` plus GUI/terminal host surfaces | Typed question/permission request and explicit policy decision | Terminal read/write and GUI request presentation are protected information-flow operations; conditional GUI views expose only bound metadata and reject parent responses until their exact one-shot release is consumed through presentation | Typed responses, queue state, bounded payload/output, lock-free blocking I/O with claimed request state |
-| JSON-RPC | `HttpJsonRpcProvider` | Registered endpoint and exact method capability; model-supplied URLs are forbidden | Registry metadata is gated before lookup; remote DNS starts inside the pending intent; transport/classification settles the same effect id | Header-env allowlist, request/response hard limits, timeout, resolved-address policy, client-only JSON-RPC 2.0 |
-| MCP | `SdkMcpProvider` for Streamable HTTP and stdio | Registered server/tool capability; stdio additionally requires `process:spawn` and exact `mcp_stdio:<digest>` execute authority exposed by server inspection | HTTP DNS and stdio spawn are covered by the call/validation intent; registry lookup is gated; actor live discovery checks outbound context and returns untrusted ingress; tool results use bounded provider evidence | Tools-only v1 surface, manifest/header/stdio-env allowlists, request/response and timeout limits, contained stdio process lifecycle |
-| PTY | Trusted `modules/pty` Runtime Module provider hooks | Startup hash trust plus normal process/shell authority; published sessions are Object Memory `EXTERNAL_REF` handles with Object rights | Spawn/write/resize/close each use protected pending-to-finalized effects; write raises the session label high-water even after an ambiguous provider outcome; cleanup does not erase an uncertain spawn | Independent reader/monitor workers, output bounds, wall/CPU/RSS supervision, POSIX process groups or Windows Job Object/ConPTY support |
+| JSON-RPC | `HttpJsonRpcProvider` | Registered endpoint and exact method capability; model-supplied URLs are forbidden | Registry metadata is gated before lookup; calls prepare the reservation/intent before resolving header values, then remote DNS starts inside that intent; transport/classification settles the same effect id | Closed manifest shape, header-env allowlist, request/response hard limits, timeout, resolved-address policy, client-only JSON-RPC 2.0 |
+| MCP | `SdkMcpProvider` for Streamable HTTP and stdio | Registered server/tool capability; stdio additionally requires `process:spawn` and exact `mcp_stdio:<digest>` execute authority exposed by server inspection | HTTP DNS and stdio spawn are covered by the call/validation intent; tool calls prepare before runtime env resolution, while live tool refresh resolves env first; registry lookup is gated; live discovery is bidirectional and tool results use bounded provider evidence | Tools-only v1 surface, closed manifest shape, header/stdio-env allowlists, request/response and timeout limits, contained stdio process lifecycle |
+| PTY | Trusted `modules/pty` Runtime Module provider hooks | Startup hash trust plus normal process/shell authority; published sessions are Object Memory `EXTERNAL_REF` handles with Object rights | Spawn is bidirectional; read/continuous ingest are ingress; write/resize/public close are egress. Effectful operations use protected pending-to-finalized evidence; write raises the session label high-water even after an ambiguous provider outcome | Independent reader/monitor workers, output bounds, wall/CPU/RSS supervision, POSIX process groups or Windows Job Object/ConPTY support |
 
 LLM requests are also formal bidirectional protected provider operations. Their
 Sink is `llm:<profile>` and profile/model/base-URL/API-mode plus effective
@@ -42,6 +42,15 @@ resolved executable, and PTY sessions retain their spawn Sink identity. Sink
 clearance is checked before provider state, DNS, stdio, or spawn and rechecked
 inside the SDK prepare transaction. Cached MCP tool metadata is public; a live
 refresh remains a provider operation. See [Data Flow](data_flow.md).
+
+Runtime environment resolution is not uniformly outside preparation. A
+JSON-RPC call and an MCP tool call first reserve finite authority and prepare a
+pending intent, then resolve header/stdio values before their first provider
+phase; a missing value restores and abandons that preparation because no
+provider work started. MCP cached tool listing resolves nothing, while live
+`list_tools(refresh=true)` resolves its environment before reservation and
+intent creation. The operation-specific references below are authoritative for
+these orderings.
 
 Shell and PTY derive the resolved executable Sink from Host-owned `argv[0]`,
 workspace/cwd, and the safe executable path without handing the remaining argv
@@ -110,10 +119,13 @@ syscall failures are reconstructed as the same envelope before ToolExecution
 persists them.
 
 Checkpoint restore and image commit report provider-classified effects but do
-not compensate or roll back provider state. Audit/effect rows are append-only
-evidence only within the RuntimeStore trust boundary: an operator with direct
-database write access can tamper with them unless the deployment adds external
-append-only storage, signatures, or remote attestation.
+not compensate or roll back provider state. Audit rows are append-only through
+RuntimeStore APIs; external-effect rows retain one causal identity while
+guarded prepare, dispatch, finalize, and retention transitions update their
+state. These guarantees exist only within the RuntimeStore trust boundary: an
+operator with direct database write access can tamper with them unless the
+deployment adds external append-only storage, signatures, or remote
+attestation.
 
 ## Registration and visibility
 

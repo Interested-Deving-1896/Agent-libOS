@@ -118,9 +118,8 @@ The implementation currently includes:
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
   denominators.
-- A checked-in practical-workflow suite that keeps `native-live`,
-  `native-partial`, `mocked`, and `modeled` evidence levels separate and never
-  fills a native row with modeled fallback evidence.
+- A checked-in practical-workflow suite with exactly two evidence levels:
+  `native-live` and `modeled`. Native rows never fall back to modeled evidence.
 
 ## Documentation
 
@@ -162,7 +161,7 @@ Start here, then read the deeper references as needed:
   workspace/global sources, trust, activate/unload semantics, bundled JIT
   tools, and `swe-agent`.
 - [docs/checkpoints.md](docs/checkpoints.md): scoped snapshots, restore, fork,
-  replay diagnostics, append-only history, and external effects.
+  replay diagnostics, retained runtime history, and external-effect reporting.
 - [docs/storage.md](docs/storage.md): transaction rollback/poison semantics,
   Object payload durability, schema recovery, and active-runtime leases.
 - [docs/evidence_payload_retention.md](docs/evidence_payload_retention.md):
@@ -175,8 +174,8 @@ Start here, then read the deeper references as needed:
   HTTP/SSE APIs, same-build contract boundary, and development commands.
 - [docs/gui_api_schema.json](docs/gui_api_schema.json): versioned JSON Schema
   subset for snapshots, errors, and confirmed high-risk GUI mutations.
-- [docs/benchmark.md](docs/benchmark.md): M1 runtime-safety benchmark tasks,
-  runners, oracle, outputs, and metrics.
+- [docs/benchmark.md](docs/benchmark.md): runtime-safety and practical-workflow
+  evaluation contracts, scale gates, outputs, and metrics.
 - [docs/mini_swe_agent_image.md](docs/mini_swe_agent_image.md): package-only
   `mini-swe-agent` image behavior and known interface differences.
 - [docs/development.md](docs/development.md): setup, tests, real LLM smoke,
@@ -190,6 +189,10 @@ Start here, then read the deeper references as needed:
   non-goals.
 - [benchmarks/runtime_safety/schema.md](benchmarks/runtime_safety/schema.md):
   benchmark task/output schema v1.
+- [benchmarks/external_effect_recovery/README.md](benchmarks/external_effect_recovery/README.md):
+  100k CI and one-million-record external-effect recovery scale profiles.
+- [benchmarks/runtime_publication_recovery/README.md](benchmarks/runtime_publication_recovery/README.md):
+  10k CI runtime-publication reopen and reconciliation scale gate.
 - [plan.md](plan.md): dated paper-submission roadmap; not the implementation
   reference for current behavior.
 - [AGENTS.md](AGENTS.md): repository structure, testing, security, and
@@ -300,9 +303,9 @@ uv run python experiments/run_practical_evaluation.py \
   --output .benchmark_runs/practical/report.json
 ```
 
-Its evidence-level labels are part of the result contract. In particular,
-`native-live` requires real ToolBroker, state, external-effect, and Explain
-evidence; it never falls back to a modeled success.
+Its two evidence-level labels, `native-live` and `modeled`, are part of the
+result contract. `native-live` requires real ToolBroker, state, external-effect,
+and Explain evidence; it never falls back to a modeled success.
 
 ## Persistent Runtime
 
@@ -588,9 +591,11 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   `restore_external_policy="report_only"`.
 - Resource Provider Substrate backends perform host effects, but primitives own
   capability checks, policy decisions, events, and audit.
-- Audit and external-effect history is append-only through RuntimeStore APIs,
-  not tamper-proof against a host administrator with direct database write
-  access. Deployments needing independent integrity must add signed or remote
+- Audit rows are append-only through RuntimeStore APIs. External-effect intent
+  rows instead move through guarded prepare/finalize/retention transitions while
+  retaining their causal identity and outcome history. Neither contract is
+  tamper-proof against a host administrator with direct database write access;
+  deployments needing independent integrity must add signed or remote
   append-only evidence outside that trust boundary.
 
 See [docs/invariants.md](docs/invariants.md) for test coverage.

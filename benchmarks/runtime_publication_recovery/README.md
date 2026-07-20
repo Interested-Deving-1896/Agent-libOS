@@ -59,6 +59,36 @@ exact seeded binding set, without materializing history in Python.
 Elapsed seed and reopen times are diagnostic only. Structural query and row
 bounds are the release gate.
 
+## Profile and automation
+
+The only named profile is `ci`: 10,000 terminal publication rows, 1,001
+unreconciled rows, and page size 500. It is run by both the per-change release
+workflow and the scheduled/manual scale workflow. The latter also runs the
+separate one-million-row **external-effect** profile; it does not make this
+publication benchmark a one-million-row profile.
+
 ```console
 uv run python experiments/run_publication_reconciliation_scale.py --profile ci
 ```
+
+`--total-records`, `--unreconciled-records`, and `--page-size` override the
+profile for focused tests or manual experiments. All three values must be
+positive, `unreconciled-records` must not exceed `total-records` and must span
+more than one page, and `page-size` must not exceed the runtime hard limit of
+5,000. A custom invocation must be reported by its explicit parameters rather
+than as a named profile.
+
+## Output
+
+By default the command writes
+`.benchmark_runs/publication-reconciliation-scale.json`; use `--output PATH` to
+select another file. The same JSON object is printed to stdout. It has
+`schema_version: 3`, population/page sizes, publication and operation
+convergence counts, expected and observed query/row/update counts, payload
+delivery and attempt-transition evidence, required indexes and query plans,
+timing fields, and `timing_is_informational_only: true`. A structural-contract
+failure raises and the command exits nonzero instead of writing a favorable
+result.
+
+See the repository [benchmark guide](../../docs/benchmark.md#recovery-scale-gates)
+for how this gate relates to the runtime-safety and practical-workflow suites.

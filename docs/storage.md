@@ -7,9 +7,11 @@ explicit domain boundaries, including `ProcessRepository`,
 `PayloadRetentionRepository`,
 `ObjectRepository`, `AuthorityRepository`, `EvidenceRepository`, and
 `ExtensionRepository`. All repositories in one runtime share the same
-transaction coordinator. Runtime code uses those repositories; the concrete
-SQL store exposes only the Host transaction and backend implementation
-boundary.
+transaction coordinator. Migrated runtime domains use those repositories. The
+concrete SQL store remains a Host composition/lifecycle boundary and is still
+passed to a small set of reviewed legacy services such as Explain; it is not yet
+hidden from every runtime component. New domain persistence should use the
+typed/repository boundary rather than extending that compatibility surface.
 
 Process, resource-accounting, runtime-publication, operation/evidence,
 module-publication, and Snapshot/Checkpoint persistence have explicit typed
@@ -21,25 +23,44 @@ runtime services. Payload-retention scans and compare-and-swap reductions use a
 separate typed repository so maintenance cannot regain the generic extension
 facade or load full evidence history into Runtime services.
 
-Those migrated repositories, including payload retention, also bind to
-explicit backend Protocols. A
-`UnitOfWork` validates concrete method presence and compatible positional and
-keyword call shapes before it constructs any repository; dynamic
-`__getattr__` shims and transaction-only backends therefore fail at assembly,
-not on their first request. The architecture ratchet rejects `_delegate` and
-`getattr` reflection inside the migrated repository classes. Legacy event,
-audit, human/LLM, ObjectTask, message/rating, context-materialization,
-external-effect, registry, and provider facades still use their reviewed
-allowlists; they are not part of this typed vertical and must be migrated
-explicitly before that compatibility mechanism can be removed.
+Those migrated repository surfaces, including payload retention, bind to
+explicit backend Protocols. A `UnitOfWork` validates concrete method presence
+and compatible positional and keyword call shapes before it constructs any
+repository; dynamic `__getattr__` shims and transaction-only backends therefore
+fail at assembly, not on their first request. The static no-reflection ratchet
+is narrower than that backend-conformance check: it rejects `_delegate` and
+`getattr` inside `ProcessRepository`, `ResourceRepository`,
+`RuntimePublicationRepository`, `CheckpointRestorePublicationWriter`,
+`SnapshotCheckpointRepository`, `EvidenceRepository`,
+`RuntimeModuleRepository`, and `PayloadRetentionRepository`. The retention
+repository calls its typed backend directly; it cannot route bounded scans or
+CAS updates through the legacy facade's `_delegate`. Legacy event, audit,
+human/LLM, ObjectTask, message/rating, context-materialization,
+external-effect, registry, and provider facades still use reviewed allowlists.
+They must be migrated explicitly before that compatibility mechanism can be
+removed.
 
 SQLite is the default local engine. SQLite and PostgreSQL are independent
 connection/dialect/lease adapters over the same typed repository
 implementation and canonical 0.3 schema. The shared implementation emits a
-small, documented SQLite-shaped SQL subset; the PostgreSQL dialect translates
-that subset and is covered by a syntax-surface contract. PostgreSQL therefore
-does not inherit the SQLite store or its connection/locking behavior, but it is
-also not a second, copied repository implementation.
+small SQLite-shaped SQL subset. The PostgreSQL dialect translates parameter
+placeholders, `COLLATE BINARY`, `INSERT OR IGNORE`, the one reviewed
+`INSERT OR REPLACE` upsert, `INDEXED BY`, and the table/index metadata probes;
+a syntax-surface test ratchets that set. PostgreSQL therefore does not inherit
+the SQLite store or its connection/locking behavior, but it is also not a
+second, copied repository implementation.
+
+Library defaults are deliberately ephemeral. `Runtime.open()` and
+`Runtime.aopen()` do not load the repository's `config.yaml`; with neither an
+explicit target nor an explicit config they use `DEFAULT_CONFIG`, whose
+`runtime.local_store_target` is `local`. The store factory maps both `local`
+and `:memory:` to an in-memory SQLite database, and `SQLiteStore()` has the
+same `:memory:` default. Each such connection is a separate store and all of
+its state disappears when it is closed. Persistence therefore requires an
+explicit filesystem/`sqlite://` target, a config whose local target is a file,
+or a PostgreSQL DSN. Product CLI and GUI entrypoints may load project
+configuration before calling `Runtime.open`; that Host behavior does not
+change the library default.
 
 This release supports one writable Runtime per database/schema on either
 backend. PostgreSQL's session advisory lease enforces that product boundary;
@@ -51,22 +72,41 @@ lock.
 
 ## Strict 0.3 schema
 
-Every 0.3 database contains a singleton `runtime_schema` row with schema
-version `3`. Opening proceeds in this order:
+Fresh 0.3 databases create a `runtime_schema` table with one marker row; the
+canonical DDL constrains its `singleton` value to `1`. Opening an existing
+store requires the row selected by `singleton = 1` to contain schema version
+`3`. Opening proceeds in this order:
 
-1. Read the version marker and probe the required schema shape.
-2. Reject an unsupported, unversioned, or incomplete store.
-3. Only for an empty target, atomically create the complete schema and marker.
+1. Read the version marker.
+2. For a version-3 marker, require every manifest table and required column,
+   reject the obsolete `storage_migrations` table, and validate the required
+   keyset text-column collations and backend encoding.
+3. Reject a wrong marker, an unversioned non-empty target, or a store missing
+   any of that probed surface.
+4. In one transaction, run the idempotent initializer. For an accepted existing
+   version-3 store this can create missing named indexes and insert missing
+   canonical seed rows such as counters and the system namespace. For an empty
+   target it creates the complete schema and then writes the marker.
 
 An interrupted bootstrap rolls back both schema and marker, so reopening the
 same empty target retries initialization instead of misclassifying it as a 0.2
 database.
 
-The version-3 physical shape documented here is the release shape, including
+The DDL emitted for a fresh version-3 store is the release shape, including the
 typed process wait/outcome columns. It replaced draft version-3 shapes before
 the 0.3 schema freeze; those development databases were never a supported
-release format. The strict shape probe rejects them, and the runtime does not
-present that rejection as a migration.
+release format. A version marker alone is insufficient: drafts missing a
+required table, required column, or canonical keyset collation are rejected,
+and the runtime does not present that rejection as a migration.
+
+The open-time compatibility probe is intentionally not a byte-for-byte DDL
+validator. Apart from the checks above, it does not compare column types,
+`NOT NULL`/`CHECK`/foreign-key/primary-key constraints, arbitrary collations,
+extra columns or objects, or the definitions and uniqueness of existing
+indexes. Idempotent initialization does not replace a same-named index with a
+different definition. Operators must create stores through this release's
+backend rather than treating a hand-built schema that passes the compatibility
+probe as canonical.
 
 Text columns that form durable startup, recovery, or retention keysets have a
 canonical bytewise collation: `BINARY` on SQLite and `"C"` on PostgreSQL. Both
@@ -76,11 +116,12 @@ validated column collation so SQLite retains composite row-value range seeks.
 SQLite database files and PostgreSQL servers must both use UTF-8 encoding;
 under UTF-8, `BINARY` and `"C"` ordering match Python's Unicode string ordering
 for persisted cursor values. Opening an existing version-3 store fails closed
-when its database encoding, any required keyset column, or any column collation
-is not canonical; the column metadata itself is checked with one set-based
-catalog probe. A UTF-16 SQLite file or locale-inheriting draft PostgreSQL schema
-is therefore rejected rather than silently paginating with a different order
-or degrading to a sort.
+when its database encoding, any required keyset text column, or any required
+keyset text-column collation is not canonical; those required column
+collations are checked with one set-based catalog probe. A UTF-16 SQLite file
+or locale-inheriting draft PostgreSQL schema is therefore rejected rather than
+silently paginating with a different order or degrading to a sort. This check
+does not validate the collation of text columns outside the keyset manifest.
 
 There are no migrations, backfills, or reconciliation paths from 0.2. A 0.2
 database is archive-only and must be opened with an archived 0.2 release. The
@@ -91,11 +132,15 @@ written.
 
 ## Transaction model
 
-Top-level UnitOfWork transactions use `BEGIN`/`COMMIT`; nested repository work
-uses savepoints. Repository helpers never commit independently while an outer
-transaction is active, so lifecycle changes can publish authority, process,
-object, extension, audit, event, operation, and protected-effect rows as one
-unit.
+Top-level `UnitOfWork.transaction()`/store transactions use `BEGIN`/`COMMIT`.
+An explicitly nested call to `transaction()`—including one made by a repository
+method—creates a savepoint. The low-level single-write helper
+`_join_or_begin_transaction()` instead joins an already active transaction
+without adding a savepoint or a second post-commit failure boundary; when no
+outer transaction exists, it opens and commits an explicit transaction.
+Neither path commits independently while an outer transaction is active, so
+lifecycle changes can publish authority, process, object, extension, audit,
+event, operation, and protected-effect rows as one unit.
 
 The PostgreSQL connection keeps connection-level autocommit enabled so a plain
 read does not leave an implicit transaction open. Every repository mutation,
@@ -185,10 +230,17 @@ Authority manifests, process/resource state, Human and process-message waits,
 LLM pending actions and context label history, registry state, explainable
 operations, audits, events, and protected external-effect intents.
 
-External effects use a prepared intent before provider dispatch. Settlement
-conditionally advances that same row to committed, not-started, partial,
-unknown, or other provider-classified outcomes. Capability-use reservations and
-effect settlement share the enclosing transaction and preserve revoke-wins and
+External effects use a `pending`/`prepared` intent before provider dispatch.
+The durable effect-state domain is `pending` or `finalized`; the durable
+transaction-state domain is `prepared`, `authorized`, `approved`, `dispatched`,
+`committed`, `failed`, `unknown`, or `compensated`. A provider certificate that
+the first effectful phase never started restores reservations and deletes the
+prepared intent, so there is no durable `not-started` transaction state. If a
+later phase is certified not started after an earlier effectful phase, the row
+is finalized as `committed` and records an outcome such as
+`partial_not_started_after_prior_provider_effect` in provider metadata;
+`partial` is not a transaction state. Capability-use reservations and effect
+settlement share the enclosing transaction and preserve revoke-wins and
 one-shot semantics.
 
 An operation's runtime-publication binding is stored in a normalized nullable
@@ -220,9 +272,26 @@ Once every valid prepared intent has restored its exact linked reservations,
 the authority repository abandons remaining `reserved` rows through the
 `(status, created_at, reservation_id)` keyset index. This ordering eliminates
 the former startup-wide external-effect JSON scan and its unbounded protected
-reservation set. Stale process executions similarly use a status/PID keyset
-index; each page commits the PAUSED transition, concurrency high-water, audit,
-and event evidence together while Runtime retains only a bounded PID sample.
+reservation set. Pending external effects are then reconciled without replay.
+
+Active resource-usage reservations are recovered next through bounded
+`(status, created_at, reservation_id)` keyset pages. A reservation whose linked
+effect is absent or still `prepared` is released as not started; a reservation
+whose surviving effect is in any other transaction state is conservatively
+treated as possibly dispatched and charged at its maximum. Recovery permits
+that charge to exceed the budget and commits any resulting resource-limit
+process termination with it. Runtime retains exact totals and only a
+page-bounded reservation-id sample.
+
+After publication, Object-payload, and JIT recovery, running explainable
+operations left by the prior Runtime are terminalized through bounded keyset
+pages. An operation whose causal tree has a pending or `unknown` external effect
+becomes `unknown`; the other stale running operations become `interrupted`.
+The temporary membership index and store lock keep the cross-page view stable,
+and Runtime retains exact totals plus a page-bounded operation-id sample.
+Stale process executions then use a status/PID keyset index; each page commits
+the `PAUSED` transition, concurrency high-water, audit, and event evidence
+together while Runtime retains only a bounded PID sample.
 
 Volatile Object payload cleanup is no longer a store-constructor side effect.
 Runtime assembly invokes it under the opaque recovery lease, traverses the
@@ -248,9 +317,9 @@ process launch. Recovery verifies the checkpoint plan anchor before replaying
 any reconciliation or durable-finalizer work, and terminal operation repair
 also requires the complete causal transcript.
 
-Orphaned `CREATED` processes use an indexed `NOT EXISTS`
-launch-publication query. Neither path materializes complete publication or
-process history.
+Orphaned `CREATED` process detection uses an indexed `NOT EXISTS`
+launch-publication query. Neither that query nor the publication-recovery paths
+above materialize complete publication or process history.
 
 Process tool tables also have a transactionally maintained normalized reverse
 projection in `process_tool_bindings`. Publication compensation checks an exact
@@ -276,9 +345,12 @@ streams only the indexed matching PIDs instead of materializing process rows.
 
 Data-flow evidence stores labels, source references, hashes, Sink/trust
 generation, and decisions—not payload copies. LLM pending actions and context
-generations retain canonical metadata-only `DataFlowContext` values. All
-required 0.3 columns are non-optional; malformed persisted state fails closed
-instead of being repaired heuristically.
+generations retain canonical metadata-only `DataFlowContext` values. The
+label/source JSON and pending-action context columns required by those records
+are non-null in the fresh 0.3 DDL, and row decoders require their canonical
+object shapes and complete security labels. Malformed persisted values fail
+closed instead of being repaired heuristically; other schema fields may still
+be nullable where their domain permits it.
 
 Process control state is persisted structurally. `wait_state_json` is a tagged
 child/message/human/tool/pause/Host-resume wait, `outcome_json` is a tagged
@@ -310,18 +382,34 @@ revalidates the complete product type and CAS fence and computes
 the same generation increment at their atomic commit point. Callers cannot
 supply or rewind the committed generation.
 
-These records are append-only or versioned through Runtime APIs, but are not
+Runtime APIs apply domain-specific mutation rules rather than one universal
+append-only/versioned policy. Audit records, events, operation-evidence links,
+and external-effect transition rows are appended. Mutable projections and
+lifecycle records—including processes, capabilities and their reservations,
+Human/message/LLM state, operations, Objects, and external-effect intents—are
+updated or deleted in place under their transaction, CAS, generation, or
+state-machine fences. None of these application-level rules is
 cryptographically tamper-proof against the Host or a database administrator.
-Independent integrity requires externally signed or append-only evidence.
+Independent integrity requires externally signed or independently append-only
+evidence.
 
 ## Active-runtime leases
 
 A persistent target is owned by one writable Runtime at a time.
 
-- File-backed SQLite canonicalizes the database path, secures database and
-  sidecar files, and on POSIX uses a non-blocking `flock` over an
-  `O_NOFOLLOW` sidecar. Where that mechanism is unavailable it uses SQLite
-  exclusive locking.
+- File-backed SQLite canonicalizes the database path on every platform. On the
+  tested POSIX path, when `O_NOFOLLOW` and `fchmod` are available, it rejects
+  unsafe file types and no-follow/path-identity violations for the canonical
+  database and existing SQLite sidecars, and tightens their mode to `0600`;
+  where `getuid` is available it also requires current-user ownership. An
+  existing database symlink is first resolved to its canonical target, so an
+  alias shares the same lease identity. When both `fcntl.flock` and
+  `O_NOFOLLOW` are available, the Runtime holds a non-blocking lock over a
+  separately hardened sidecar. Where that lease
+  mechanism is unavailable—including the Windows fallback—it uses SQLite
+  exclusive locking. The fallback provides the single-writer lease but does
+  not claim the POSIX ownership, mode, or no-follow hardening guarantees when
+  those operating-system primitives are absent.
 - PostgreSQL uses a session advisory lock derived from the database/schema
   identity. Session close is the single ownership-release point; close never
   attempts a separate explicit advisory unlock. Cleanup failures are reported
@@ -334,6 +422,7 @@ persistent target. Do not edit capability, trust, label, decision, or evidence
 rows directly; supported mutations must publish their coupled generation and
 audit/event evidence.
 
-See [CLI Reference](cli.md) for backend selection and
+See [Configuration Reference](configuration.md) for library and product
+configuration precedence, [CLI Reference](cli.md) for backend selection, and
 [Architecture](architecture.md) for the authority, evidence, primitive, and
 Runtime dependency boundaries.

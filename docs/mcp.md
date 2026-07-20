@@ -54,6 +54,47 @@ http:
 `stdio.env` maps child process environment variable names to host environment
 variable names. The runtime does not inherit the full host environment.
 
+The accepted v1 shape is closed: unknown server, transport, tool, or header
+fields are rejected instead of being silently ignored. `metadata` and JSON
+Schema contents remain application-defined mappings.
+
+| Mapping | Required fields | Optional fields and defaults |
+| --- | --- | --- |
+| server | `server_id`, `transport`, non-empty `tools`, and exactly the transport block selected by `transport` | `schema_version: 1`, `timeout_s: config.mcp.timeout_s`, `max_request_bytes: config.mcp.max_request_bytes`, `max_response_bytes: config.mcp.max_response_bytes`, `metadata: {}` |
+| `stdio` | non-empty single-token `command` | `args: []`, `env: {}`, `cwd: null` |
+| `http` | `url` | `headers: {}` |
+| tool | `tool_id`, `mcp_name`, `right`, `rollback_class`, `state_mutation`, `information_flow` | `rollback_status` as mapped below, `input_schema: {}`, `metadata: {}` |
+| HTTP header | `env` | `prefix: ""`, `suffix: ""` |
+
+`transport` is `stdio` or `streamable_http`; the inactive transport block is
+forbidden. `right` is `read`, `write`, or `execute`. `rollback_class` accepts
+`irreversible`, `rollbackable`, `no_rollback_required`, or `unknown`, while an
+explicit `rollback_status` accepts `not_supported`, `not_applied`,
+`not_required`, or `unknown`. If `rollback_status` is omitted, the default MCP
+provider maps it as follows:
+
+| `rollback_class` | Effective omitted `rollback_status` |
+| --- | --- |
+| `irreversible` | `not_supported` |
+| `rollbackable` | `not_applied` |
+| `no_rollback_required` | `not_required` |
+| `unknown` | `unknown` |
+
+An explicitly supplied `rollback_status` is preserved instead of applying this
+default mapping.
+
+A tool cannot combine `no_rollback_required` with `state_mutation: true`. A
+non-empty `input_schema` must be valid JSON Schema and is pinned against live
+tool metadata before calls.
+
+With `DEFAULT_CONFIG`, omitted limits resolve to `timeout_s: 10`,
+`max_request_bytes: 65,536`, and `max_response_bytes: 1,048,576`. Manifest
+values must be positive and cannot exceed the active hard limits (60 seconds,
+1,048,576 request bytes, and 8,388,608 response bytes by default). Manifest
+text is capped at 262,144 bytes. Server/tool ids are capped at 96 characters,
+`mcp_name` at 256, header names at 128, and resolved header values at 8,192;
+deployments may customize these values through `AgentLibOSConfig.mcp`.
+
 ## Authority
 
 Registry metadata authority:
@@ -133,14 +174,19 @@ clearance is enforced before argument-schema validation that could otherwise
 start a stdio provider, runtime env resolution, live validation, DNS, stdio
 spawn, or `call_tool`.
 
-Cached `list_tools(refresh=false)` reads registered metadata only and is treated
-as public. A process-initiated live refresh is a bidirectional protected
+Cached `list_tools(refresh=false)` reads and returns registered manifest
+metadata only (`refreshed: false`, `response_bytes: 0`); it does not resolve
+environment variables, start a transport, create a provider-effect row, or
+compare live schemas. A process-initiated live refresh is a bidirectional protected
 provider operation with Sink `mcp:<server_id>:list_tools`: the caller's current
 flow context is checked before DNS/stdio/provider dispatch, and live metadata
 or an after-dispatch provider error is aggregated back as `normal/untrusted`
 ingress. A provider-certified not-started failure adds no ingress. A
 Host-internal refresh with no process actor uses a public/verified request
-context. A trusted MCP Sink does not grant the MCP tool right, `process:spawn`, exact
+context. A successful refresh returns the manifest entries plus each matched
+tool's live name, description, schema, and `schema_matches_manifest` result; it
+does not add undeclared live tools to the callable set. A trusted MCP Sink does
+not grant the MCP tool right, `process:spawn`, exact
 `mcp_stdio:<hash>` execute authority, effect permission, or budget. Conditional
 release is exact and one-shot; untrusted MCP cannot send above `normal`.
 
@@ -154,14 +200,28 @@ See [Data Flow](data_flow.md).
 
 ## Security Rules
 
-Only manifest-declared tools may be called. Argument schema failures, missing
-runtime environment variables, request-size failures, resource-budget preflight
-failures, and preflight external-effect classifier failures happen before
-finite authority is reserved. For non-local Streamable HTTP, reservation and
-pending-effect persistence precede DNS because host resolution is itself an
-external observation; an ordinary DNS failure therefore consumes the use and
-finalizes information-flow evidence even without a tool request. The primitive
-asks the provider for live tool metadata and fails closed if the
+Only manifest-declared tools may be called. Argument-schema and request-size
+validation happen before protected preparation; the preflight classifier runs
+at the beginning of preparation. Finite capability reservations, the pending
+effect intent, and the maximum resource-usage reservation are then created in
+one transaction, so a resource-reservation failure rolls all three back.
+Runtime environment resolution has operation-specific ordering:
+
+- cached `list_tools(refresh=false)` performs no resolution;
+- live `list_tools(refresh=true)` resolves and validates its HTTP headers or
+  stdio environment before finite composite authority is reserved or a pending
+  effect is created, so a missing value leaves neither reservation nor intent;
+- `call_tool` resolves the same values after finite tool/stdio authority has
+  been reserved and the pending call intent prepared, but before DNS, stdio
+  snapshot/spawn, live validation, or tool dispatch. A missing or invalid value
+  therefore takes the no-provider-start path, restoring all reservations and
+  abandoning that intent.
+
+For non-local Streamable HTTP, reservation and pending-effect persistence
+precede DNS because host resolution is itself an external observation; an
+ordinary DNS failure therefore consumes the use and finalizes information-flow
+evidence even without a tool request. The primitive asks the provider for live
+tool metadata and fails closed if the
 server no longer exposes the tool or if a pinned `input_schema` changed; those
 post-boundary failures do not restore the use.
 
@@ -205,16 +265,20 @@ avoid an encoded response expanding past the raw limit.
 
 ## External Effects
 
-A refreshed `list_tools` call atomically reserves its finite composite
-authority and persists an `external_effects` row with provider `mcp`, operation
-`list_tools`, and `effect_state: pending` before non-local DNS or the live
-metadata request. Its event/audit/classification path CASes the same
+A refreshed `list_tools` call first validates runtime environment values, then
+atomically reserves its finite composite authority and persists an
+`external_effects` row with provider `mcp`, operation `list_tools`, and
+`effect_state: pending` before non-local DNS or the live metadata request. Its
+event/audit/classification path CASes the same
 `effect_id` to `finalized`. If the provider raises or a post-provider sink
 fails, the operation is finalized conservatively when possible; otherwise the
 pending/unknown row remains durable.
 
 `call_tool` similarly reserves deduplicated main/stdio authority and creates one
-pending row after local preflight. That intent spans non-local DNS, the
+pending row after local preflight. Runtime environment values are resolved
+after this preparation but before the first provider phase; a failure there
+restores/abandons the reservation and row. Once environment resolution passes,
+that intent spans non-local DNS, the
 mandatory live tool-metadata validation, and the actual tool call: once DNS or
 either live provider boundary is crossed, schema drift, transport failure,
 event/audit failure, or post-call classifier failure cannot be interpreted as

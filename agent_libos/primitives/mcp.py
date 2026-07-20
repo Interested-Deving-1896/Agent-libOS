@@ -86,6 +86,43 @@ _ALLOWED_HEADER_SUFFIXES = {""}
 _TRANSPORTS = {"stdio", "streamable_http"}
 _STDIO_EXECUTABLE_IDENTITY_UNSET = object()
 _PROVIDER_RESULT_RETURNED_ATTR = "_agent_libos_provider_result_returned"
+_SERVER_FIELDS = {
+    "schema_version",
+    "server_id",
+    "transport",
+    "stdio",
+    "http",
+    "tools",
+    "timeout_s",
+    "max_request_bytes",
+    "max_response_bytes",
+    "metadata",
+}
+_STDIO_FIELDS = {"command", "args", "env", "cwd"}
+_HTTP_FIELDS = {"url", "headers"}
+_TOOL_FIELDS = {
+    "tool_id",
+    "mcp_name",
+    "right",
+    "rollback_class",
+    "rollback_status",
+    "state_mutation",
+    "information_flow",
+    "input_schema",
+    "metadata",
+}
+_HEADER_FIELDS = {"env", "prefix", "suffix"}
+
+
+def _reject_unknown_fields(
+    value: dict[str, Any],
+    allowed: set[str],
+    *,
+    context: str,
+) -> None:
+    unknown = sorted(str(field) for field in value if field not in allowed)
+    if unknown:
+        raise ValidationError(f"unknown {context} fields: {unknown}")
 
 
 def _mark_provider_result_returned(error: ProviderHostError) -> ProviderHostError:
@@ -2434,6 +2471,7 @@ class McpPrimitive:
             # spec and its decoded live model hash differently.
             value = to_jsonable(value)
         if isinstance(value, dict):
+            _reject_unknown_fields(value, _SERVER_FIELDS, context="MCP server")
             transport = str(value.get("transport", "") or "").strip()
             server_id = self._required(value, "server_id", "MCP server")
             spec = McpServerSpec(
@@ -2474,6 +2512,7 @@ class McpPrimitive:
     def _stdio_spec(self, value: Any) -> McpStdioTransportSpec:
         if not isinstance(value, dict):
             raise ValidationError("MCP stdio transport requires stdio object")
+        _reject_unknown_fields(value, _STDIO_FIELDS, context="MCP stdio")
         return McpStdioTransportSpec(
             command=str(value.get("command", "")),
             args=[str(item) for item in list(value.get("args") or [])],
@@ -2484,6 +2523,7 @@ class McpPrimitive:
     def _http_spec(self, value: Any) -> McpHttpTransportSpec:
         if not isinstance(value, dict):
             raise ValidationError("MCP streamable_http transport requires http object")
+        _reject_unknown_fields(value, _HTTP_FIELDS, context="MCP HTTP")
         return McpHttpTransportSpec(
             url=str(value.get("url", "")),
             headers=self._header_specs(value.get("headers") or {}),
@@ -2492,6 +2532,7 @@ class McpPrimitive:
     def _tool_spec(self, value: Any) -> McpToolSpec:
         if not isinstance(value, dict):
             raise ValidationError("MCP tools entries must be objects")
+        _reject_unknown_fields(value, _TOOL_FIELDS, context="MCP tool")
         return McpToolSpec(
             tool_id=str(self._required(value, "tool_id", "MCP tool")),
             mcp_name=str(self._required(value, "mcp_name", "MCP tool")),
@@ -2618,6 +2659,11 @@ class McpPrimitive:
         for name, spec in value.items():
             if not isinstance(spec, dict):
                 raise ValidationError(f"MCP header {name} must be an object")
+            _reject_unknown_fields(
+                spec,
+                _HEADER_FIELDS,
+                context=f"MCP header {name}",
+            )
             headers[str(name)] = McpHeaderSpec(
                 env=str(self._required(spec, "env", f"MCP header {name}")),
                 prefix=str(spec.get("prefix", "")),

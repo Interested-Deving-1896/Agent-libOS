@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import (
+    CapabilityEffect,
     CapabilityRight,
     EventType,
     ObjectHandle,
@@ -550,6 +551,69 @@ class TestObjectTasks:
         finally:
             runtime.close()
 
+    def test_object_task_start_consumes_finite_spawn_attempt_before_runner_creation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="finite object task spawn attempt",
+            )
+            spawn_cap = runtime.capability.issue_trusted(
+                subject=pid,
+                resource="process:spawn",
+                rights=[CapabilityRight.WRITE.value],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            owner = _owner(runtime, pid)
+            before_process_ids = {
+                process.pid for process in runtime.store.list_processes()
+            }
+
+            def fail_before_runner(*_args: object, **_kwargs: object) -> str:
+                raise RuntimeError("runner creation failed before publication")
+
+            monkeypatch.setattr(
+                runtime.object_tasks._process,
+                "spawn_child",
+                fail_before_runner,
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="runner creation failed before publication",
+            ):
+                runtime.object_tasks.start(
+                    pid,
+                    owner,
+                    "get_working_directory",
+                    {},
+                )
+
+            assert {
+                process.pid for process in runtime.store.list_processes()
+            } == before_process_ids
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+            assert runtime.store.get_capability(spawn_cap.cap_id).uses_remaining == 0
+            assert any(
+                record.action == "capability.consume"
+                and spawn_cap.cap_id in record.capability_refs
+                for record in runtime.audit.trace()
+            )
+            assert not any(
+                event.type == EventType.OBJECT_TASK_STARTED
+                for event in runtime.store.list_events()
+            )
+            assert not any(
+                record.action == "object_task.start"
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
     def test_object_task_runner_does_not_inherit_external_capability_unless_explicit(self, tmp_path: Path) -> None:
         runtime = Runtime.open("local", substrate=LocalResourceProviderSubstrate(tmp_path))
         try:
@@ -662,10 +726,13 @@ class TestObjectTasks:
             )
             original_assert = runtime.object_tasks._assert_owner_rights
             authorized = threading.Barrier(2)
+            synchronized_thread = threading.local()
 
             def synchronized_assert(pid: str, handle: ObjectHandle, rights: set[str]) -> list[object]:
                 decisions = original_assert(pid, handle, rights)
-                authorized.wait(timeout=2)
+                if not getattr(synchronized_thread, "preflight_complete", False):
+                    synchronized_thread.preflight_complete = True
+                    authorized.wait(timeout=2)
                 return decisions
 
             monkeypatch.setattr(runtime.object_tasks, "_assert_owner_rights", synchronized_assert)
@@ -690,6 +757,195 @@ class TestObjectTasks:
             assert completed.status == ObjectTaskStatus.SUCCEEDED
             assert runtime.store.get_capability(cap.cap_id).uses_remaining == 0
             assert len(runtime.store.list_object_tasks(include_terminal=True)) == 1
+        finally:
+            runtime.close()
+
+    def test_object_task_start_reauthorizes_owner_rights_before_reservation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="owner authority race parent",
+            )
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "object task creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                ],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            one_time_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                },
+                capability_id=cap.cap_id,
+            )
+            original_assert = runtime.object_tasks._assert_owner_rights
+            deny_injected = False
+
+            def deny_after_preflight(
+                pid: str,
+                handle: ObjectHandle,
+                rights: set[str],
+            ) -> list[object]:
+                nonlocal deny_injected
+                decisions = original_assert(pid, handle, rights)
+                if not deny_injected:
+                    runtime.capability.issue_trusted(
+                        subject=pid,
+                        resource=f"object:{handle.oid}",
+                        rights=[ObjectRight.LINK.value],
+                        issued_by="test.authority-race",
+                        effect=CapabilityEffect.DENY,
+                    )
+                    deny_injected = True
+                return decisions
+
+            monkeypatch.setattr(
+                runtime.object_tasks,
+                "_assert_owner_rights",
+                deny_after_preflight,
+            )
+            before_process_ids = {
+                process.pid for process in runtime.store.list_processes()
+            }
+
+            with pytest.raises(CapabilityDenied, match="capability lacks link"):
+                runtime.object_tasks.start(
+                    child,
+                    one_time_owner,
+                    "get_working_directory",
+                    {},
+                )
+
+            assert {
+                process.pid for process in runtime.store.list_processes()
+            } == before_process_ids
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            assert not any(
+                event.type == EventType.OBJECT_TASK_STARTED
+                for event in runtime.store.list_events()
+            )
+            assert not any(
+                record.action == "object_task.start"
+                for record in runtime.audit.trace()
+            )
+        finally:
+            runtime.close()
+
+    def test_object_task_start_rejects_revoked_named_handle_despite_broad_allow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="stale owner handle parent",
+            )
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "object task creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            named_cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                ],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            runtime.capability.issue_trusted(
+                subject=child,
+                resource="object:*",
+                rights=[
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                ],
+                issued_by="test.broad-authority",
+            )
+            stale_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                },
+                capability_id=named_cap.cap_id,
+            )
+            original_assert = runtime.object_tasks._assert_owner_rights
+            revoked = False
+
+            def revoke_after_preflight(
+                pid: str,
+                handle: ObjectHandle,
+                rights: set[str],
+            ) -> list[object]:
+                nonlocal revoked
+                decisions = original_assert(pid, handle, rights)
+                if not revoked:
+                    runtime.capability.revoke(
+                        named_cap.cap_id,
+                        revoked_by="test.authority-race",
+                        reason="invalidate named Object handle after preflight",
+                        require_authority=False,
+                    )
+                    revoked = True
+                return decisions
+
+            monkeypatch.setattr(
+                runtime.object_tasks,
+                "_assert_owner_rights",
+                revoke_after_preflight,
+            )
+            before_process_ids = {
+                process.pid for process in runtime.store.list_processes()
+            }
+
+            with pytest.raises(CapabilityDenied, match="invalid object capability"):
+                runtime.object_tasks.start(
+                    child,
+                    stale_owner,
+                    "get_working_directory",
+                    {},
+                )
+
+            assert runtime.capability.check(
+                child,
+                f"object:{owner.oid}",
+                ObjectRight.LINK,
+            )
+            assert {
+                process.pid for process in runtime.store.list_processes()
+            } == before_process_ids
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+            assert not any(
+                event.type == EventType.OBJECT_TASK_STARTED
+                for event in runtime.store.list_events()
+            )
+            assert not any(
+                record.action == "object_task.start"
+                for record in runtime.audit.trace()
+            )
         finally:
             runtime.close()
 
@@ -744,6 +1000,301 @@ class TestObjectTasks:
             assert runtime.capability.list_subject(runner_pids[0], include_inactive=True) == []
             assert runtime.store.list_object_tasks(include_terminal=True) == []
             assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+        finally:
+            runtime.close()
+
+    def test_object_task_start_link_evidence_failure_rolls_back_and_restores_owner(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="object task link evidence rollback parent",
+            )
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "object task creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            owner_cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                ],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            one_time_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                },
+                capability_id=owner_cap.cap_id,
+            )
+            runner_pids: list[str] = []
+            original_spawn_child = runtime.object_tasks._process.spawn_child
+            original_link_evidence = runtime.object_tasks._operations.link_evidence
+
+            def capture_runner(*args: object, **kwargs: object) -> str:
+                runner_pid = original_spawn_child(*args, **kwargs)
+                runner_pids.append(runner_pid)
+                return runner_pid
+
+            def fail_object_task_link(
+                entity_type: str,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                if entity_type == "object_task":
+                    raise RuntimeError("object task operation link failed")
+                return original_link_evidence(entity_type, *args, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.object_tasks._process,
+                "spawn_child",
+                capture_runner,
+            )
+            monkeypatch.setattr(
+                runtime.object_tasks._operations,
+                "link_evidence",
+                fail_object_task_link,
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="object task operation link failed",
+            ):
+                runtime.object_tasks.start(
+                    child,
+                    one_time_owner,
+                    "get_working_directory",
+                    {},
+                )
+
+            assert len(runner_pids) == 1
+            assert runtime.store.get_process(runner_pids[0]) is None
+            assert runtime.capability.list_subject(
+                runner_pids[0],
+                include_inactive=True,
+            ) == []
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+            assert runtime.store.get_capability(owner_cap.cap_id).uses_remaining == 1
+            reservations = [
+                row
+                for row in runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                )
+                if row["cap_id"] == owner_cap.cap_id
+            ]
+            assert [row["status"] for row in reservations] == ["restored"]
+            actions = [record.action for record in runtime.audit.trace()]
+            assert "capability.restore_reserved_use" in actions
+            assert "object_task.runner_cleanup" in actions
+            assert "object_task.start" not in actions
+            assert not any(
+                event.type == EventType.OBJECT_TASK_STARTED
+                for event in runtime.store.list_events()
+            )
+        finally:
+            runtime.close()
+
+    def test_object_task_start_skips_owner_restore_when_runner_cleanup_is_unconfirmed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        runner_pids: list[str] = []
+        original_cleanup = runtime.object_tasks._process.cleanup_failed_launch
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="object task incomplete cleanup parent",
+            )
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "object task creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            owner_cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                ],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            one_time_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                },
+                capability_id=owner_cap.cap_id,
+            )
+            original_spawn_child = runtime.object_tasks._process.spawn_child
+            original_link_evidence = runtime.object_tasks._operations.link_evidence
+
+            def capture_runner(*args: object, **kwargs: object) -> str:
+                runner_pid = original_spawn_child(*args, **kwargs)
+                runner_pids.append(runner_pid)
+                return runner_pid
+
+            def preserve_runner(_runner_pid: str) -> None:
+                raise RuntimeError("runner cleanup failed")
+
+            def fail_object_task_link(
+                entity_type: str,
+                *args: object,
+                **kwargs: object,
+            ) -> object:
+                if entity_type == "object_task":
+                    raise RuntimeError("object task publication failed")
+                return original_link_evidence(entity_type, *args, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.object_tasks._process,
+                "spawn_child",
+                capture_runner,
+            )
+            monkeypatch.setattr(
+                runtime.object_tasks._process,
+                "cleanup_failed_launch",
+                preserve_runner,
+            )
+            monkeypatch.setattr(
+                runtime.object_tasks._operations,
+                "link_evidence",
+                fail_object_task_link,
+            )
+
+            with pytest.raises(
+                RuntimeError,
+                match="object task publication failed",
+            ):
+                runtime.object_tasks.start(
+                    child,
+                    one_time_owner,
+                    "get_working_directory",
+                    {},
+                )
+
+            assert len(runner_pids) == 1
+            assert runtime.store.get_process(runner_pids[0]) is not None
+            assert runtime.capability.list_subject(
+                runner_pids[0],
+                include_inactive=True,
+            )
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+            assert runtime.store.get_capability(owner_cap.cap_id).uses_remaining == 0
+            reservations = [
+                row
+                for row in runtime.store.select_table_rows(
+                    "capability_use_reservations",
+                    order_by="reservation_id",
+                )
+                if row["cap_id"] == owner_cap.cap_id
+            ]
+            assert [row["status"] for row in reservations] == ["reserved"]
+            actions = [record.action for record in runtime.audit.trace()]
+            assert "object_task.runner_cleanup_incomplete" in actions
+            assert "object_task.owner_permission_restore_skipped" in actions
+            assert "capability.restore_reserved_use" not in actions
+            assert "object_task.start" not in actions
+            assert not any(
+                event.type == EventType.OBJECT_TASK_STARTED
+                for event in runtime.store.list_events()
+            )
+        finally:
+            for runner_pid in runner_pids:
+                original_cleanup(runner_pid)
+            runtime.close()
+
+    def test_object_task_start_rolls_back_task_when_owner_commit_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        runtime = Runtime.open("local")
+        try:
+            parent = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="one time owner commit rejection parent",
+            )
+            _grant_process_spawn(runtime, parent)
+            child = runtime.spawn_child_process(parent, "object task creator")
+            _grant_process_spawn(runtime, child)
+            owner = _owner(runtime, parent)
+            cap = runtime.capability.issue_trusted(
+                subject=child,
+                resource=f"object:{owner.oid}",
+                rights=[
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                ],
+                issued_by="test",
+                uses_remaining=1,
+            )
+            one_time_owner = ObjectHandle(
+                oid=owner.oid,
+                rights={
+                    ObjectRight.READ.value,
+                    ObjectRight.WRITE.value,
+                    ObjectRight.LINK.value,
+                },
+                capability_id=cap.cap_id,
+            )
+            runner_pids: list[str] = []
+            original_spawn_child = runtime.object_tasks._process.spawn_child
+
+            def capture_runner(*args: object, **kwargs: object) -> str:
+                runner_pid = original_spawn_child(*args, **kwargs)
+                runner_pids.append(runner_pid)
+                return runner_pid
+
+            monkeypatch.setattr(
+                runtime.object_tasks._process,
+                "spawn_child",
+                capture_runner,
+            )
+            monkeypatch.setattr(
+                runtime.object_tasks._capabilities,
+                "commit_reserved_use",
+                lambda *_args, **_kwargs: False,
+            )
+
+            with pytest.raises(
+                CapabilityDenied,
+                match="owner permission reservation could not be committed",
+            ):
+                runtime.object_tasks.start(
+                    child,
+                    one_time_owner,
+                    "get_working_directory",
+                    {},
+                )
+
+            assert len(runner_pids) == 1
+            assert runtime.store.get_process(runner_pids[0]) is None
+            assert runtime.capability.list_subject(
+                runner_pids[0],
+                include_inactive=True,
+            ) == []
+            assert runtime.store.list_object_tasks(include_terminal=True) == []
+            assert runtime.store.get_capability(cap.cap_id).uses_remaining == 1
+            actions = [record.action for record in runtime.audit.trace()]
+            assert "capability.restore_reserved_use" in actions
+            assert "object_task.runner_cleanup" in actions
+            assert "object_task.start" not in actions
         finally:
             runtime.close()
 
@@ -2305,6 +2856,80 @@ class TestObjectTasks:
             assert reopened.list_events() == before_events
         finally:
             reopened.close()
+
+    def test_concurrent_object_task_start_rechecks_per_object_limit_at_publish(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = replace(
+            DEFAULT_CONFIG,
+            object_tasks=replace(
+                DEFAULT_CONFIG.object_tasks,
+                max_running_per_object=1,
+            ),
+        )
+        runtime = Runtime.open("local", config=config)
+        try:
+            pid = runtime.process.spawn(
+                image="base-agent:v0",
+                goal="concurrent object task capacity",
+            )
+            _grant_process_spawn(runtime, pid)
+            owner = _owner(runtime, pid)
+            original_require_capacity = (
+                runtime.object_tasks._require_concurrency_capacity
+            )
+            preflight_barrier = threading.Barrier(2)
+            synchronized_thread = threading.local()
+
+            def synchronize_preflight(owner_oid: str) -> None:
+                original_require_capacity(owner_oid)
+                if not getattr(
+                    synchronized_thread,
+                    "capacity_preflight_complete",
+                    False,
+                ):
+                    synchronized_thread.capacity_preflight_complete = True
+                    preflight_barrier.wait(timeout=2)
+
+            monkeypatch.setattr(
+                runtime.object_tasks,
+                "_require_concurrency_capacity",
+                synchronize_preflight,
+            )
+
+            def start() -> ObjectTask:
+                return runtime.object_tasks.start(
+                    pid,
+                    owner,
+                    "receive_process_messages",
+                    {"channel": "never"},
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(start) for _ in range(2)]
+                outcomes: list[ObjectTask] = []
+                errors: list[BaseException] = []
+                for future in futures:
+                    try:
+                        outcomes.append(future.result(timeout=3))
+                    except BaseException as exc:
+                        errors.append(exc)
+
+            assert len(outcomes) == 1
+            assert len(errors) == 1
+            assert isinstance(errors[0], ValidationError)
+            assert "per-object concurrency limit" in str(errors[0])
+            waiting = runtime.object_tasks.wait(
+                outcomes[0].task_id,
+                actor_pid=pid,
+                timeout=2,
+            )
+            assert waiting.status == ObjectTaskStatus.WAITING_MESSAGE
+            assert len(runtime.store.list_object_tasks(include_terminal=False)) == 1
+            assert len(runtime.store.list_child_processes(pid)) == 1
+        finally:
+            runtime.close()
 
     def test_object_task_per_object_concurrency_limit_is_enforced(self) -> None:
         config = replace(

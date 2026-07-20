@@ -28,11 +28,13 @@ decided only when a libOS primitive runs under that process id. Capability
 checks, policy, human approval, provider containment, external-effect
 classification, events, and audit all happen at that primitive boundary.
 Trusted source labels propagate through runtime Objects, messages, Tool/JIT
-results, Human answers, and provider ingress. Before runtime-mediated egress,
-the Host resolves a canonical Sink identity and clearance from its durable
-registry; a model cannot declare a Sink trusted. Conditional high-sensitivity
-egress requires an exact one-shot Human release bound to the Sink, payload,
-source versions, labels, manifest, and registry generation.
+results, Human answers, and provider ingress. Before runtime-mediated external
+egress, the Host resolves a canonical Sink identity and clearance from its
+durable registry; a model cannot declare a Sink trusted. Conditional
+high-sensitivity egress requires an exact one-shot Human release bound to the
+Sink, payload, source versions, labels, manifest, and registry generation.
+Internal process handoff is not cleared as an external Sink: it preserves
+labels and must fit the receiving process's Task Authority receive-domain.
 
 The contribution is not a larger tool catalog. The contribution is a runtime
 substrate for capability-controlled self-evolution.
@@ -54,9 +56,18 @@ substrate for capability-controlled self-evolution.
    HTTP client endpoints, MCP client tools over registered servers, and
    Deno/TypeScript JIT tools that can reach libOS only through syscall RPC.
    The same implementation carries trusted data-flow labels, enforces
-   Host-owned Sink clearance at filesystem, LLM, Human, JSON-RPC, MCP, Shell,
-   PTY, process, and GUI presentation boundaries, and routes provider ingress
-   through the shared Protected Operation SDK.
+   Host-owned Sink clearance at filesystem-write, LLM, Human, JSON-RPC, MCP,
+   Shell, PTY, and GUI presentation boundaries, checks internal process handoff
+   against the receiving Task Authority Manifest's data-flow policy, and routes
+   provider ingress through the shared Protected Operation SDK. The protected
+   prepare transaction reauthorizes and reserves finite capability/release
+   authority together with its durable external-effect intent; provider side
+   effects remain outside that transaction, so ambiguous dispatched outcomes
+   remain explicit recovery inputs. Launch, exec, fork, and checkpoint restore
+   use separate, recovery-bound runtime publications. See the exact
+   [data-flow contract](data_flow.md),
+   [protected-operation lifecycle](protected_operation_sdk.md), and
+   [publication reconciliation model](explainable_operations.md).
 
 3. Benchmark suite.
    The current implementation includes an M1 deterministic runtime-safety
@@ -110,8 +121,10 @@ complete comparative paper evaluation.
   and authority even when prompt content is adversarial.
 - Agent libOS does not roll back irreversible external side effects.
   Checkpoint restore reconstructs scoped runtime state; provider-classified
-  external effects are append-only and report-only unless a future provider
-  compensation API implements explicit repair.
+  external effects remain in durable history and are report-only unless a
+  future provider compensation API implements explicit repair. Their prepared
+  intent rows are finalized or retention-reduced in place under guarded state
+  transitions rather than forming a cryptographically append-only ledger.
 - Agent libOS does not rely on MCP, GitHub, OpenAI Agents SDK, LangGraph, or
   any external framework as a trusted security boundary. Those systems are
   workload inspiration or adapter targets; the authority boundary is inside
@@ -127,6 +140,11 @@ complete comparative paper evaluation.
   Trusted provider/module code and a direct RuntimeStore administrator remain
   inside the Host TCB, and local evidence is not cryptographically tamper-proof
   against that administrator.
+- Data labels and Sink clearance are not at-rest encryption or automatic
+  deletion. Optional [payload-retention maintenance](evidence_payload_retention.md)
+  is Host-triggered and disabled by default; it monotonically reduces eligible
+  terminal LLM/external-effect provider payloads while retaining causal
+  identity, classification, links, and digests needed for evidence.
 
 ## Current Submission Story
 

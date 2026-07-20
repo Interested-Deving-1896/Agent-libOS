@@ -105,6 +105,146 @@ def test_host_manifest_is_hashed_persisted_and_compiles_only_declared_authority(
         reopened.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("permitted_effect", ["filesystem.*"]),
+        ("expiry_at", "2030-01-01T00:00:00Z"),
+    ],
+    ids=["permitted-effects-typo", "expires-at-typo"],
+)
+def test_manifest_rejects_unknown_top_level_fields(field: str, value: object) -> None:
+    runtime = Runtime.open("local")
+    try:
+        with pytest.raises(
+            ValidationError,
+            match="authority manifest contains unsupported fields",
+        ):
+            runtime.process.spawn(
+                goal="reject misspelled authority",
+                authority_manifest={field: value},
+            )
+    finally:
+        runtime.close()
+
+
+def test_manifest_rejects_mixed_non_string_unknown_fields_without_side_effects() -> None:
+    runtime = Runtime.open("local")
+    try:
+        before_processes = runtime.store.list_processes()
+        before_events = runtime.store.list_events()
+        before_audit = runtime.store.list_audit()
+        with pytest.raises(
+            ValidationError,
+            match="authority manifest contains unsupported fields",
+        ):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_invalid_manifest",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied={2: "invalid", "typo": "invalid"},  # type: ignore[dict-item]
+            )
+        assert runtime.store.list_processes() == before_processes
+        assert runtime.store.list_events() == before_events
+        assert runtime.store.list_audit() == before_audit
+        assert runtime.authority_manifests.get_for_process("pid_invalid_manifest") is None
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {
+            "authorized_capabilities": [
+                {
+                    "resource": "filesystem:workspace:report.txt",
+                    "rights": [CapabilityRight.READ.value],
+                    "permitted_effects": ["filesystem.*"],
+                }
+            ]
+        },
+        {
+            "approval_policy": {
+                "requestable_capabilities": [
+                    {
+                        "resource": "filesystem:workspace:report.txt",
+                        "rights": [CapabilityRight.READ.value],
+                        "expire_at": "2030-01-01T00:00:00Z",
+                    }
+                ]
+            }
+        },
+    ],
+    ids=["authorized", "requestable"],
+)
+def test_manifest_rejects_unknown_capability_entry_fields(
+    manifest: dict[str, object],
+) -> None:
+    runtime = Runtime.open("local")
+    try:
+        with pytest.raises(
+            ValidationError,
+            match="authority manifest capability entry contains unsupported fields",
+        ):
+            runtime.process.spawn(
+                goal="reject misplaced capability policy",
+                authority_manifest=manifest,
+            )
+    finally:
+        runtime.close()
+
+
+def test_data_flow_policy_requires_lists_in_python_manifests() -> None:
+    runtime = Runtime.open("local")
+    try:
+        with pytest.raises(
+            ValidationError,
+            match=r"data_flow_policy\.allowed_tenants must be a list",
+        ):
+            runtime.process.spawn(
+                goal="reject tuple identity policy",
+                authority_manifest={
+                    "data_flow_policy": {
+                        "allowed_tenants": ("tenant-a",),
+                        "allowed_principals": [],
+                    }
+                },
+            )
+    finally:
+        runtime.close()
+
+
+def test_data_flow_policy_rejects_mixed_non_string_unknown_fields() -> None:
+    runtime = Runtime.open("local")
+    try:
+        with pytest.raises(
+            ValidationError,
+            match="data_flow_policy contains unsupported fields",
+        ):
+            runtime.authority_manifests.prepare_launch(
+                pid="pid_invalid_data_flow_policy",
+                image_id="base-agent:v0",
+                goal_ref=None,
+                supplied={
+                    "data_flow_policy": {
+                        "allowed_tenants": [],
+                        "allowed_principals": [],
+                        2: "invalid",
+                        "typo": "invalid",
+                    }
+                },
+            )
+        assert (
+            runtime.authority_manifests.get_for_process(
+                "pid_invalid_data_flow_policy"
+            )
+            is None
+        )
+    finally:
+        runtime.close()
+
+
 def test_model_permission_request_outside_manifest_is_denied_before_human_request() -> None:
     runtime = Runtime.open("local")
     try:
@@ -207,6 +347,64 @@ def test_implicit_manifest_denies_model_requests_but_preserves_host_transition_a
         )
 
         assert runtime.capability.check(child, resource, CapabilityRight.READ)
+    finally:
+        runtime.close()
+
+
+def test_implicit_manifest_records_host_launch_capabilities() -> None:
+    runtime = Runtime.open("local")
+    try:
+        resource = "filesystem:workspace:reports/launch-granted.txt"
+        pid = runtime.process.spawn(
+            image="base-agent:v0",
+            goal="implicit launch authority",
+            capabilities=[
+                {
+                    "resource": resource,
+                    "rights": [CapabilityRight.READ.value],
+                }
+            ],
+        )
+
+        manifest = runtime.authority_manifests.get_for_process(pid)
+        assert manifest is not None
+        assert manifest.authorized_capabilities[0]["resource"] == resource
+        assert manifest.authorized_capabilities[0]["rights"] == [
+            CapabilityRight.READ.value
+        ]
+        assert manifest.metadata["explicit"] is False
+        assert manifest.metadata["transition_ceiling"] is False
+        assert runtime.capability.check(pid, resource, CapabilityRight.READ)
+        runtime.authority_manifests.assert_capability_request(
+            pid,
+            resource,
+            [CapabilityRight.READ.value],
+        )
+    finally:
+        runtime.close()
+
+
+def test_explicit_empty_object_keeps_host_launch_capabilities_as_ceiling() -> None:
+    runtime = Runtime.open("local")
+    try:
+        resource = "filesystem:workspace:reports/explicit-launch.txt"
+        pid = runtime.process.spawn(
+            goal="explicit launch authority",
+            capabilities=[
+                {
+                    "resource": resource,
+                    "rights": [CapabilityRight.READ.value],
+                }
+            ],
+            authority_manifest={},
+        )
+
+        manifest = runtime.authority_manifests.get_for_process(pid)
+        assert manifest is not None
+        assert manifest.authorized_capabilities[0]["resource"] == resource
+        assert manifest.metadata["explicit"] is True
+        assert manifest.metadata["transition_ceiling"] is True
+        assert runtime.capability.check(pid, resource, CapabilityRight.READ)
     finally:
         runtime.close()
 
@@ -464,9 +662,13 @@ def test_manifest_max_delegation_depth_is_compiled_and_cannot_be_broadened() -> 
         runtime.close()
 
 
-def test_checkpoint_fork_preserves_explicit_manifest_effect_ceiling() -> None:
+def test_checkpoint_fork_preserves_explicit_manifest_policy_ceilings() -> None:
     runtime = Runtime.open("local")
     try:
+        requestable = {
+            "resource": "filesystem:workspace:later.txt",
+            "rights": [CapabilityRight.READ.value],
+        }
         parent = runtime.process.spawn(
             goal="checkpoint manifest source",
             authority_manifest={
@@ -477,8 +679,20 @@ def test_checkpoint_fork_preserves_explicit_manifest_effect_ceiling() -> None:
                     }
                 ],
                 "permitted_effects": ["filesystem.*"],
+                "resource_budget": {"max_tool_calls": 7},
+                "approval_policy": {
+                    "mode": "operator",
+                    "requestable_capabilities": [requestable],
+                },
+                "data_flow_policy": {
+                    "schema_version": 1,
+                    "allowed_tenants": [],
+                    "allowed_principals": [],
+                },
+                "expires_at": "2030-01-01T00:00:00Z",
             },
         )
+        source_manifest = runtime.authority_manifests.get_for_process(parent)
         checkpoint_id = runtime.checkpoint.create(parent, "fork manifest", require_capability=False)
 
         fork = runtime.checkpoint.fork_from_checkpoint(
@@ -490,7 +704,28 @@ def test_checkpoint_fork_preserves_explicit_manifest_effect_ceiling() -> None:
         manifest = runtime.authority_manifests.get_for_process(fork_pid)
 
         assert manifest is not None
+        assert source_manifest is not None
+        assert manifest.parent_manifest_id == source_manifest.manifest_id
         assert manifest.permitted_effects == ["filesystem.*"]
+        assert manifest.resource_budget["max_tool_calls"] == 7
+        assert manifest.approval_policy == {
+            "mode": "operator",
+            "requestable_capabilities": [
+                {
+                    **requestable,
+                    "constraints": {},
+                    "delegable": False,
+                    "revocable": True,
+                }
+            ],
+        }
+        assert manifest.data_flow_policy == {
+            "schema_version": 1,
+            "allowed_tenants": [],
+            "allowed_principals": [],
+        }
+        assert manifest.expires_at == "2030-01-01T00:00:00Z"
+        assert manifest.metadata["transition_ceiling"] is True
         assert runtime.capability.check(fork_pid, "jsonrpc:demo:update", CapabilityRight.WRITE)
         with pytest.raises(CapabilityDenied, match="does not permit effect class"):
             runtime.authority_manifests.assert_effect(fork_pid, "jsonrpc.call")

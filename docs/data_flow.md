@@ -32,8 +32,14 @@ Explicit object metadata cannot overwrite a parent tenant or principal.
 Lowering sensitivity, removing or replacing identity, raising trust or
 integrity, or changing declassification authority requires an exact
 `declassification:object:<oid>` `admin` capability. Model-facing memory tools
-reject label-bearing metadata, so the model cannot assert trusted labels or a
-declassification authority.
+do not reject all label metadata: the standard `create_memory_object` tool may
+set sensitivity, tenant/principal, and only the conservative `untrusted` or
+`unknown` trust/integrity values. Ambient materialization labels and every
+explicit parent are then propagated conservatively, so a lower model-supplied
+value cannot wash a source label and a conflicting identity becomes `mixed`.
+The tool rejects trust/integrity elevation and every non-empty
+`declassification_authority`; the JIT memory syscall ignores caller-supplied
+label fields and derives labels from its runtime-owned flow context.
 
 For an LLM-created Object, provenance is the union of explicit `parent_oids`
 and every Object actually included in that LLM materialization. Missing or
@@ -199,6 +205,27 @@ authority. A Host raw payload with no sources starts as `normal` inside the Host
 trust boundary. Model-mediated calls also inherit their ambient materialized
 context, so omitting an explicit source cannot wash a label.
 
+### Atomicity and recovery boundary
+
+Steps 6–7 are the atomic authority boundary: current ordinary and release
+authority is revalidated, finite uses are reserved, and the prepared
+external-effect intent is written in one RuntimeStore transaction. This is not
+a distributed transaction with the provider. A first-phase
+`ProviderEffectNotStarted` can restore the exact still-live reservations; once
+a provider phase may have observed or changed state, authority stays committed
+and an ambiguous outcome remains durable as `unknown` or pending
+reconciliation. Prepared-intent recovery runs before general provider-effect
+reconciliation on reopen. The complete contract is documented in the
+[Protected Operation SDK](protected_operation_sdk.md), with its durable state
+and ordering in [Storage](storage.md).
+
+Process launch, exec, fork, and checkpoint restore use separate durable
+runtime-publication programs rather than external-effect intents. Their
+publication/operation links are reconciled before generic stale-operation
+terminalization, and an unresolved publication keeps mutation admission
+fail-closed. See [Explainable Operations](explainable_operations.md) and
+[Checkpoints](checkpoints.md) for those recovery boundaries.
+
 ## Exact conditional release
 
 A conditional send above `normal` creates a requested
@@ -211,12 +238,14 @@ includes:
 - source Object id/version/content hash and aggregate label hash;
 - canonical payload/argument hash, operation, and target-state version.
 
-The Human sees only Sink, sensitivity, tenant/principal, size, hashes, source
-count, and operation—not the payload. Approval does not change Object labels,
-does not replace ordinary capability, and cannot exceed the Sink maximum or
-identity scope. Replay, cross-Sink reuse, payload change, source mutation,
-manifest change, trust replacement, or generation change fails. `untrusted`
-Sinks cannot be elevated by Human approval; `trusted` Sinks need no release.
+The Human request carries bounded metadata only—not the payload—including Sink
+and trust identity, registry generation, sensitivity, tenant/principal, size,
+hashes, source count, manifest identity, operation, and the exact requested
+one-shot capability binding. Approval does not change Object labels, does not
+replace ordinary capability, and cannot exceed the Sink maximum or identity
+scope. Replay, cross-Sink reuse, payload change, source mutation, manifest
+change, trust replacement, or generation change fails. `untrusted` Sinks
+cannot be elevated by Human approval; `trusted` Sinks need no release.
 When the binding includes mutable target state, the SDK resolves its current
 version again inside the prepare transaction; a change from the approved
 version denies before capability reservation or provider dispatch.
@@ -280,9 +309,10 @@ model to recreate the call. A changed profile/Sink identity also fails closed,
 and the same release cannot produce a second provider request.
 
 The protected-operation lifecycle restores an unconsumed ordinary/release use
-only when the provider certifies `ProviderEffectNotStarted` and no earlier
-information flow occurred. Crossing DNS, stdio, provider, or spawn commits the
-uses even if a later phase fails.
+when protected preparation aborts before its durable dispatch boundary. After
+dispatch begins, it restores only when the first provider phase certifies
+`ProviderEffectNotStarted` and no earlier information flow occurred. Crossing
+DNS, stdio, provider, or spawn commits the uses even if a later phase fails.
 
 ## Process domains and persistence
 
@@ -351,6 +381,16 @@ manifest, or context epoch changes. Changing mere source versions or
 trust/integrity without changing confidentiality clearance does not retain less
 data at the provider and therefore does not reset an otherwise valid chain.
 
+Data-flow enforcement controls runtime-mediated movement; it does not encrypt
+stored payloads or automatically shorten their lifetime. The Host may
+explicitly run the disabled-by-default [Evidence and LLM Payload Retention
+maintenance](evidence_payload_retention.md), which monotonically reduces only
+eligible terminal LLM-call and external-effect provider payloads from `full` to
+`summary` to `hash_only`. It preserves causal identities, classifications,
+links, and original payload digests, and it refuses rows still needed for
+runtime continuation or recovery. This at-rest lifecycle is distinct from
+write-time `llm.persist_full_io` and from Sink clearance.
+
 ## Guarantee boundary
 
 The guarantee covers payloads that cross runtime-mediated Sinks. Marking a
@@ -361,9 +401,12 @@ control over that program's later network or filesystem I/O.
 Host administrators, direct database writes, trusted Runtime Modules/provider
 extensions, a Sink's secondary forwarding, and additional I/O initiated by a
 native child after the mediated argv/stdin boundary are outside this guarantee.
-Audit and label rows are append-only through runtime APIs, not tamper-proof
-against a database administrator. Deployments that need that property must add
-external signed/append-only evidence and an OS/container/WASM isolation layer.
+Audit and data-flow decision rows are append-only through runtime APIs. Active
+Sink-registry, file-binding, and context-label projections instead change under
+generation/CAS or supersession rules while retaining the history needed for
+decisions. None is tamper-proof against a database administrator. Deployments
+that need that property must add external signed/append-only evidence and an
+OS/container/WASM isolation layer.
 
 The machine-checked invariant is
 `data-labels-constrain-runtime-mediated-egress`; the deterministic benchmark

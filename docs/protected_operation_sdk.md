@@ -38,14 +38,39 @@ runtime.protected_operations.register_contract(
 requires a non-empty `internal_reason`; it is for a Runtime-owned continuation,
 not a shortcut for extension code. `state_mutation` and `information_flow` are
 conservative upper bounds used when the provider outcome or classifier is
-unknown. `ResourcePolicy` declares whether accounting is forbidden, optional,
-or requires preflight plus resource settlement after every durably settled
-dispatched outcome. A required operation that fails after dispatch uses
-`failure_resource` when the invocation can measure partial usage; otherwise the
-SDK conservatively charges the preflight usage after the failure effect is
-durably settled. Provider failure therefore cannot create an unmetered
-finalized path; a failed effect settlement remains a pending intent for
-reconciliation.
+unknown. `ResourcePolicy` has these exact semantics:
+
+- `none` forbids preflight, reservation, success, and failure accounting on the
+  invocation;
+- `optional` permits an invocation with no accounting, or one that explicitly
+  supplies the relevant accounting fields; and
+- `required` requires either `preflight_usage` or `reservation_usage` before
+  dispatch and a `ResourceSettlement` on successful completion.
+
+`preflight_usage` is only a budget check. It does not reserve or charge quota.
+On a dispatched failure, `failure_resource` supplies measured partial usage; a
+required invocation without that measurement conservatively charges its
+preflight usage, but only after the failure effect is durably settled. If that
+effect settlement fails, the intent remains pending and a preflight-only path
+has not yet charged usage.
+
+`reservation_usage` instead creates a durable maximum-usage reservation in the
+same transaction as the prepared effect. A successful `ResourceSettlement`
+settles actual usage within that envelope; `charge_reserved_maximum=True`
+settles the full envelope. Certified not-started paths release the reservation.
+An unknown dispatched outcome without measured usage charges the maximum.
+After a crash, startup recovery releases an active reservation whose effect is
+absent or still `prepared`, and charges the maximum for every other active
+reservation. A successful invocation that supplied `reservation_usage` must
+therefore also pass a settlement to `complete()` to settle it online; otherwise
+the active reservation is left for startup recovery.
+
+Effect/evidence finalization commits before the SDK performs the success-path
+resource charge or reservation settlement. A charge or overage failure is
+reported to the caller but cannot roll back the provider effect. With a durable
+reservation, a failed post-effect settlement stays active and is handled by
+startup recovery; without a reservation, there is no deferred charge record to
+recover.
 
 `data_flow_direction` is independently `none`, `ingress`, `egress`, or
 `bidirectional`. Do not infer egress from `information_flow`: filesystem reads,
@@ -116,6 +141,29 @@ decision/trust/source/label hashes and ids. Together, the early primitive check,
 transactional prepare, and per-phase dispatch recheck close
 provider-before-policy and mutable-source TOCTOU paths.
 
+Use the invocation revalidators for mutable identities that the generic checks
+cannot reconstruct:
+
+- `authority_revalidator` re-derives the exact ordered capability-decision set
+  inside the prepare transaction, after the optional `prepare` hook and before
+  reservations are created. If omitted, the SDK calls
+  `CapabilityManager.reauthorize_decision()` for each original decision. Before
+  each provider phase, the SDK then reauthorizes reusable decisions and checks
+  the exact finite-use reservations; it does not call the custom revalidator a
+  second time.
+- `data_sink_revalidator` resolves the live `DataSink` identity immediately
+  before every provider phase. It must return the same trusted identity captured
+  by `data_sink`; a changed or unresolvable Sink is denied before provider code
+  runs and the denial is retained as data-flow evidence.
+- `data_flow_target_state_version` binds the preflight decision to the captured
+  target-state version. When the target can change, pair it with
+  `data_flow_target_state_version_resolver`; the resolver supplies the live
+  version for every per-phase authorization, which rejects a stale binding.
+
+These callbacks are trusted, synchronous Host code. They must not call the
+provider, must return the declared typed value, and must not place payloads or
+secrets in exceptions or persisted evidence.
+
 Registry-backed provider invocations may additionally supply an immutable
 `ProviderRegistryBinding` and its typed live resolver. The SDK compares the
 captured spec SHA-256 and generation with the resolver result inside the same
@@ -164,9 +212,10 @@ with runtime.protected_operations.start(
 ```
 
 `complete()` atomically runs the local `settle_success` hook, emits event/audit,
-and finalizes the prepared effect id. Resource charge runs afterward. A charge
-or overage error is reported to the caller and may terminate the process, but
-cannot hide or roll back an already committed provider effect.
+and finalizes the prepared effect id. Resource charge or usage-reservation
+settlement runs afterward. A charge or overage error is reported to the caller
+and may terminate the process, but cannot hide or roll back an already committed
+provider effect.
 
 ## Async and composite providers
 
@@ -221,9 +270,12 @@ a not-started mutating phase from becoming a false committed mutation.
   refs and label hashes). Finalizing an intent never replaces that evidence
   with an error-only envelope.
 - A dispatched required-resource operation settles measured `failure_resource`
-  usage, or conservatively settles its preflight usage when no measurement is
-  available. Charging remains after effect settlement, so an overage cannot
-  erase the provider outcome.
+  usage. Without a measurement it charges the reserved maximum when
+  `reservation_usage` was used, or conservatively charges `preflight_usage`.
+  Charging happens only after effect settlement, so an overage cannot erase the
+  provider outcome. If effect settlement itself fails, the intent remains
+  pending and only a durable usage reservation supplies a recoverable deferred
+  accounting record.
 - A classifier failure uses the contract's conservative effect ceiling and
   records only the classifier error type.
 - Exiting without a provider phase or without `complete()`, completing twice,
@@ -261,19 +313,33 @@ otherwise the effect stays `unknown`.
 
 ## Enforcement
 
-`scripts/check_protected_operations.py` rejects provider subsystem imports or
-calls of the runtime-internal prepare/dispatch/finalize/abandon helpers and use
-of the former private reservation-restoration API. It also rejects direct
-`self.provider.*()` calls that are not reachable from an SDK `call()`/`acall()`
-phase (apart from explicitly enumerated non-effect path normalization). The
-check is call-site-sensitive: a helper that reaches a provider may not also be
-called outside a phase, and provider session-handle calls such as
-`session.handle.read()` must be inside a protected callable. The SDK contract
-registry is checked against the Explainable Operations external primitive
-boundary set.
-It also requires every registered data-flow contract to declare an exact
-direction and statically rejects SDK starts whose invocation omits the ingress
-context or, for egress, the Sink, source context, payload descriptor, or
-operation. LLM is included in this provider-boundary inventory.
+`scripts/check_protected_operations.py` is an AST policy check over Python files
+under `agent_libos/` and the repository-level `modules/` directory. It rejects:
+
+- direct imports or calls of the internal prepare/dispatch/finalize/abandon
+  helpers outside the four explicitly allowed lifecycle implementation files;
+- use of the former private reservation-restoration API;
+- recognized direct `self.provider.*()` calls and recognized provider-handle
+  methods outside a callable passed to an SDK `call()`/`acall()` phase; and
+- missing ingress/egress descriptor keywords for its explicit, hard-coded core
+  contract inventory when the local invocation construction can be resolved.
+
+The intentional exceptions are narrow and visible in the checker: filesystem
+path normalization, Human delivery-buffer `read`/`write`, the lifecycle
+implementation files, and recovery-time `handle.close()` in a function whose
+first executable statement is the exact recovery-cleanup lease guard. The last
+exception is evidence-free cleanup of an already-published transient handle;
+it is not a general provider-call allowance.
+
+The checker is not a sound whole-program Python call-graph analysis. It does not
+scan tests, scripts, examples, installed third-party packages, or module source
+outside the two roots; it does not prove reflective/dynamic dispatch, arbitrary
+provider aliases, cross-file helper reachability, or dynamically registered
+data-flow contracts. New provider shapes and contract names require updating
+the checker inventory and adding runtime denial-path tests. Separate runtime
+tests assert that the registered SDK contracts equal the Explainable Operations
+external-primitive boundary set and that every core data-flow contract declares
+an exact direction. LLM is included in that runtime inventory.
+
 The SDK is Host-only infrastructure: it adds no model tool, syscall, CLI, or
 HTTP endpoint.

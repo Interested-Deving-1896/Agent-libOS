@@ -16,7 +16,7 @@ Use frozen dependency resolution for artifact and CI-style checks:
 
 ```bash
 uv sync --frozen --all-groups
-npm --prefix gui install
+npm --prefix gui ci
 ```
 
 Deno-backed tests run by default when `deno` is installed. If `deno` is absent,
