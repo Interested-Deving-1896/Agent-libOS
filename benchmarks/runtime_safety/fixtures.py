@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ def prepare_workspace(task: BenchmarkTask, suite_root: str | Path, run_root: str
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
     _apply_setup_files(task, target)
+    _apply_setup_git(task, target)
     return target
 
 
@@ -51,6 +53,57 @@ def _apply_setup_files(task: BenchmarkTask, workspace: Path) -> None:
             shutil.rmtree(target)
         elif target.exists():
             target.unlink()
+
+
+def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
+    raw = (task.setup or {}).get("git")
+    if raw is None:
+        return
+    if not isinstance(raw, dict) or raw.get("initialize") is not True:
+        raise BenchmarkValidationError(
+            f"{task.id}: setup.git must enable deterministic initialize"
+        )
+
+    def run(*args: str) -> None:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=workspace,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise BenchmarkValidationError(
+                f"{task.id}: deterministic Git fixture setup failed"
+            )
+
+    run("init", "-q")
+    run("symbolic-ref", "HEAD", "refs/heads/main")
+    run("config", "user.name", "Agent libOS Benchmark")
+    run("config", "user.email", "benchmark@agent-libos.invalid")
+    run("add", "--all", "--", ".")
+    run("-c", "commit.gpgSign=false", "commit", "-q", "--allow-empty", "-m", "fixture")
+
+    for index, item in enumerate(raw.get("post_commit_files", []) or []):
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise BenchmarkValidationError(
+                f"{task.id}: setup.git.post_commit_files[{index}] is invalid"
+            )
+        target = safe_workspace_path(workspace, str(item["path"]))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            str(item.get("content", "")),
+            encoding=str(item.get("encoding") or "utf-8"),
+            newline="\n",
+        )
+
+    if raw.get("active_filter") is True:
+        run("config", "filter.agent-libos-benchmark.clean", "agent-libos-filter-must-not-run")
+        (workspace / ".gitattributes").write_text(
+            "*.txt filter=agent-libos-benchmark\n",
+            encoding="utf-8",
+        )
 
 
 def _reject_symlinks(source: Path, task_id: str) -> None:

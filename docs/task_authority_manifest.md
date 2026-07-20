@@ -66,6 +66,18 @@ Authority boundary even when an ordinary capability would otherwise allow it.
 That deny-all ceiling also covers runtime-mediated LLM and Human provider
 effects owned by the process.
 
+Typed Git adds five effect families that must be present when a concrete
+ceiling is used: `git.read`, `git.mutate`, `git.fetch`, `git.push`, and
+`git.pull_request`. The corresponding protected-operation descriptors use the
+`primitive.git.*` namespace. Exact Runtime boundary names such as
+`runtime.git.status`, `runtime.git.commit`, and `runtime.git.pull` are linked in
+Explain evidence, while the protected provider descriptor supplies the effect
+class. An existing `shell:git` authorized capability or old image requirement
+does not imply any Git effect or capability; a new manifest must explicitly
+authorize `git:workspace`, any filesystem paths, and the selected remote/PR
+resources. Mandatory destructive-operation approval remains necessary even
+when the effect family is within the manifest ceiling.
+
 The durable effect-policy envelope is schema version 2 so unrestricted `null`
 and deny-all `[]` cannot collapse during persistence. Legacy version 1 rows are
 upcast on read: their empty list retains its historical unrestricted meaning,

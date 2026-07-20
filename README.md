@@ -68,7 +68,7 @@ The implementation currently includes:
   text.
 - Process-private Object Memory namespaces by default, with explicit shared
   namespaces available through capabilities.
-- Structured Capability authority for filesystem, shell, clock, human,
+- Structured Capability authority for filesystem, Git, shell, clock, human,
   process, image, checkpoint, skill, and Object Memory primitives, including
   typed resource matching, deny/ask/allow effects, one-shot grants,
   attenuation, revoke, and audit lineage.
@@ -83,8 +83,11 @@ The implementation currently includes:
   `required_capabilities` as declarations only. See
   [docs/task_authority_manifest.md](docs/task_authority_manifest.md).
 - A Resource Provider Substrate for injectable filesystem, clock, shell, and
-  human I/O backends, plus JSON-RPC over HTTP and MCP client providers for
-  pre-registered remote endpoints.
+  human I/O backends, a pinned system-Git provider exposed as `Runtime.git`,
+  plus JSON-RPC over HTTP and MCP client providers for pre-registered remote
+  endpoints. Typed Git covers bounded inspection, local changes, managed
+  worktrees, immutable patch Objects, existing remotes, and repository-local
+  simulated pull requests without exposing arbitrary Git argv or URLs.
 - Trusted startup Runtime Modules loaded from manifest-declared Python
   entrypoints before `Runtime.open()` returns. Modules can register tools,
   images, syscalls, provider hooks, and startup hooks, but do not grant process
@@ -114,7 +117,7 @@ The implementation currently includes:
   tool capabilities, provider-classified external effects, audit, and resource
   accounting, with the same authority-before-lookup and transactional registry
   semantics.
-- A deterministic runtime-safety benchmark harness with 28 checked-in schema-v1
+- A deterministic runtime-safety benchmark harness with 32 checked-in schema-v1
   tasks, including a self-evolution subset, baselines, evidence-backed
   side-effect oracle, fail-closed output validity, and explicit metric
   denominators.
@@ -142,6 +145,9 @@ Start here, then read the deeper references as needed:
   extension examples.
 - [docs/providers.md](docs/providers.md): provider inventory, authority/effect
   contracts, containment limits, and extension checklist.
+- [docs/git.md](docs/git.md): the typed `Runtime.git` provider/primitive,
+  model tools, state tokens, capabilities, hardening, remotes, patch Objects,
+  managed worktrees, and simulated pull requests.
 - [docs/capabilities.md](docs/capabilities.md): resource naming, rights,
   one-shot grants, human approval, shell policy, and filesystem containment.
 - [docs/data_flow.md](docs/data_flow.md): label integrity, Host Sink trust,
@@ -515,8 +521,8 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - Capability records are typed authority statements with explicit
   allow/deny/ask effects, issuer lineage, delegation depth, status, expiry, and
   optional use counts.
-- Skills and JIT tools do not grant filesystem, shell, human, object, process,
-  image, checkpoint, JSON-RPC, or MCP remote authority.
+- Skills and JIT tools do not grant filesystem, Git, shell, human, object,
+  process, image, checkpoint, JSON-RPC, or MCP remote authority.
 - JIT syscalls bypass the LLM-facing tool table but not primitive capability
   checks, permission policy, human approval, or audit.
 - The local shell provider is command/environment/cwd/resource mediation, not a
@@ -529,6 +535,12 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
 - JSON-RPC and MCP calls gate on endpoint/method or server/tool capability
   resources before loading provider metadata or input schemas, so missing call
   authority cannot enumerate registered manifests.
+- Git calls operate only on the fixed workspace repository or a trusted
+  managed worktree. Mutations require a prior state token plus Git and affected
+  filesystem authority; destructive and remote-ref-rewriting operations bind
+  one-use Human approval to exact state/OIDs. Raw Shell/PTY Git is limited to
+  six hardened inspection commands and cannot bypass `Runtime.git` even under
+  an always-allow shell policy.
 - Human approval is part of a primitive/syscall. Callers see a final success or
   final failure, not a pending/retry protocol. Run-local automatic decisions
   are isolated across concurrent scheduler workers, and terminal process states
@@ -564,8 +576,9 @@ See [docs/cli.md](docs/cli.md) for the full command reference.
   come from explicit tool/syscall arguments, not parsed stdout or file content.
 - Checkpoint restore covers reconstructable process-subtree state and captured
   image registry metadata needed by that state. It does not delete append-only
-  audit/events/LLM calls or roll back filesystem, shell, image-package source,
-  network, or provider side effects. Ownership, not borrowed MemoryView
+  audit/events/LLM calls or roll back filesystem, Git/worktree/remote state,
+  shell, image-package source, network, or provider side effects. Ownership,
+  not borrowed MemoryView
   reachability, defines the destructive Object scope; restore/fork revalidate
   current capability state so a committed revoke is not resurrected.
 - Checkpoint-derived images capture internal reconstructable runtime state, not

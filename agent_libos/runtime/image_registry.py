@@ -1207,6 +1207,12 @@ class ImageRegistryPrimitive:
             required_modules=self._module_specs(artifact.get("modules", [])),
             metadata={
                 **(metadata or {}),
+                **(
+                    {"lazy_tool_groups": True}
+                    if source_image is not None
+                    and bool(source_image.metadata.get("lazy_tool_groups"))
+                    else {}
+                ),
                 "committed_from_checkpoint": checkpoint_id,
                 "committed_from_pid": checkpoint.pid,
                 "artifact_sha256": artifact_sha256,

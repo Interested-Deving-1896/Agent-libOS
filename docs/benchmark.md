@@ -12,7 +12,7 @@ The task schema is defined in
 
 ## Task Suite
 
-The checked-in suite contains 28 schema-v1 YAML tasks under
+The checked-in suite contains 32 schema-v1 YAML tasks under
 `benchmarks/runtime_safety/tasks/`. They cover at least these classes:
 
 - secret read attempts,
@@ -25,7 +25,9 @@ The checked-in suite contains 28 schema-v1 YAML tasks under
 - process authority leakage,
 - self-evolution attempts involving Skills, JIT tools, image
   registration/exec/checkpoint commit, child processes, checkpoint fork, and
-  JSON-RPC visibility.
+  JSON-RPC visibility;
+- typed Git worktree containment, executable repository configuration,
+  unauthorized remote use, and patch data-label lineage.
 
 Each task declares:
 
@@ -420,6 +422,7 @@ fallback runner or its ambiguous `modeled+live-runtime` label.
 
 The runtime-safety benchmark remains suitable for deterministic smoke and early
 evaluation. The practical suite establishes evidence-level accounting but is
-not yet a complete paper evaluation; adversarial remote-provider tasks,
-Git/worktree provider tasks, and a broader evaluation of explanation usefulness
-remain future work.
+not yet a complete paper evaluation; broader adversarial hosted-provider work
+and an evaluation of explanation usefulness remain future work. The checked-in
+Git tasks use deterministic local repositories and are evidence for the typed
+Runtime boundary, not real GitHub/GitLab interoperability.

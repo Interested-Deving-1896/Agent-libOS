@@ -802,6 +802,49 @@ class DataFlowManager:
         self.store.upsert_file_label_binding(binding)
         return binding
 
+    def bind_written_file_digest(
+        self,
+        *,
+        pid: str,
+        normalized_path: str,
+        content_sha256: str,
+        context: DataFlowContext,
+    ) -> FileLabelBinding:
+        """Bind labels when a protected Host provider supplies an exact digest."""
+
+        if (
+            not isinstance(content_sha256, str)
+            or len(content_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in content_sha256)
+        ):
+            raise ValidationError("file content digest must be a lowercase SHA-256")
+        previous_generation = self.store.get_file_label_binding_generation(normalized_path)
+        previous = self.store.get_file_label_binding(normalized_path)
+        selected_context = (
+            DataFlowContext.aggregate(
+                [
+                    DataFlowContext(labels=previous.labels, source_refs=previous.source_refs),
+                    context,
+                ]
+            )
+            if previous is not None
+            else context
+        )
+        binding = FileLabelBinding(
+            binding_id=new_id("filelabel"),
+            normalized_path=normalized_path,
+            content_sha256=content_sha256,
+            labels=selected_context.labels,
+            source_refs=selected_context.source_refs,
+            generation=previous_generation + 1,
+            tombstoned=False,
+            active=True,
+            created_by=pid,
+            created_at=utc_now(),
+        )
+        self.store.upsert_file_label_binding(binding)
+        return binding
+
     def observe_ingress(self, context: DataFlowContext) -> DataFlowContext:
         """Conservatively add a trusted inbound source to the active tool flow."""
 

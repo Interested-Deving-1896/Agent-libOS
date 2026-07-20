@@ -133,7 +133,28 @@ class TestResourceProviderSubstrate:
             result = shell.run(pid, ['git', 'status', '--short'], timeout=2.0)
             assert result.stdout == 'ok\n'
             assert provider.calls == [
-                (['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--short'], 2.0)
+                (
+                    [
+                        'git',
+                        '--no-pager',
+                        '--no-optional-locks',
+                        '-c',
+                        'core.fsmonitor=false',
+                        '-c',
+                        'core.untrackedCache=false',
+                        '-c',
+                        'maintenance.auto=false',
+                        '-c',
+                        'submodule.recurse=false',
+                        '-c',
+                        'diff.external=',
+                        '-c',
+                        'color.ui=false',
+                        'status',
+                        '--short',
+                    ],
+                    2.0,
+                )
             ]
             assert result.argv == ['git', 'status', '--short']
         finally:

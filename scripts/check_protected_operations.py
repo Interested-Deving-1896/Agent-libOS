@@ -25,6 +25,11 @@ ALLOWED_LIFECYCLE_FILES = frozenset(
 SAFE_PROVIDER_CALLS = frozenset(
     {
         (Path("agent_libos/primitives/filesystem.py"), "resolve"),
+        # This Git call is a non-dispatching, local security preflight.  The
+        # primitive performs the Task Authority and remote capability gates
+        # before invoking it, then re-runs the ordinary fingerprint method in
+        # the protected provider phase immediately before network dispatch.
+        (Path("agent_libos/primitives/git.py"), "preflight_remote_fingerprint"),
         (Path("agent_libos/human/delivery.py"), "read"),
         (Path("agent_libos/human/delivery.py"), "write"),
     }
@@ -53,6 +58,10 @@ EGRESS_CONTRACTS = frozenset(
         "primitive.filesystem.delete_file",
         "primitive.filesystem.delete_directory",
         "primitive.shell.run",
+        "primitive.git.mutate",
+        "primitive.git.fetch",
+        "primitive.git.push",
+        "primitive.git.pull_request",
         "primitive.jsonrpc.call",
         "primitive.mcp.list_tools",
         "primitive.mcp.list_tools.internal",
@@ -72,6 +81,10 @@ INGRESS_CONTRACTS = frozenset(
         "primitive.filesystem.read_bytes",
         "primitive.filesystem.read_directory",
         "primitive.shell.run",
+        "primitive.git.read",
+        "primitive.git.mutate",
+        "primitive.git.fetch",
+        "primitive.git.pull_request",
         "primitive.jsonrpc.call",
         "primitive.mcp.list_tools",
         "primitive.mcp.list_tools.internal",
@@ -237,7 +250,133 @@ class _CallGraph:
                 if callee not in protected:
                     protected.add(callee)
                     pending.append(callee)
+        # A primitive may centralize the SDK lifecycle in a gateway such as
+        # ``_read(callback)`` or ``_mutate(callback)``.  Treat a call-site
+        # callback as protected only when the gateway invokes that exact
+        # formal parameter exclusively from a function already passed to
+        # ProtectedOperation.call/acall.  This keeps the scan useful without
+        # requiring every typed operation to duplicate the lifecycle body.
+        changed = True
+        calls = tuple(node for node in ast.walk(tree) if isinstance(node, ast.Call))
+        while changed:
+            changed = False
+            gateways = self._protected_callback_parameters(protected)
+            for call in calls:
+                owner = _nearest_owner(call, self.parents)
+                callee = self.resolve(call.func, owner)
+                if callee is None:
+                    continue
+                for parameter in gateways.get(callee, ()):
+                    callback = self._bound_callback(call, callee, parameter)
+                    if callback is None:
+                        continue
+                    selected = (
+                        callback
+                        if isinstance(callback, ast.Lambda)
+                        else self.resolve(callback, owner)
+                    )
+                    if selected is not None and selected not in protected:
+                        protected.add(selected)
+                        pending.append(selected)
+                        changed = True
+            while pending:
+                function = pending.pop()
+                for callee in self.calls.get(function, ()):
+                    if callee not in protected:
+                        protected.add(callee)
+                        pending.append(callee)
+                        changed = True
         return protected
+
+    @staticmethod
+    def _parameters(function: FunctionNode) -> tuple[str, ...]:
+        if isinstance(function, ast.Lambda):
+            arguments = function.args
+        else:
+            arguments = function.args
+        return tuple(
+            argument.arg
+            for argument in (
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+            )
+        )
+
+    def _protected_callback_parameters(
+        self,
+        protected: set[FunctionNode],
+    ) -> dict[FunctionNode, set[str]]:
+        candidates: dict[FunctionNode, set[str]] = {}
+        for call in (
+            node
+            for function in protected
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and _nearest_owner(node, self.parents) is function
+            and isinstance(node.func, ast.Name)
+        ):
+            callback_name = call.func.id
+            container = _nearest_owner(call, self.parents)
+            while container is not None:
+                if callback_name in self._parameters(container):
+                    candidates.setdefault(container, set()).add(callback_name)
+                    break
+                container = _nearest_owner(
+                    self.parents.get(container, container),
+                    self.parents,
+                )
+
+        safe: dict[FunctionNode, set[str]] = {}
+        for gateway, parameters in candidates.items():
+            for parameter in parameters:
+                invocations = [
+                    node
+                    for node in ast.walk(gateway)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == parameter
+                ]
+                reassigned = any(
+                    isinstance(node, ast.Name)
+                    and node.id == parameter
+                    and isinstance(node.ctx, (ast.Store, ast.Del))
+                    for node in ast.walk(gateway)
+                )
+                if (
+                    invocations
+                    and not reassigned
+                    and all(
+                        _nearest_owner(invocation, self.parents) in protected
+                        for invocation in invocations
+                    )
+                ):
+                    safe.setdefault(gateway, set()).add(parameter)
+        return safe
+
+    def _bound_callback(
+        self,
+        call: ast.Call,
+        callee: FunctionNode,
+        parameter: str,
+    ) -> ast.AST | None:
+        for keyword in call.keywords:
+            if keyword.arg == parameter:
+                return keyword.value
+        parameters = self._parameters(callee)
+        try:
+            index = parameters.index(parameter)
+        except ValueError:
+            return None
+        path = _attribute_path(call.func)
+        if parameters and parameters[0] in {"self", "cls"} and path[:1] in {
+            ("self",),
+            ("cls",),
+        }:
+            index -= 1
+        if index < 0 or index >= len(call.args):
+            return None
+        return call.args[index]
 
     def provider_reaching_functions(
         self,

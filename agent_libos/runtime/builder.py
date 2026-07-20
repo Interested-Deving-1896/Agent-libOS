@@ -19,6 +19,7 @@ from agent_libos.evidence import (
 from agent_libos.primitives import (
     ClockPrimitive,
     FilesystemAdapter,
+    GitPrimitive,
     JsonRpcPrimitive,
     McpPrimitive,
     ShellAdapter,
@@ -85,6 +86,7 @@ from agent_libos.storage import (
 )
 from agent_libos.substrate import (
     HttpJsonRpcProvider,
+    LocalGitProvider,
     LocalResourceProviderSubstrate,
     ResourceProviderSubstrate,
     SdkMcpProvider,
@@ -2350,6 +2352,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
         host.substrate = substrate or LocalResourceProviderSubstrate(
             Path.cwd().resolve(),
             namespace=host.config.runtime.workspace_namespace,
+            git_config=host.config.git,
         )
         host.workspace_root = Path(
             getattr(
@@ -2595,6 +2598,24 @@ class RuntimeBuilder(Generic[RuntimeT]):
             provider=host.substrate.shell,
             config=host.config,
             resources=host.resources,
+        )
+        git_provider = getattr(host.substrate, "git", None)
+        if git_provider is None:
+            git_provider = LocalGitProvider(
+                host.workspace_root,
+                config=host.config.git,
+            )
+        host.git = GitPrimitive(
+            host.capability,
+            host.audit,
+            host.events,
+            protected_operations=host.protected_operations,
+            human=host.human,
+            provider=git_provider,
+            filesystem=host.filesystem,
+            memory=host.memory,
+            data_flow=host.data_flow,
+            config=host.config,
         )
         host.jsonrpc = JsonRpcPrimitive(
             host.uow,
@@ -3161,6 +3182,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
             "clock": host.clock,
             "data_flow": host.data_flow,
             "filesystem": host.filesystem,
+            "git": host.git,
             "human": host.human,
             "image_registry": host.image_registry,
             "image_boot": host.image_boot,

@@ -77,8 +77,11 @@ immutable `package_snapshot` in its `loaded_skills` record. Historical
 checkpoint `skills` rows remain readable compatibility data, not a host
 registry mutation.
 
-Host filesystem, shell, JSON-RPC/MCP remote calls, and provider effects are not
-rolled back. Image registry rows are internal runtime metadata: snapshots
+Host filesystem, Git checkout/index/refs/worktrees/simulated-PR metadata and
+remote calls, shell, JSON-RPC/MCP remote calls, and provider effects are not
+captured or rolled back. Git external-effect records remain reportable through
+checkpoint diff/restore evidence, but restore never replays or compensates
+them. Image registry rows are internal runtime metadata: snapshots
 capture the image definitions needed by the checkpointed subtree and any
 referenced `checkpoint_commit` or `image_package` artifact payloads.
 Destructive restore re-upserts those captured image and artifact rows so the
@@ -640,6 +643,10 @@ Independent version namespaces appear in this document:
 
 Changing one of these versions does not change or authorize either of the
 others.
+
+Git does not add another checkpoint schema. RuntimeStore remains schema v3 and
+checkpoint snapshots remain v4. Image packages continue to reject `.git`
+metadata and do not embed managed worktrees or remote state.
 
 Checkpoint list callers may request only positive integer limits no larger
 than `CheckpointDefaults.list_limit`; `0`, negative values, booleans, and larger

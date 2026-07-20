@@ -49,9 +49,11 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.ports import AuditPort, EventPort
+from agent_libos.primitives.git_command_policy import trusted_git_read_operation
 from agent_libos.primitives.shell import ShellExecutionPolicy, ShellPolicyDecision
 from agent_libos.substrate import (
     ExecutableSnapshot,
+    LocalGitProvider,
     ProviderEffectNotStarted,
     resolve_runtime_python_alias,
     SubprocessLimits,
@@ -244,7 +246,10 @@ def initialize_pty(runtime: "ModuleHost") -> None:
     if runtime.get_runtime_attribute(_PTY_ADAPTER_ATTR) is not None:
         return
     settings = _coerce_pty_settings(getattr(runtime.substrate, "pty_settings", None))
-    provider = getattr(runtime.substrate, "pty", None) or LocalPtyProvider(runtime.workspace_root)
+    provider = getattr(runtime.substrate, "pty", None) or LocalPtyProvider(
+        runtime.workspace_root,
+        git_config=runtime.config.git,
+    )
     adapter = PtyAdapter(
         runtime,
         runtime.shell,
@@ -277,8 +282,10 @@ class LocalPtyProvider:
     supports_subprocess_limits = os.name != "nt"
     supports_executable_snapshots = True
 
-    def __init__(self, cwd: str | Path):
+    def __init__(self, cwd: str | Path, *, git_config: Any | None = None):
         self.cwd = Path(cwd).resolve()
+        self._git_config = git_config
+        self._git_read_guard: LocalGitProvider | None = None
 
     def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
         return self._resolve_argv0(argv, self._resolve_cwd(cwd))
@@ -299,6 +306,18 @@ class LocalPtyProvider:
         safe_path = self._safe_path()
         requested_argv0 = argv[0] if argv else None
         resolved_argv = self._resolve_argv0(argv, selected_cwd)
+        git_operation = trusted_git_read_operation(argv, hardened_only=True)
+        if git_operation is not None:
+            if selected_cwd != self.cwd:
+                raise ValidationError(
+                    "legacy raw Git reads are fixed to the Runtime workspace root"
+                )
+            if self._git_read_guard is None:
+                self._git_read_guard = LocalGitProvider(
+                    self.cwd,
+                    config=self._git_config,
+                )
+            self._git_read_guard.validate_read_only_operation(git_operation)
         if executable_snapshot is not None:
             executable_snapshot.verify()
             if executable_snapshot.source_path != Path(resolved_argv[0]).resolve(
@@ -745,6 +764,16 @@ def _safe_subprocess_env(*, path: str, home: Path) -> dict[str, str]:
     env["PATH"] = path
     env["HOME"] = str(home)
     env["USERPROFILE"] = str(home)
+    env["GIT_NO_LAZY_FETCH"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_PAGER"] = "cat"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_ATTR_NOSYSTEM"] = "1"
+    if os.name == "nt":
+        env["GCM_INTERACTIVE"] = "Never"
     return env
 
 
@@ -890,6 +919,7 @@ class _PtyCloseMutationState:
 class _PtyCreatePlan:
     pid: str
     argv: list[str]
+    dispatch_argv: list[str]
     cwd: str
     cols: int
     rows: int
@@ -1024,8 +1054,7 @@ class PtyAdapter:
             startup_timeout_s=startup_timeout_s,
             max_output_chars=max_output_chars,
         )
-        resource = self.shell_policy.resource_for(checked)
-        self.shell_policy.enforce_workspace_argv_scope(checked, cwd=cwd)
+        resource, dispatch_argv = self._prepare_spawn_argv(checked, cwd=cwd)
         decision = self._authorize_pty_spawn(
             pid,
             checked,
@@ -1048,7 +1077,7 @@ class PtyAdapter:
             source_oids,
         )
         data_flow_payload = {
-            "argv": [executable_identity, *checked[1:]],
+            "argv": [executable_identity, *dispatch_argv[1:]],
             "cwd": cwd,
         }
         self.host.data_flow.authorize_egress(
@@ -1100,6 +1129,7 @@ class PtyAdapter:
         return _PtyCreatePlan(
             pid=pid,
             argv=checked,
+            dispatch_argv=dispatch_argv,
             cwd=cwd,
             cols=selected_cols,
             rows=selected_rows,
@@ -1118,6 +1148,17 @@ class PtyAdapter:
             session_id=session_id,
             effect_context=effect_context,
         )
+
+    def _prepare_spawn_argv(
+        self,
+        checked: list[str],
+        *,
+        cwd: str,
+    ) -> tuple[str, list[str]]:
+        resource = self.shell_policy.resource_for(checked)
+        dispatch_argv = self.shell_policy.harden_read_only_git_argv(checked)
+        self.shell_policy.enforce_workspace_argv_scope(checked, cwd=cwd)
+        return resource, dispatch_argv
 
     def _validate_create_request(
         self,
@@ -1286,7 +1327,7 @@ class PtyAdapter:
         self,
         plan: _PtyCreatePlan,
     ) -> _PtyStartedSession:
-        guards = _PtySpawnGuards(provider_argv=list(plan.argv))
+        guards = _PtySpawnGuards(provider_argv=list(plan.dispatch_argv))
         resources = _PtySpawnResources()
         protected_cm: Any | None = None
         protected: Any | None = None
@@ -1343,7 +1384,7 @@ class PtyAdapter:
             guards.provider_argv = protected.call(
                 ProviderPhase("resolve_argv", information_flow=True),
                 self.shell_policy.resolve_provider_argv,
-                plan.argv,
+                guards.provider_argv,
                 cwd=plan.cwd,
                 provider=self.provider,
             )
@@ -1359,7 +1400,7 @@ class PtyAdapter:
             self.shell_policy.snapshot_executable_for_dispatch(
                 pid=plan.pid,
                 provider=self.provider,
-                requested_argv0=plan.argv[0],
+                requested_argv0=guards.provider_argv[0],
                 provider_argv0=guards.provider_argv[0],
                 cwd=plan.cwd,
                 expected_sink=plan.spawn_sink,

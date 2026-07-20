@@ -853,6 +853,14 @@ def test_protected_boundary_registry_covers_core_mutation_surfaces() -> None:
             "skill.activate",
             "image.commit",
         } <= runtime.explainable_boundary_names
+        assert {
+            "runtime.git.repository_info",
+            "runtime.git.status",
+            "runtime.git.stage",
+            "runtime.git.fetch",
+            "runtime.git.push",
+            "runtime.git.create_pull_request",
+        } <= runtime.explainable_boundary_names
 
         parent = runtime.process.spawn(goal="direct fork attribution")
         runtime.process.fork(parent, "forked child")

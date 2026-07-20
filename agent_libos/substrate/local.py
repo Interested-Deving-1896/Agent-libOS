@@ -45,6 +45,7 @@ from agent_libos.models import (
     McpToolSpec,
 )
 from agent_libos.models.exceptions import CapabilityDenied, ValidationError
+from agent_libos.primitives.git_command_policy import trusted_git_read_operation
 from agent_libos.models.external_effect import default_external_effect_rollback_status
 from agent_libos.substrate.base import (
     CommandMetrics,
@@ -60,6 +61,7 @@ from agent_libos.substrate.base import (
     SubprocessLimits,
     SubprocessTimeoutExpired,
 )
+from agent_libos.substrate.git import LocalGitProvider
 from agent_libos.utils.ids import new_id
 from agent_libos.utils.serde import dumps, to_jsonable
 
@@ -880,8 +882,10 @@ class LocalShellProvider:
     supports_subprocess_limits = os.name != "nt"
     supports_executable_snapshots = True
 
-    def __init__(self, cwd: str | Path):
+    def __init__(self, cwd: str | Path, *, git_config: Any | None = None):
         self.cwd = Path(cwd).resolve()
+        self._git_config = git_config
+        self._git_read_guard: LocalGitProvider | None = None
 
     def resolve_argv(self, argv: list[str], *, cwd: str | None = None) -> list[str]:
         return self._resolve_argv0(argv, self._resolve_cwd(cwd))
@@ -897,11 +901,11 @@ class LocalShellProvider:
         stderr_limit_chars: int | None = None,
         executable_snapshot: ExecutableSnapshot | None = None,
     ) -> CommandResult:
-        if limits is not None and not self.supports_subprocess_limits:
-            raise ValidationError("shell provider cannot enforce SubprocessLimits on this platform")
-        selected_cwd = self._resolve_cwd(cwd)
-        stdout_limit = _SHELL_DEFAULTS.stdout_hard_limit_chars if stdout_limit_chars is None else max(0, int(stdout_limit_chars))
-        stderr_limit = _SHELL_DEFAULTS.stderr_hard_limit_chars if stderr_limit_chars is None else max(0, int(stderr_limit_chars))
+        selected_cwd = self._prepare_run_cwd(argv, cwd=cwd, limits=limits)
+        stdout_limit, stderr_limit = self._selected_output_limits(
+            stdout_limit_chars,
+            stderr_limit_chars,
+        )
         requested_argv0 = argv[0] if argv else None
         checked_argv = self._resolve_argv0(argv, selected_cwd)
         popen_executable: str | None = None
@@ -1070,6 +1074,53 @@ class LocalShellProvider:
                 )
             return result
 
+    def _prepare_run_cwd(
+        self,
+        argv: list[str],
+        *,
+        cwd: str | None,
+        limits: SubprocessLimits | None,
+    ) -> Path:
+        if limits is not None and not self.supports_subprocess_limits:
+            raise ValidationError(
+                "shell provider cannot enforce SubprocessLimits on this platform"
+            )
+        selected_cwd = self._resolve_cwd(cwd)
+        self._validate_legacy_git_dispatch(argv, selected_cwd)
+        return selected_cwd
+
+    def _validate_legacy_git_dispatch(self, argv: list[str], selected_cwd: Path) -> None:
+        git_operation = trusted_git_read_operation(argv, hardened_only=True)
+        if git_operation is None:
+            return
+        if selected_cwd != self.cwd:
+            raise ValidationError(
+                "legacy raw Git reads are fixed to the Runtime workspace root"
+            )
+        if self._git_read_guard is None:
+            self._git_read_guard = LocalGitProvider(
+                self.cwd,
+                config=self._git_config,
+            )
+        self._git_read_guard.validate_read_only_operation(git_operation)
+
+    @staticmethod
+    def _selected_output_limits(
+        stdout_limit_chars: int | None,
+        stderr_limit_chars: int | None,
+    ) -> tuple[int, int]:
+        stdout_limit = (
+            _SHELL_DEFAULTS.stdout_hard_limit_chars
+            if stdout_limit_chars is None
+            else max(0, int(stdout_limit_chars))
+        )
+        stderr_limit = (
+            _SHELL_DEFAULTS.stderr_hard_limit_chars
+            if stderr_limit_chars is None
+            else max(0, int(stderr_limit_chars))
+        )
+        return stdout_limit, stderr_limit
+
     def executable_snapshot_required(
         self,
         executable: str,
@@ -1121,6 +1172,16 @@ class LocalShellProvider:
         env["PATH"] = self._safe_path()
         env["HOME"] = str(self.cwd)
         env["USERPROFILE"] = str(self.cwd)
+        env["GIT_NO_LAZY_FETCH"] = "1"
+        env["GIT_OPTIONAL_LOCKS"] = "0"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["GIT_PAGER"] = "cat"
+        env["GIT_NO_REPLACE_OBJECTS"] = "1"
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_ATTR_NOSYSTEM"] = "1"
+        if os.name == "nt":
+            env["GCM_INTERACTIVE"] = "Never"
         return env
 
     def _resolve_argv0(self, argv: list[str], selected_cwd: Path) -> list[str]:
@@ -2630,12 +2691,19 @@ def _mcp_oversize_observation(encoded: bytes) -> dict[str, Any]:
 class LocalResourceProviderSubstrate:
     """Default Resource Provider Substrate backed by the host OS."""
 
-    def __init__(self, workspace_root: str | Path, namespace: str = _RUNTIME_DEFAULTS.workspace_namespace):
+    def __init__(
+        self,
+        workspace_root: str | Path,
+        namespace: str = _RUNTIME_DEFAULTS.workspace_namespace,
+        *,
+        git_config: Any | None = None,
+    ):
         self.workspace_root = Path(workspace_root).resolve()
         self.workspace_display = str(self.workspace_root)
         self.filesystem = LocalFilesystemProvider(self.workspace_root, namespace=namespace)
         self.clock = LocalClockProvider()
-        self.shell = LocalShellProvider(self.workspace_root)
+        self.shell = LocalShellProvider(self.workspace_root, git_config=git_config)
+        self.git = LocalGitProvider(self.workspace_root, config=git_config)
         self.human = LocalHumanProvider()
         self.jsonrpc = HttpJsonRpcProvider()
         self.mcp = SdkMcpProvider(self.workspace_root)

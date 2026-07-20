@@ -25,6 +25,7 @@ Legend:
 | Core process/shell containment | POSIX process groups plus platform-specific fallbacks | Ubuntu security/runtime/provider lanes | macOS and Windows native process-tree/resource behavior are not CI-covered |
 | Deno/TypeScript JIT | Deno required for real JIT; deterministic benchmark also has an explicit fake backend | Deno LTS on Ubuntu; real-Deno tests run when installed | Windows parent-death Job Object and macOS native behavior need release-gate runs |
 | PTY Runtime Module | POSIX PTY and optional Windows `pywinpty`/ConPTY path | POSIX paths on Ubuntu plus deterministic branch tests | Real Windows PTY/resize/close/parent-death integration is an environment gate |
+| Typed Git provider | System Git 2.22+, fixed non-bare workspace repository; local operations, managed worktrees, patch Objects, existing remotes, and repository-local simulated PRs | Deterministic provider/security/runtime tests use temporary SHA-1/SHA-256 repositories and local bare remotes; Shell/PTY/provenance hardening is parameterized | Native Windows locking/path/credential-manager and real HTTPS/OpenSSH authentication require release-gate runs; GitHub/GitLab APIs are not implemented |
 | JSON-RPC client | Registered HTTP endpoints only | Deterministic loopback/provider tests | Real network proxy/TLS/DNS policy is deployment-specific |
 | MCP client | Tools-only v1 over Streamable HTTP or stdio | Deterministic primitive/provider tests | Real MCP SDK/server integration uses the optional `mcp` extra and `--run-mcp` environment gate; Resources/Prompts are not implemented |
 | Real LLM | OpenAI Responses and OpenAI-compatible Chat profiles | Mock/action-selection paths only | Credentials and token-spending smoke are opt-in with `--run-real-llm`; run one scoped task/profile per release target |
@@ -45,7 +46,7 @@ Legend:
 
 | Suite | Default evidence | Boundary |
 | --- | --- | --- |
-| `benchmarks/runtime_safety` | Deterministic schema-v1 task×runner matrix, including `data_label_exfiltration`, fail-closed metrics, provenance-bearing CLI metadata | Early runtime-safety workload, not a complete paper evaluation or formal proof |
+| `benchmarks/runtime_safety` | 32 deterministic schema-v1 tasks, including data-label exfiltration plus Git worktree containment, malicious config, remote misuse, and patch lineage; fail-closed metrics and provenance-bearing CLI metadata | Early runtime-safety workload, not a complete paper evaluation or formal proof; Git network tasks use controlled local state rather than a hosted provider |
 | `benchmarks/practical_agent_workflows` | Exactly two labels: `native-live` and `modeled`; native has no modeled fallback | Checked-in scenarios do not imply a real GitHub/provider integration |
 | `benchmarks/external_effect_recovery` | 100k-record `ci` profile on each change; one-million-record `million` profile in the manual/nightly workflow | Structural paging/index/convergence checks are gates; elapsed times are diagnostic, not SLAs |
 | `benchmarks/runtime_publication_recovery` | 10k terminal publications with 1,001 unreconciled rows in the only named profile, `ci` | No one-million-publication profile is currently implemented; custom sizes are explicit CLI overrides |

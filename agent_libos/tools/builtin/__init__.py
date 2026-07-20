@@ -23,6 +23,7 @@ from agent_libos.tools.builtin.filesystem import (
     WriteDirectoryTool,
     WriteTextFileTool,
 )
+from agent_libos.tools.builtin.git import GIT_TOOL_NAMES, GIT_TOOL_TYPES
 from agent_libos.tools.builtin.human import AskHumanTool, HumanOutputTool
 from agent_libos.tools.builtin.images import CommitCheckpointToImageTool, LoadImagePackageTool
 from agent_libos.tools.builtin.jit import ProposeJitTool, RegisterJitTool, ValidateJitTool
@@ -100,6 +101,8 @@ __all__ = [
     "GetWorkingDirectoryTool",
     "GetCurrentTimeTool",
     "GetObjectTaskTool",
+    "GIT_TOOL_NAMES",
+    "GIT_TOOL_TYPES",
     "AskHumanTool",
     "HumanOutputTool",
     "InspectCheckpointTool",

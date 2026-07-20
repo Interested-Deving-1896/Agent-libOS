@@ -1,11 +1,23 @@
 runtime:
   local_store_target: .agent_libos.sqlite
 
+git:
+  enabled: true
+  executable: git
+  minimum_version: 2.22.0
+  worktree_root: agent_outputs/git_worktrees
+  trusted_metadata_roots: []
+  allowed_remote_schemes: [https, ssh]
+  allow_file_remotes: false
+  inherit_credential_helpers: true
+  inherit_ssh_agent: true
+  protect_git_metadata: true
+
 modules:
   manifest_paths:
     - modules/pty/module.yaml
   trusted_modules:
-    - agent-libos-pty:v0:63770588d3652221d1703d8d78e71ffeee9701b50dc0091bb5238ab41d25d909:beaec71631e20b9d4509692d332918cd616ae2517eb93b23d571eaa04793acaf
+    - agent-libos-pty:v0:81c53ccabc769a947842c12160377de9201c6d11ca2bfed88ff06292485bbc19:8eab5b8f0ee10ef0826f999b4162dae3a5257aabbcaa794a5a50fa296ba2a36c
 
 data_flow:
   default_trust_level: untrusted

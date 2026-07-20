@@ -251,7 +251,23 @@ longer defines.
   observation/close. Object release finalizers run outside the SQL transaction so PTY
   close can durably record its intent; `swe_edit` refuses truncated source.
   Auto-allowed Git inspection disables optional locks, repository fsmonitor,
-  and external diff helpers before the provider boundary.
+  and external diff helpers before the provider boundary. Raw Git is limited to
+  six exact inspection commands; all mutation and remote argv must use the typed
+  Git primitive even under an always-allow shell policy.
+- `git-provider-is-pinned-and-non-executable`: the typed Git provider operates
+  only on the configured workspace repository or an explicitly trusted managed
+  worktree. It rejects parent discovery, untrusted gitfiles, symlinked metadata,
+  alternates, and repository configuration that could execute hooks, filters,
+  helpers, drivers, editors, signers, or implicit network fetches.
+- `git-mutations-require-authority-state-and-evidence`: typed Git writes require
+  Git authority, matching filesystem authority, an exact prior state token, and
+  protected-operation evidence. Destructive, remote, and ref-rewriting actions
+  additionally bind their approval to exact parameters and old object ids;
+  pre-dispatch denials are not misclassified as unknown effects.
+- `git-patches-remotes-and-prs-preserve-cas-lineage`: patch Objects carry exact
+  content hashes and source labels, remote operations bind the selected remote
+  configuration and old refs, and simulated pull requests use common-dir refs
+  plus atomically persisted metadata with base/head compare-and-swap checks.
 - `command-risk-rules-are-deterministic`: command risk rules separate
   harmless, risky, and destructive shell operations without model judgment.
 - `sandbox-profile-derived-from-capability-decision`: primitive sandbox
@@ -701,5 +717,4 @@ longer defines.
 - Explainability tests verify provenance completeness and deterministic
   summaries, but do not yet measure whether operators understand explanations
   better in a user study.
-- MCP Resources/Prompts, Git worktree, and mock PR providers are planned but not
-  implemented.
+- MCP Resources/Prompts remain planned but are not implemented.

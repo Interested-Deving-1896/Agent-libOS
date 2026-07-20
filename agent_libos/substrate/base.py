@@ -595,6 +595,50 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class GitCommandResult:
+    """Byte-preserving result returned by the Host Git provider."""
+
+    argv: tuple[str, ...]
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    stdout_sha256: str
+    stderr_sha256: str
+    metrics: "CommandMetrics"
+
+
+@dataclass(frozen=True)
+class GitRepositoryLayout:
+    """Validated identity of one worktree belonging to the pinned repository."""
+
+    root: Path
+    git_dir: Path
+    common_dir: Path
+    object_format: str
+    linked_worktree: bool
+    repository_id: str
+    worktree_id: str
+    git_version: str
+
+
+@dataclass(frozen=True)
+class GitRepositoryState:
+    """Complete bounded repository state used to derive opaque CAS tokens."""
+
+    layout: GitRepositoryLayout
+    head_ref: str | None
+    head_oid: str | None
+    index_sha256: str
+    config_sha256: str
+    refs_sha256: str
+    worktrees_sha256: str
+    pull_requests_sha256: str
+    worktree_sha256: str
+    status_porcelain: bytes
+    status_sha256: str
+
+
+@dataclass(frozen=True)
 class CommandMetrics:
     wall_seconds: float = 0.0
     cpu_seconds: float = 0.0
@@ -711,6 +755,108 @@ class ShellProvider(Protocol):
     ) -> ExternalEffectClassification: ...
 
 
+class GitProvider(Protocol):
+    def validate_operation(
+        self,
+        operation: str,
+        *,
+        worktree: str | Path | None = None,
+        remote: str | None = None,
+    ) -> dict[str, str]: ...
+
+    def validate_read_only_operation(
+        self,
+        operation: str,
+        *,
+        worktree: str | Path | None = None,
+    ) -> dict[str, str]: ...
+
+    def repository_layout(
+        self,
+        *,
+        worktree: str | Path | None = None,
+    ) -> GitRepositoryLayout: ...
+
+    def repository_state(
+        self,
+        *,
+        worktree: str | Path | None = None,
+    ) -> GitRepositoryState: ...
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        worktree: str | Path | None = None,
+        timeout: float | None = None,
+        stdin: bytes | None = None,
+        max_output_bytes: int | None = None,
+        read_only: bool = True,
+        remote: str | None = None,
+        expected_remote_fingerprint: str | None = None,
+        verify_after: bool = True,
+    ) -> GitCommandResult: ...
+
+    def repository_lock(
+        self,
+        *,
+        worktree: str | Path | None = None,
+        timeout: float | None = None,
+    ) -> Iterator[GitRepositoryLayout]: ...
+
+    def reconcile_external_effect(self, effect: Any) -> dict[str, Any]: ...
+
+    def remote_fingerprint(
+        self,
+        remote: str,
+        *,
+        worktree: str | Path | None = None,
+    ) -> dict[str, Any]: ...
+
+    def preflight_remote_fingerprint(
+        self,
+        remote: str,
+        *,
+        worktree: str | Path | None = None,
+    ) -> dict[str, Any]: ...
+
+    def remote_configuration(
+        self,
+        remote: str,
+        *,
+        worktree: str | Path | None = None,
+    ) -> tuple[str, str, dict[str, Any]]: ...
+
+    def prepare_managed_worktree(self, worktree_id: str) -> Path: ...
+
+    def path_content_sha256(
+        self,
+        path: bytes,
+        *,
+        worktree: str | Path | None = None,
+    ) -> str | None: ...
+
+    def read_pull_request_metadata(self, pr_id: str) -> tuple[bytes, str] | None: ...
+
+    def list_pull_request_metadata(self, *, limit: int) -> tuple[tuple[str, bytes, str], ...]: ...
+
+    def write_pull_request_metadata(
+        self,
+        pr_id: str,
+        data: bytes,
+        *,
+        expected_sha256: str | None,
+        create: bool = False,
+    ) -> str: ...
+
+    def classify_external_effect(
+        self,
+        operation: str,
+        context: dict[str, Any],
+        result: Any,
+    ) -> ExternalEffectClassification: ...
+
+
 class HumanProvider(Protocol):
     def write(self, message: str) -> None: ...
 
@@ -795,6 +941,7 @@ class ResourceProviderSubstrate(Protocol):
     filesystem: FilesystemProvider
     clock: ClockProvider
     shell: ShellProvider
+    git: GitProvider
     human: HumanProvider
     jsonrpc: JsonRpcProvider
     mcp: McpProvider

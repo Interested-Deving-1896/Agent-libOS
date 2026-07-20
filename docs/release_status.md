@@ -7,6 +7,13 @@ configuration has been release-validated.
 
 ## Closed release blockers and P1 architecture debt
 
+- `Runtime.git` is a typed system-Git provider pinned to the workspace root.
+  It validates repository/config/executable identity, uses state-token CAS and
+  a cross-process lock, requires affected filesystem plus Git authority, and
+  separates local mutation, fetch, push, and simulated-PR evidence. Managed
+  managed checkouts, immutable patch Objects, existing Host-configured remotes, and
+  repository-local simulated PRs are implemented without arbitrary Git argv,
+  model URLs, executable hooks/helpers, or a Git hosting dependency.
 - Publication-owned launch and exec artifacts use exact durable receipts,
   atomic state transitions, idempotent compensation, recovery claims, and a
   fail-closed recovery fence. Recovery precedes global JIT rehydration.
@@ -148,8 +155,8 @@ configuration has been release-validated.
 
 - Compilation, architecture/blocking-work checks, protected-operation coverage,
   release-contract checks, whitespace checks, and the invariant manifest pass.
-  All 80 declared invariants resolve against 3,169 collected pytest nodes.
-- The combined deterministic matrix passes 2,896 tests with 261 documented
+  All 83 declared invariants resolve against 3,297 collected pytest nodes.
+- The combined deterministic matrix passes 3,024 tests with 261 documented
   PostgreSQL, dependency, platform, or explicit real-provider opt-in skips and
   no failures or errors.
 - The complete PostgreSQL service gate passes 259 selected tests with no skips
@@ -157,7 +164,9 @@ configuration has been release-validated.
 - The GUI lane passes all 19 Vitest files and 67 tests, TypeScript type checking,
   and the production frontend build.
 - The runtime-safety release smoke passes all three selected tasks with complete
-  audit evidence, no unauthorized effects, and no false denials.
+  audit evidence, no unauthorized effects, and no false denials. Four focused
+  Git tasks additionally pass for managed-checkout containment, malicious
+  repository config, remote misuse, and patch-label lineage.
 - The practical-workflow evaluation passes three `native-live` scenarios and 80
   modeled scenarios while retaining their distinct evidence labels and using no
   modeled fallback for native scenarios.
@@ -193,6 +202,11 @@ configuration has been release-validated.
   entrypoints. Repository-level PTY module, example Skill and Image assets,
   benchmarks, tests, and documentation are source-distribution or checkout
   assets, as documented in the README.
+- Git is a Python Runtime/model-tool surface only. It requires an existing
+  non-bare workspace repository and system Git 2.22 or newer; unavailable Git
+  fails individual calls without preventing Runtime startup. Host-configured
+  remotes are the only first-class Git network exception. There is no Git CLI,
+  GUI/HTTP surface, or real GitHub/GitLab API integration in 0.3.2.
 
 ## Remaining environment gates and non-blocking debt
 
@@ -204,6 +218,9 @@ configuration has been release-validated.
 - Real MCP SDK/server, real LLM, network proxy and TLS topology, and provider
   credentials remain explicit opt-in gates. Deterministic or loopback evidence
   is not presented as real-provider evidence.
+- Real Git HTTPS/OpenSSH authentication, Host credential-manager variations,
+  and native Windows Git path/locking behavior are environment gates. Local
+  bare-remote tests do not establish hosted-provider interoperability.
 - Payload retention is an operator-triggered maintenance policy, not an implicit
   startup behavior. Million-record benchmark timing remains informational rather
   than a latency guarantee.

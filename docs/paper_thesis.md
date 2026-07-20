@@ -52,8 +52,9 @@ substrate for capability-controlled self-evolution.
    The current implementation realizes the model in Python with Capability,
    Resource Provider Substrate, runtime store persistence, audit/events, scoped
    checkpoint restore/fork/replay diagnostics, persistent LLM call accounting,
-   image registry/exec/commit primitives, standard `SKILL.md` packages, JSON-RPC over
-   HTTP client endpoints, MCP client tools over registered servers, and
+   image registry/exec/commit primitives, standard `SKILL.md` packages, a typed
+   system-Git provider for the fixed workspace repository, JSON-RPC over HTTP
+   client endpoints, MCP client tools over registered servers, and
    Deno/TypeScript JIT tools that can reach libOS only through syscall RPC.
    The same implementation carries trusted data-flow labels, enforces
    Host-owned Sink clearance at filesystem-write, LLM, Human, JSON-RPC, MCP,
@@ -71,13 +72,13 @@ substrate for capability-controlled self-evolution.
 
 3. Benchmark suite.
    The current implementation includes an M1 deterministic runtime-safety
-   harness with 28 schema-v1 adversarial tasks, wrapper baselines, ablations,
+   harness with 32 schema-v1 adversarial tasks, wrapper baselines, ablations,
    declared allowed/forbidden side effects, evidence-backed outcome records,
    explicit exact/prefix/glob oracle matching, and fail-closed stable metrics
    output. The suite includes a first self-evolution subset covering Skill
    activation, JIT registration, image registration/exec/checkpoint commit,
-   child-process delegation, checkpoint fork, and JSON-RPC remote-resource
-   visibility.
+   child-process delegation, checkpoint fork, JSON-RPC remote-resource
+   visibility, and Git worktree/config/remote/patch-lineage boundaries.
 
 4. Evaluation.
    The paper should compare Agent libOS against direct tool wrappers,

@@ -700,11 +700,13 @@ constraints.
 
 For the exact built-in inspection argv `git status`, `git status --short`,
 `git branch --show-current`, `git rev-parse --show-toplevel`, `git diff`, and
-`git diff --stat`, the shell primitive injects `--no-optional-locks`, disables
-`core.fsmonitor`, and adds `--no-ext-diff` for the two diff forms.
-Authorization and returned results retain the original argv. Configured or
-human-approved Git argv outside this exact set do not receive this rewrite and
-must be assessed under their own rule/approval context.
+`git diff --stat`, Shell and PTY apply the shared Git-provider validation and
+inject no-pager/no-optional-lock/no-fsmonitor/no-external-diff/no-textconv and
+no-lazy-fetch hardening. Matching is case-insensitive and accepts `git.exe`.
+Authorization and returned results retain the original argv. Every other raw
+Git argv—including mutation and remote commands—is deterministically rejected
+before Shell policy or Human approval, even under `always_allow`; callers must
+use the typed `Runtime.git` boundary.
 
 Scoped denies are supported with `AuthorityRule` constraints. An unconstrained
 deny still dominates all matching grants; a constrained deny dominates only when
@@ -713,3 +715,42 @@ its rule matches the current operation context, so policy can allow read-only
 
 Block-list checks also scan nested executable-looking argv tokens such as
 `bash`, `powershell`, `python`, or `curl`.
+
+## Git Authority
+
+Typed Git authority is separate from Shell authority. The repository resource
+is `git:workspace` with `read`, `diff`, `write`, `delete`, and `admin` rights.
+Existing remotes use `git_remote:workspace:<remote>`: `read` permits fetch/pull
+input, `write` permits push, and `delete`/`admin` cover remote ref deletion and
+force-with-lease. Simulated pull requests use
+`git_pr:workspace:<pr-id>` with `read`, `write`, `approve`, and `delete`; listing
+uses the wildcard read resource `git_pr:workspace:*`.
+
+Remote capability constraints can bind `git_remote`,
+`git_url_fingerprint`, `git_allowed_refs`, `git_expected_state_token`, and
+`git_old_oid`. The primitive derives these values from the pinned repository
+and existing remote. A scoped deny is evaluated before remote metadata lookup,
+so denied authority cannot enumerate a configured remote or its URL hash.
+
+All mutations require an opaque state token from a previous Git read. The
+primitive checks it after ordinary authority and again under the cross-process
+repository lock immediately before dispatch. Checkout-affecting operations
+also authorize exact filesystem paths, or the selected worktree subtree when a
+safe preflight cannot enumerate every path. A Git write grant therefore cannot
+rewrite files without matching filesystem rights, while filesystem authority
+cannot directly access `.git` metadata.
+
+Reset, clean, amend, destructive restore/integration, branch/tag/stash/worktree
+deletion, fetch prune, remote-ref deletion, force-with-lease, simulated-PR
+merge, and patch deletion require the applicable `delete` and `admin` rights
+and a one-use Human approval bound to exact canonical arguments, state token,
+and old OIDs. A broad allowed capability without that approval binding cannot
+satisfy a mandatory approval. Ordinary commit, merge, fast-forward pull, and
+non-forced push follow the capability record's normal `allow`/`ask`/`deny`
+effect.
+
+Git tools in the coding/review image table are visibility only. They do not
+grant `git:*`, `git_remote:*`, `git_pr:*`, filesystem, Task Authority effect,
+or data-flow permission. Existing `shell:git` grants are intentionally not
+translated. See [Git Provider and Primitive](git.md) for the complete operation
+and approval matrix.

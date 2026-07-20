@@ -107,6 +107,36 @@ def test_evaluator_uses_neutral_effect_binding_without_runtime_dependency() -> N
     assert changed.effect is None
 
 
+def test_evaluator_binds_git_old_oid_constraint_exactly() -> None:
+    evaluator = CapabilityEvaluator()
+    expected_oid = "a" * 40
+    cap = _capability(
+        "cap_git_old_oid",
+        effect=CapabilityEffect.ALLOW,
+        constraints={"git_old_oid": expected_oid},
+    )
+
+    allowed = evaluator.decide(
+        subject=cap.subject,
+        resource=cap.resource,
+        requested_right=CapabilityRight.READ.value,
+        matches=[cap],
+        context={"git_old_oid": expected_oid},
+    )
+    changed = evaluator.decide(
+        subject=cap.subject,
+        resource=cap.resource,
+        requested_right=CapabilityRight.READ.value,
+        matches=[cap],
+        context={"git_old_oid": "b" * 40},
+    )
+
+    assert allowed.allowed
+    assert allowed.constraint_results["git_old_oid"]["ok"]
+    assert not changed.allowed
+    assert not changed.constraint_results["git_old_oid"]["ok"]
+
+
 def test_manager_is_a_compatible_facade_over_three_services() -> None:
     store, manager = _manager()
     try:

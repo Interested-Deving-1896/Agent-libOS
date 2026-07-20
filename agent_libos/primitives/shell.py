@@ -27,6 +27,10 @@ from agent_libos.models import (
     SandboxProfile,
 )
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ResourceLimitExceeded, ValidationError
+from agent_libos.primitives.git_command_policy import (
+    harden_read_only_git_argv,
+    validate_and_normalize_raw_git,
+)
 from agent_libos.ports import AuditPort, EventPort
 from agent_libos.substrate import (
     CommandMetrics,
@@ -52,14 +56,6 @@ from agent_libos.sdk import (
 _TOOL_DEFAULTS = DEFAULT_CONFIG.tools
 
 _WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat", ".com", ".ps1")
-_READ_ONLY_GIT_COMMANDS = {
-    ("git", "status"),
-    ("git", "status", "--short"),
-    ("git", "branch", "--show-current"),
-    ("git", "rev-parse", "--show-toplevel"),
-    ("git", "diff"),
-    ("git", "diff", "--stat"),
-}
 
 
 @dataclass(frozen=True)
@@ -89,6 +85,9 @@ class ShellExecutionPolicy(Protocol):
     """
 
     def validate_argv(self, argv: list[str]) -> list[str]:
+        ...
+
+    def harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
         ...
 
     def resource_for(self, argv: list[str]) -> str:
@@ -250,7 +249,7 @@ class ShellAdapter:
         decision = self._authorize(pid, checked, resource, timeout=selected_timeout, cwd=selected_cwd)
         if not decision.allowed and not decision.ask_human:
             raise CapabilityDenied(f"{pid} denied shell execute on {resource}: {decision.reason}")
-        dispatch_argv = self._harden_read_only_git_argv(checked)
+        dispatch_argv = self.harden_read_only_git_argv(checked)
         sink = self.executable_data_sink("shell", dispatch_argv[0], cwd=cwd)
         executable_identity = sink.identity.split(":", 1)[1]
         flow_context = self._data_flow().context_from_source_oids(pid, source_oids)
@@ -497,19 +496,12 @@ class ShellAdapter:
             return completed
 
     def _harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
-        """Harden the exact built-in Git read allowlist before provider use."""
-        if tuple(argv) not in _READ_ONLY_GIT_COMMANDS:
-            return list(argv)
-        # --no-optional-locks prevents index refresh writes; overriding
-        # core.fsmonitor prevents a repository-configured executable hook.
-        hardened = ["git", "--no-optional-locks", "-c", "core.fsmonitor=false", argv[1]]
-        remaining = list(argv[2:])
-        if argv[1] == "diff":
-            # diff.external and attribute diff drivers otherwise execute
-            # arbitrary repository-controlled helpers even for exact git diff.
-            hardened.append("--no-ext-diff")
-        hardened.extend(remaining)
-        return hardened
+        return self.harden_read_only_git_argv(argv)
+
+    def harden_read_only_git_argv(self, argv: list[str]) -> list[str]:
+        """Apply the shared exact-read Git hardening used by Shell and PTY."""
+
+        return harden_read_only_git_argv(argv)
 
     def _protected(self):
         return self.protected_operations
@@ -1401,7 +1393,9 @@ class ShellAdapter:
             if index == 0 and not value.strip():
                 raise ValidationError("shell argv[0] must be non-empty")
             checked.append(value)
-        return checked
+        # This check deliberately precedes policy evaluation. An always_allow
+        # shell grant cannot become an alternate Git mutation/remote boundary.
+        return validate_and_normalize_raw_git(checked)
 
     def _validate_timeout(self, timeout: float) -> float:
         try:

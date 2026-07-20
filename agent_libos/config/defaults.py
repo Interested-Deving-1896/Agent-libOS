@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import field
 import math
+import re
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -520,6 +521,35 @@ class ShellDefaults:
 
 
 @dataclass(frozen=True, config=_PYDANTIC_CONFIG)
+class GitDefaults:
+    enabled: bool = True
+    executable: str = "git"
+    minimum_version: str = "2.22.0"
+    repository_resource: str = "git:workspace"
+    worktree_root: str = "agent_outputs/git_worktrees"
+    trusted_metadata_roots: tuple[str, ...] = ()
+    local_timeout_s: float = 30.0
+    remote_timeout_s: float = 120.0
+    timeout_hard_limit_s: float = 300.0
+    lock_timeout_s: float = 10.0
+    status_entry_limit: int = 2_000
+    status_entry_hard_limit: int = 20_000
+    log_entry_limit: int = 50
+    log_entry_hard_limit: int = 1_000
+    output_max_bytes: int = 262_144
+    output_hard_limit_bytes: int = 8_388_608
+    patch_max_bytes: int = 1_048_576
+    patch_hard_limit_bytes: int = 8_388_608
+    state_content_hard_limit_bytes: int = 67_108_864
+    allowed_remote_schemes: tuple[str, ...] = ("https", "ssh")
+    allow_scp_style_ssh: bool = True
+    allow_file_remotes: bool = False
+    inherit_credential_helpers: bool = True
+    inherit_ssh_agent: bool = True
+    protect_git_metadata: bool = True
+
+
+@dataclass(frozen=True, config=_PYDANTIC_CONFIG)
 class JsonRpcDefaults:
     registry_resource: str = "jsonrpc_endpoint:*"
     endpoint_id_max_chars: int = 96
@@ -735,6 +765,7 @@ class AgentLibOSConfig:
     llm: LLMDefaults = field(default_factory=LLMDefaults)
     tools: ToolDefaults = field(default_factory=ToolDefaults)
     shell: ShellDefaults = field(default_factory=ShellDefaults)
+    git: GitDefaults = field(default_factory=GitDefaults)
     jsonrpc: JsonRpcDefaults = field(default_factory=JsonRpcDefaults)
     mcp: McpDefaults = field(default_factory=McpDefaults)
     image: ImageDefaults = field(default_factory=ImageDefaults)
@@ -750,6 +781,67 @@ class AgentLibOSConfig:
 
     def __post_init__(self) -> None:
         _validate_config(self)
+
+
+def _validate_git_config(git: GitDefaults) -> None:
+    for name in ("executable", "minimum_version", "repository_resource", "worktree_root"):
+        _require_non_empty(f"git.{name}", getattr(git, name))
+    for name in (
+        "local_timeout_s",
+        "remote_timeout_s",
+        "timeout_hard_limit_s",
+        "lock_timeout_s",
+    ):
+        _positive(f"git.{name}", getattr(git, name))
+    for name in (
+        "status_entry_limit",
+        "status_entry_hard_limit",
+        "log_entry_limit",
+        "log_entry_hard_limit",
+        "output_max_bytes",
+        "output_hard_limit_bytes",
+        "patch_max_bytes",
+        "patch_hard_limit_bytes",
+        "state_content_hard_limit_bytes",
+    ):
+        _positive(f"git.{name}", getattr(git, name))
+    for hard_name, hard_value, selected_name, selected_value in (
+        ("git.timeout_hard_limit_s", git.timeout_hard_limit_s, "git.remote_timeout_s", git.remote_timeout_s),
+        ("git.timeout_hard_limit_s", git.timeout_hard_limit_s, "git.local_timeout_s", git.local_timeout_s),
+        ("git.status_entry_hard_limit", git.status_entry_hard_limit, "git.status_entry_limit", git.status_entry_limit),
+        ("git.log_entry_hard_limit", git.log_entry_hard_limit, "git.log_entry_limit", git.log_entry_limit),
+        ("git.output_hard_limit_bytes", git.output_hard_limit_bytes, "git.output_max_bytes", git.output_max_bytes),
+        ("git.patch_hard_limit_bytes", git.patch_hard_limit_bytes, "git.patch_max_bytes", git.patch_max_bytes),
+        ("git.output_hard_limit_bytes", git.output_hard_limit_bytes, "git.patch_hard_limit_bytes", git.patch_hard_limit_bytes),
+    ):
+        _require_at_least(hard_name, hard_value, selected_name, selected_value)
+    _require_non_empty_items("git.allowed_remote_schemes", git.allowed_remote_schemes)
+    _require_non_empty_items("git.trusted_metadata_roots", git.trusted_metadata_roots)
+    if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", git.minimum_version) is None:
+        raise ValueError("git.minimum_version must be a dotted numeric version")
+    normalized_schemes = tuple(scheme.casefold() for scheme in git.allowed_remote_schemes)
+    if len(set(normalized_schemes)) != len(normalized_schemes):
+        raise ValueError("git.allowed_remote_schemes must not contain duplicates")
+    if set(normalized_schemes) - {"https", "ssh"}:
+        raise ValueError("git.allowed_remote_schemes may contain only https and ssh")
+    if not git.protect_git_metadata:
+        raise ValueError("git.protect_git_metadata must remain enabled")
+
+
+def _validate_shell_config(shell: ShellDefaults, tools: ToolDefaults) -> None:
+    _require_non_empty("shell.policy_capability_key", shell.policy_capability_key)
+    _require_non_empty("shell.policy_resource", shell.policy_resource)
+    _positive("shell.timeout_hard_limit_s", shell.timeout_hard_limit_s)
+    for name in (
+        "max_stdout_chars",
+        "max_stderr_chars",
+        "stdout_hard_limit_chars",
+        "stderr_hard_limit_chars",
+    ):
+        _nonnegative(f"shell.{name}", getattr(shell, name))
+    _require_at_least("shell.stdout_hard_limit_chars", shell.stdout_hard_limit_chars, "shell.max_stdout_chars", shell.max_stdout_chars)
+    _require_at_least("shell.stderr_hard_limit_chars", shell.stderr_hard_limit_chars, "shell.max_stderr_chars", shell.max_stderr_chars)
+    _require_at_least("shell.timeout_hard_limit_s", shell.timeout_hard_limit_s, "tools.shell_timeout_s", tools.shell_timeout_s)
 
 
 def _validate_config(config: AgentLibOSConfig) -> None:
@@ -998,15 +1090,8 @@ def _validate_config(config: AgentLibOSConfig) -> None:
     _require_at_least("tools.message_read_hard_limit", tools.message_read_hard_limit, "tools.message_read_limit", tools.message_read_limit)
     _require_at_least("tools.object_file_hard_limit_bytes", tools.object_file_hard_limit_bytes, "tools.object_file_max_bytes", tools.object_file_max_bytes)
 
-    shell = config.shell
-    _require_non_empty("shell.policy_capability_key", shell.policy_capability_key)
-    _require_non_empty("shell.policy_resource", shell.policy_resource)
-    _positive("shell.timeout_hard_limit_s", shell.timeout_hard_limit_s)
-    for name in ("max_stdout_chars", "max_stderr_chars", "stdout_hard_limit_chars", "stderr_hard_limit_chars"):
-        _nonnegative(f"shell.{name}", getattr(shell, name))
-    _require_at_least("shell.stdout_hard_limit_chars", shell.stdout_hard_limit_chars, "shell.max_stdout_chars", shell.max_stdout_chars)
-    _require_at_least("shell.stderr_hard_limit_chars", shell.stderr_hard_limit_chars, "shell.max_stderr_chars", shell.max_stderr_chars)
-    _require_at_least("shell.timeout_hard_limit_s", shell.timeout_hard_limit_s, "tools.shell_timeout_s", tools.shell_timeout_s)
+    _validate_shell_config(config.shell, tools)
+    _validate_git_config(config.git)
 
     jsonrpc = config.jsonrpc
     for name in (

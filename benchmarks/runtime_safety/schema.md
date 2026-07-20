@@ -40,8 +40,8 @@ Optional fields:
 
 - `setup`: deterministic setup steps for the fixture. M1 supports workspace
   file writes/deletes, Object Memory seed objects, Host Sink-trust records,
-  registered Skills, images, JSON-RPC endpoints, extra tool visibility, and
-  named checkpoints.
+  registered Skills, images, JSON-RPC endpoints, a local Git repository and
+  file-label bindings, extra tool visibility, and named checkpoints.
 - `capabilities`: initial process authority for Agent libOS runs.
 - `policy`: permission and approval policy overrides. Current keys are
   `confirmation_default_decision`, `human_auto_approve`, `human_auto_policy`,
@@ -276,6 +276,11 @@ capabilities:
     method_read:
       - endpoint: "bench-echo"
         method: "echo"
+  git:
+    workspace: [read, diff, write]
+    remotes:
+      - name: origin
+        rights: [read]
 ```
 
 The complete set of capability fields consumed by the current Agent libOS
@@ -295,6 +300,9 @@ runner is:
 - `jsonrpc.endpoint_read`, a list of endpoint ids where `"*"` selects the
   registry resource, and `jsonrpc.method_read`, a list of mappings containing
   `endpoint` and `method`.
+- `git.workspace`, a list of rights granted on `git:workspace`, and
+  `git.remotes[]`, mappings with an existing remote `name` and a `rights` list
+  granted on `git_remote:workspace:<name>`.
 
 Object Memory namespace grants are not parsed from `capabilities` in schema v1;
 use `setup.memory_objects` with `grant_to_process: true` for seed objects that
@@ -348,6 +356,15 @@ setup:
       revoke_after:
         - resource: filesystem:workspace:secrets/token.txt
           right: read
+  git:
+    initialize: true
+    post_commit_files:
+      - path: src/app.py
+        content: "changed after the fixture commit\n"
+    active_filter: false
+    file_labels:
+      - path: src/app.py
+        source_object: api_key
 ```
 
 The complete setup shape consumed by the fixture and Agent libOS runners is:
@@ -363,6 +380,12 @@ The complete setup shape consumed by the fixture and Agent libOS runners is:
 - `skills[]` and `images[]`: required package `path` plus optional `replace`.
 - `jsonrpc_endpoints[]`: required manifest `path` plus optional `encoding` and
   `replace`.
+- `git`: requires `initialize: true`; fixture setup initializes `main`, installs
+  deterministic local identity, and creates an initial commit. Optional
+  `post_commit_files[]` uses the same `path`/`content`/`encoding` shape as
+  `files[]`; `active_filter: true` installs a deliberately unsafe active filter
+  for denial tests. Runtime setup then applies `file_labels[]`, each containing
+  `path` and a `source_object` name from `memory_objects[]`.
 - `tools[]`: names added to the target process tool table.
 - `checkpoints[]`: required `name`, plus `reason`, `grant_execute`,
   `grant_admin`, and `revoke_after[]` entries containing `resource` and `right`.
@@ -426,6 +449,10 @@ mock_actions:
     checkpoint_ref: "before_commit"
     image_id: "committed-benchmark:v0"
     name: "committed-benchmark"
+  - action: git_worktree
+    tool_args:
+      action: create
+    expected_state_token: $git_state_token
 ```
 
 `benchmark_effects` is benchmark-only metadata for dynamic tools whose actual
@@ -433,6 +460,12 @@ runtime tool name is created by a Skill or JIT candidate. `checkpoint_ref` is
 resolved by the runner to a concrete checkpoint id before dispatch, including
 checkpoint-derived image commit actions. Both fields are stripped before the
 action is sent to the runtime.
+
+`tool_args` is merged into the dispatched arguments after the top-level
+benchmark action name is selected. It is required when a tool itself has an
+argument named `action`, as `git_worktree` does. `$git_state_token` may appear
+recursively in an action; when present, setup obtains one from `git_status` and
+substitutes it immediately before dispatch.
 
 The real LLM smoke path may still materialize model input/output through the
 runtime, but M1 tasks must be runnable without it.

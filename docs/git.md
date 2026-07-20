@@ -1,0 +1,264 @@
+# Git Provider and Primitive
+
+Agent libOS exposes Git as a first-class `Runtime.git` primitive backed by the
+Host system Git. The boundary is deliberately typed: model tools select a
+documented operation and structured parameters, never an arbitrary Git argv,
+URL, credential, refspec, hook, or configuration value.
+
+This release covers the Python Runtime and model tool surfaces only. It does
+not add Git commands to the CLI, GUI, or HTTP API, and it does not integrate
+with GitHub, GitLab, or another hosting service.
+
+## Repository scope and availability
+
+The provider is pinned to the Runtime workspace root. That path must already
+be the root of a non-bare Git repository; the provider does not search parent
+directories, initialize a repository, or clone one. `worktree_id="main"`
+selects the root checkout. Other ids are accepted only when they resolve to a
+Runtime-created managed worktree or to a linked worktree whose metadata root
+is explicitly listed in `git.trusted_metadata_roots`.
+
+Git is optional at Runtime startup. `git.enabled: false`, a missing executable,
+or a version older than `git.minimum_version` leaves the rest of the Runtime
+usable. Git calls then fail with a stable `git_unavailable` or
+`unsupported_git_version` error. The default minimum is Git 2.22.0. Both SHA-1
+and SHA-256 repositories are supported.
+
+At every call the provider verifies the workspace root, worktree, Git directory,
+common directory, object format, and filesystem identity. It rejects:
+
+- parent-repository discovery and bare workspace roots;
+- a symlinked `.git`, repository config, attributes source, or metadata path;
+- a forged or untrusted external gitfile, object alternate, or linked-worktree
+  metadata root;
+- worktrees outside the configured workspace/metadata trust boundary;
+- repository identity changes before, during, or after an operation.
+
+Managed worktrees are created below `git.worktree_root`, which must resolve to
+a proper subdirectory of the workspace and outside `.git`. The Runtime creates
+the path and opaque id; the model cannot supply an arbitrary destination. The
+provider adds that root to the repository-local `info/exclude` without editing
+the tracked `.gitignore`. Removal is explicit, and unknown or dirty worktrees
+are never automatically deleted.
+
+## Public Runtime and tool surface
+
+Every method below has a synchronous form on `Runtime.git` and an asynchronous
+form prefixed with `a`, such as `status`/`astatus` and `push`/`apush`. All model
+arguments use strict Pydantic schemas with unknown fields rejected.
+
+| Category | Model tools |
+| --- | --- |
+| Inspect | `git_repository_info`, `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_list_refs`, `git_list_remotes`, `git_list_worktrees` |
+| Local change | `git_stage`, `git_unstage`, `git_commit`, `git_restore`, `git_branch`, `git_switch`, `git_tag`, `git_integrate`, `git_stash`, `git_reset`, `git_clean`, `git_worktree` |
+| Patch | `git_create_patch`, `git_apply_patch` |
+| Remote | `git_fetch`, `git_pull`, `git_push` |
+| Simulated pull request | `git_create_pull_request`, `git_list_pull_requests`, `git_inspect_pull_request`, `git_review_pull_request`, `git_merge_pull_request`, `git_close_pull_request` |
+
+`git_integrate` accepts only `merge`, `rebase`, `cherry_pick`, `revert`, and
+`abort`. Pull defaults to `ff_only` and also supports `merge` and `rebase`.
+Push requires explicit remote and local refs (remote deletion omits the local
+ref). A forced update is available only as force-with-lease with the exact
+expected remote OID; naked force is not an interface option.
+
+There is no typed operation for init, clone, remote/config mutation, arbitrary
+argv, submodule update, LFS, signing, bisect, GC/maintenance, plumbing, custom
+upload/receive pack, or model-selected credentials.
+
+## Results, paths, state, and bounds
+
+Public dataclasses include `GitRepositoryInfo`, `GitStateToken`, `GitPath`,
+`GitStatusEntry`, `GitStatusResult`, `GitDiffResult`, `GitRef`, `GitCommit`,
+`GitRemoteInfo`, `GitWorktreeInfo`, `GitOperationResult`, `GitPatchArtifact`,
+and `GitPullRequest`.
+
+Git output is captured and parsed as bytes. A `GitPath` contains a display
+string plus a base64 token for the exact repository-relative bytes. When a path
+is not valid UTF-8, `lossy` is true and callers must return `path_b64` instead
+of reconstructing the path from `display`. Literal pathspecs and `--` are used
+for path-bearing commands, so a filename beginning with `-`, containing a
+newline, or using non-UTF-8 bytes cannot become an option.
+
+List and content responses declare `truncated`, byte count, and SHA-256. The
+normal result limit may produce an explicitly truncated result where the
+operation supports it; crossing the configured hard limit raises
+`output_too_large`. A patch artifact must fit in full—no partial Object is
+created.
+
+Every mutation accepts an opaque 64-hex `expected_state_token` obtained from a
+prior repository read. The token commits to repository/worktree identity,
+HEAD/ref state, index, effective configuration, refs, worktree registry,
+simulated-PR metadata, and bounded worktree content state. Mutation acquires a
+cross-process repository lock and compares the token again immediately before
+dispatch. Drift returns `stale_state`; success returns a new token in
+`GitOperationResult.after`.
+
+Refs are restricted to validated full refs, strict branch/tag names, or exact
+object ids resolved by the provider. Model-supplied revision expressions,
+path/ref ambiguity, option injection, and arbitrary refspecs are not accepted.
+
+## Capability and approval model
+
+Git authority is independent of tool visibility and legacy Shell grants:
+
+| Resource | Rights and use |
+| --- | --- |
+| `git:workspace` | `read`, `diff`, `write`, `delete`, and `admin` for the fixed repository |
+| `git_remote:workspace:<remote>` | `read` for fetch/pull input, `write` for push, and `delete`/`admin` for deletion or force-with-lease |
+| `git_pr:workspace:<pr-id>` | `read`, `write`, `approve`, and `delete` for one simulated PR; wildcard read is used for listing |
+
+Remote capability constraints may bind `git_remote`, `git_url_fingerprint`,
+`git_allowed_refs`, `git_expected_state_token`, and `git_old_oid`. These are
+matched against Host-derived operation context, not model assertions.
+
+An operation that may read or rewrite checkout files also requires the
+corresponding `filesystem:workspace:<path>` rights. Exact path operations check
+each path. When a safe preflight cannot enumerate the affected set, the
+operation requires read/write/delete authority for the selected worktree
+subtree. Git metadata is never authorized through filesystem capabilities.
+
+The following actions require `delete` and `admin` authority plus a mandatory
+one-use Human approval bound to the exact parameters, old state token, and
+relevant old OID:
+
+- reset, clean, amend, destructive restore, and ref-rewriting integration;
+- branch/tag/stash/worktree/ref deletion and branch rename;
+- stash pop, stash including untracked files, forced switch/tag, and fetch
+  prune;
+- remote-ref deletion and force-with-lease;
+- simulated-PR merge;
+- a patch application whose preview deletes files.
+
+Ordinary commit, non-destructive merge, fast-forward pull, and non-forced push
+follow the selected capability effect (`allow`, `ask`, or `deny`). A mandatory
+approval cannot be satisfied by a broad unbound allow. Capability decisions,
+finite-use reservations, approval binding, the pending effect, event, audit,
+and operation evidence use the protected-operation lifecycle.
+
+Git provider effects must also pass the process Task Authority Manifest. The
+relevant effect classes are `git.read`, `git.mutate`, `git.fetch`, `git.push`,
+and `git.pull_request`; their protected-operation descriptors use the
+`primitive.git.*` namespace. Exact method boundary names such as
+`runtime.git.status` and `runtime.git.commit` are included in Explain evidence.
+An old `shell:git` grant confers none of these capabilities.
+
+## Repository configuration and command hardening
+
+Every Git subprocess uses a Host-selected executable outside the workspace and
+a fixed non-interactive environment. The provider disables or neutralizes:
+
+- pagers, optional locks, fsmonitor, untracked cache, maintenance, hooks,
+  editors, merge auto-edit, signing, replace refs, submodule recursion, external
+  diff/textconv, and implicit lazy fetch;
+- workspace-controlled global configuration and executable lookup;
+- prompts and interactive credential acquisition.
+
+Repository configuration is treated as data, not executable authority. An
+operation fails `unsafe_repository_config` before dispatch when its active
+configuration or attributes select an external clean/smudge/process filter,
+LFS filter, diff command, merge driver, alternate-refs command, custom SSH
+command, upload/receive pack, remote helper, promisor/partial clone, shell
+credential helper, repository credential helper, or workspace-controlled
+include. Hooks are redirected to an empty Host-owned directory and commands
+also use `--no-verify` where applicable.
+
+Commit author/committer identity is read from effective repository or Host Git
+configuration. The model can supply only the commit message; author overrides,
+environment identity, signing, and editor invocation are unavailable.
+
+Filesystem reads/writes/deletes reject `.git` path components, the worktree
+`.git` file, and Git metadata aliases when `git.protect_git_metadata` is true.
+Only the Git provider may mutate repository metadata.
+
+For compatibility, Shell, the optional PTY module, and benchmark provenance
+share the provider's repository validation for exactly six raw inspection
+commands: `git status`, `git status --short`, `git branch --show-current`,
+`git rev-parse --show-toplevel`, `git diff`, and `git diff --stat`. Executable
+matching is case-insensitive and accepts the platform `git.exe` spelling. The
+commands receive the same no-pager/no-lock/no-fsmonitor/no-external-diff and
+no-lazy-fetch hardening. Every other raw Git command is rejected before shell
+policy or Human approval, including when Shell policy is `always_allow`.
+
+## Remote operations
+
+The model supplies only an existing remote name. Fetch/pull/push use the URL in
+the repository config; the model cannot supply a URL, credential, refspec,
+protocol helper, or transport command. The default protocol set is HTTPS and
+controlled OpenSSH. URLs with HTTPS userinfo/passwords, query/fragment data,
+non-`git` SSH users, `ext::`, custom protocols, or custom helpers are rejected.
+Each remote must resolve to exactly one fetch URL and one push URL. Configured
+fetch refspecs may map only a branch (or the branch wildcard) into that
+remote's matching `refs/remotes/<remote>/` namespace. Typed fetch/pull also
+override implicit prune and tag-fetch settings; typed push disables implicit
+follow-tags, push certificates, and configured push options, so repository or
+Host defaults cannot broaden the approved effect.
+Local `file:` remotes are disabled by default and exist only as an explicit
+Host configuration option for controlled deployments and deterministic tests.
+
+HTTPS may use standard Host credential helpers only when the helper was loaded
+from system/global config, resolves to an executable outside the workspace,
+and its executable identity can be hashed. `!shell` helpers and repository
+helpers are forbidden. SSH uses a Host-resolved OpenSSH executable, batch mode,
+the inherited SSH agent when enabled, no user config, no forwarding, and no
+proxy/local commands. Authentication material is never placed in model-visible
+argv, tool results, audit, events, or provider error text.
+
+Before approval the primitive captures hashes of the fetch/push URLs, effective
+configuration, credential/SSH executable identities, remote-tracking refs, and
+the expected old remote OID. The provider recomputes that fingerprint after
+approval and immediately before dispatch. A change returns `stale_state`.
+Timeout or ambiguous transport failure remains `unknown`; startup
+reconciliation may query refs/receipts but never replays the operation.
+
+Host-configured remotes are the only first-class Git-provider network exception
+to the general rule that remote targets must be separately registered. This is
+not a real GitHub/GitLab API integration and does not create hosted pull
+requests.
+
+## Patch Objects and simulated pull requests
+
+`git_create_patch` creates an immutable `ObjectType.CODE_PATCH`. Its payload
+contains the complete patch bytes, base/head/index OIDs, source state token,
+changed byte-safe paths, byte count, and SHA-256. Object provenance and data
+labels include the files that contributed to the patch. If the complete patch
+exceeds `git.patch_max_bytes` or the Object hard limit, the call fails without
+creating an Object.
+
+`git_apply_patch` accepts only an existing patch Object created by this
+primitive. It validates the artifact hash and schema, checks the expected state,
+runs `git apply --check` as a preview, determines affected/deleted paths, then
+applies through the typed mutation boundary. The source Object's labels flow to
+the result and affected file bindings.
+
+Simulated pull requests are repository-local workflow records. Immutable base
+and head snapshots live below `refs/agent-libos/pull-requests/`; versioned
+metadata and review-body hashes are written atomically below the Git common
+directory. Creation captures base/head OIDs and patch hash. Review supports
+comment, approve, and request-changes. Close retains evidence. Merge supports
+fast-forward, merge commit, and squash, always compares the live base/head and
+metadata hashes with the recorded values, requires a clean selected worktree,
+and uses mandatory approval. These records do not contact a hosting platform.
+
+## Stable errors and recovery
+
+`GitError.code` is stable and includes: `git_unavailable`,
+`unsupported_git_version`, `not_repository`, `unsafe_repository`,
+`repository_busy`, `stale_state`, `invalid_path`, `invalid_ref`,
+`dirty_worktree`, `conflict`, `identity_missing`,
+`unsafe_repository_config`, `auth_required`, `non_fast_forward`,
+`remote_rejected`, `timeout`, `output_too_large`, and `unknown_effect`.
+Model tools map these to the normal Tool error envelope and expose only the
+stable Git code and operation, never raw provider stderr that might contain a
+secret.
+
+Provider-certified failures before any protected Git effect starts abandon the
+pending intent and may restore a finite capability reservation. After dispatch,
+timeouts, cancellation, repository identity loss, failed post-validation, and
+unclassifiable outcomes retain an `unknown` effect. Startup reconciliation is
+query-only; it inspects repository refs, worktree state, simulated-PR metadata,
+or remote receipts and never automatically retries a mutation or network call.
+
+Checkpoint restore and image commit do not capture, package, rewind, or delete
+Git metadata, checkout state, managed worktrees, remote state, or simulated-PR
+metadata. They report the already-recorded Git external effects. `.git` remains
+excluded from image packages.

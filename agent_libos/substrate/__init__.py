@@ -6,6 +6,10 @@ from agent_libos.substrate.base import (
     ExecutableSnapshot,
     executable_content_sha256,
     FilesystemProvider,
+    GitCommandResult,
+    GitProvider,
+    GitRepositoryLayout,
+    GitRepositoryState,
     HierarchicalPathLock,
     HumanProvider,
     JsonRpcProvider,
@@ -21,6 +25,7 @@ from agent_libos.substrate.base import (
     SubprocessLimits,
     SubprocessTimeoutExpired,
 )
+from agent_libos.substrate.git import GitProviderEffectNotStarted, LocalGitProvider
 from agent_libos.substrate.local import (
     LocalClockProvider,
     LocalFilesystemProvider,
@@ -40,6 +45,11 @@ __all__ = [
     "ExecutableSnapshot",
     "executable_content_sha256",
     "FilesystemProvider",
+    "GitCommandResult",
+    "GitProvider",
+    "GitProviderEffectNotStarted",
+    "GitRepositoryLayout",
+    "GitRepositoryState",
     "HierarchicalPathLock",
     "HumanProvider",
     "HttpJsonRpcProvider",
@@ -48,6 +58,7 @@ __all__ = [
     "LocalClockProvider",
     "LocalFilesystemProvider",
     "LocalHumanProvider",
+    "LocalGitProvider",
     "LocalResourceProviderSubstrate",
     "LocalShellProvider",
     "WindowsJobObject",

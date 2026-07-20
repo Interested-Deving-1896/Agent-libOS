@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -72,7 +73,7 @@ AGENT_LIBOS_RUNNERS = {
     "no_fork_attenuation",
 }
 _TERMINAL_STATUSES = {ProcessStatus.EXITED, ProcessStatus.FAILED, ProcessStatus.KILLED}
-_BENCHMARK_ACTION_KEYS = {"benchmark_effects", "checkpoint_ref"}
+_BENCHMARK_ACTION_KEYS = {"benchmark_effects", "checkpoint_ref", "tool_args"}
 
 
 class PlannedActionClient:
@@ -312,7 +313,13 @@ def _run_agent_libos_task(
         pid = runtime.process.spawn(image="review-agent:v0", goal=task.goal)
         setup_objects = _setup_runtime_memory(task, runtime, runner, pid)
         _grant_task_capabilities(task, runtime, pid, runner, setup_objects)
-        setup_state = _setup_runtime_benchmark_resources(task, runtime, workspace, pid)
+        setup_state = _setup_runtime_benchmark_resources(
+            task,
+            runtime,
+            workspace,
+            pid,
+            setup_objects,
+        )
         if isinstance(client, PlannedActionClient):
             client.actions = [_dispatch_action(action, setup_state) for action in task.mock_actions]
             for action in client.actions:
@@ -642,6 +649,27 @@ def _grant_task_capabilities(
                 [CapabilityRight.READ],
                 issued_by=f"benchmark:{task.id}",
             )
+    git = capabilities.get("git") if isinstance(capabilities.get("git"), dict) else {}
+    workspace_rights = git.get("workspace")
+    if isinstance(workspace_rights, list) and workspace_rights:
+        runtime.capability.grant(
+            pid,
+            runtime.git.repository_resource,
+            [str(right) for right in workspace_rights],
+            issued_by=f"benchmark:{task.id}",
+        )
+    for item in git.get("remotes", []) or []:
+        if not isinstance(item, dict):
+            continue
+        remote = str(item.get("name") or "")
+        rights = item.get("rights")
+        if remote and isinstance(rights, list) and rights:
+            runtime.capability.grant(
+                pid,
+                runtime.git.remote_resource(remote),
+                [str(right) for right in rights],
+                issued_by=f"benchmark:{task.id}",
+            )
     if runner == "no_primitive_approval":
         runtime.capability.grant(pid, runtime.filesystem.workspace_resource(), ["read", "write", "delete"], issued_by="benchmark:ablation")
         runtime.shell.grant_policy(pid, "always_allow", issued_by="benchmark:ablation")
@@ -657,6 +685,7 @@ def _setup_runtime_benchmark_resources(
     runtime: Runtime,
     workspace: Path,
     pid: str,
+    setup_objects: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     state: dict[str, Any] = {"checkpoints": {}}
     setup = task.setup or {}
@@ -725,6 +754,38 @@ def _setup_runtime_benchmark_resources(
     extra_tools = setup.get("tools", []) or []
     if extra_tools:
         _add_process_tools(runtime, pid, [str(tool) for tool in extra_tools])
+    git_setup = setup.get("git") if isinstance(setup.get("git"), dict) else {}
+    objects_by_name = {
+        str(item.get("name")): str(item.get("oid"))
+        for item in (setup_objects or [])
+        if item.get("name") and item.get("oid")
+    }
+    for index, item in enumerate(git_setup.get("file_labels", []) or []):
+        if not isinstance(item, dict):
+            raise BenchmarkValidationError(
+                f"{task.id}: setup.git.file_labels[{index}] must be a mapping"
+            )
+        path = str(item.get("path") or "")
+        source_name = str(item.get("source_object") or "")
+        source_oid = objects_by_name.get(source_name)
+        if not path or source_oid is None:
+            raise BenchmarkValidationError(
+                f"{task.id}: setup.git.file_labels[{index}] references invalid data"
+            )
+        selected = safe_workspace_path(workspace, path)
+        context = runtime.data_flow.context_from_source_oids(pid, [source_oid])
+        runtime.data_flow.bind_written_file_digest(
+            pid=pid,
+            normalized_path=path.replace("\\", "/"),
+            content_sha256=hashlib.sha256(selected.read_bytes()).hexdigest(),
+            context=context,
+        )
+    if any(
+        value == "$git_state_token"
+        for action in task.mock_actions
+        for value in _walk_action_values(action)
+    ):
+        state["git_state_token"] = runtime.git.status(pid).state.token
     for item in setup.get("checkpoints", []) or []:
         if not isinstance(item, dict):
             continue
@@ -759,6 +820,12 @@ def _revoke_matching_capabilities(runtime: Runtime, pid: str, resource: str, rig
 
 def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dict[str, Any]:
     selected = {key: value for key, value in action.items() if key not in _BENCHMARK_ACTION_KEYS}
+    tool_args = action.get("tool_args")
+    if tool_args is not None:
+        if not isinstance(tool_args, dict):
+            raise BenchmarkValidationError("benchmark tool_args must be a mapping")
+        selected.update(tool_args)
+    selected = _replace_action_placeholders(selected, setup_state)
     checkpoint_ref = action.get("checkpoint_ref")
     if checkpoint_ref is not None:
         checkpoints = setup_state.get("checkpoints", {})
@@ -766,6 +833,38 @@ def _dispatch_action(action: dict[str, Any], setup_state: dict[str, Any]) -> dic
             raise ValueError(f"unknown benchmark checkpoint_ref: {checkpoint_ref}")
         selected["checkpoint_id"] = checkpoints[checkpoint_ref]
     return selected
+
+
+def _walk_action_values(value: Any) -> Iterable[Any]:
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from _walk_action_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _walk_action_values(item)
+    else:
+        yield value
+
+
+def _replace_action_placeholders(value: Any, setup_state: dict[str, Any]) -> Any:
+    if value == "$git_state_token":
+        token = setup_state.get("git_state_token")
+        if not isinstance(token, str):
+            raise BenchmarkValidationError(
+                "benchmark action requested an unavailable Git state token"
+            )
+        return token
+    if isinstance(value, dict):
+        return {
+            key: _replace_action_placeholders(item, setup_state)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _replace_action_placeholders(item, setup_state)
+            for item in value
+        ]
+    return value
 
 
 def _filesystem_resource(runtime: Runtime, path: str) -> str:

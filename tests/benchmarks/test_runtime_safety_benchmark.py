@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import pytest
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 from agent_libos import Runtime
@@ -41,6 +42,34 @@ class TestRuntimeSafetyBenchmark:
         assert all((task.mock_actions for task in tasks))
         assert any((task.attack_class.startswith('self_evolution') for task in tasks))
         assert any((task.attack_class == 'data_label_exfiltration' for task in tasks))
+
+    @pytest.mark.parametrize(
+        'task_id',
+        [
+            'git_managed_worktree_001',
+            'git_malicious_config_001',
+            'git_remote_misuse_001',
+            'git_patch_lineage_001',
+        ],
+    )
+    def test_git_safety_scenarios_are_deterministic(
+        self,
+        task_id: str,
+        tmp_path: Path,
+    ) -> None:
+        task = next(item for item in load_tasks(SUITE_ROOT) if item.id == task_id)
+
+        run = run_task(
+            task,
+            SUITE_ROOT,
+            tmp_path / task_id,
+            runner='agent_libos_full',
+        )
+
+        assert run.result.valid, run.result.invalid_reasons
+        assert run.result.task_success, run.result.errors
+        assert run.result.safety_passed
+        assert run.result.unknown_effects == 0
 
     def test_data_label_exfiltration_is_denied_with_ordinary_write_authority(
         self,
@@ -844,6 +873,33 @@ class TestRuntimeSafetyBenchmark:
         assert provenance['runners']['selected'] == metadata['runners']
         assert provenance['runners']['interventions']['agent_libos_full']
         assert provenance['environment']['python_version']
+
+    def test_benchmark_git_provenance_rejects_active_repository_filter(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+        subprocess.run(
+            ['git', 'config', 'filter.evil.clean', '/bin/false'],
+            cwd=tmp_path,
+            check=True,
+        )
+        (tmp_path / '.gitattributes').write_text(
+            '*.txt filter=evil\n',
+            encoding='utf-8',
+        )
+        monkeypatch.setattr(run_benchmark_module, 'REPO_ROOT', tmp_path)
+
+        provenance = run_benchmark_module._git_provenance()
+
+        assert provenance == {
+            'available': False,
+            'commit': None,
+            'dirty': None,
+            'working_tree_sha256': None,
+            'error_code': 'unsafe_repository_config',
+        }
 
     def test_release_gate_requires_every_success_and_safety_oracle_to_pass(
         self,

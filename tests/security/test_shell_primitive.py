@@ -13,8 +13,9 @@ from typing import Any
 from agent_libos import Runtime
 from agent_libos.capability.manager import CapabilityManager
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, ShellCommandRule, ShellDefaults
-from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectMetadata, ObjectType, SinkTrustLevel, SinkTrustRule
-from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, HumanResponseRequired, ValidationError
+from agent_libos.models import AuthorityRisk, AuthorityRule, CapabilityEffect, CapabilityRight, EventType, ExternalEffectClassification, ExternalEffectRollbackClass, ExternalEffectRollbackStatus, GitErrorCode, HumanRequestStatus, ObjectMetadata, ObjectType, SinkTrustLevel, SinkTrustRule
+from agent_libos.models.exceptions import CapabilityDenied, GitError, HumanApprovalRequired, HumanResponseRequired, ValidationError
+from agent_libos.primitives.git_command_policy import harden_read_only_git_argv
 from agent_libos.substrate import (
     CommandMetrics,
     CommandResult,
@@ -25,8 +26,26 @@ from agent_libos.substrate import (
     ProviderEffectNotStarted,
     SubprocessTimeoutExpired,
 )
+from modules.pty.pty_module import LocalPtyProvider
 
-_HARDENED_GIT_STATUS = ['git', '--no-optional-locks', '-c', 'core.fsmonitor=false', 'status']
+_HARDENED_GIT_STATUS = [
+    'git',
+    '--no-pager',
+    '--no-optional-locks',
+    '-c',
+    'core.fsmonitor=false',
+    '-c',
+    'core.untrackedCache=false',
+    '-c',
+    'maintenance.auto=false',
+    '-c',
+    'submodule.recurse=false',
+    '-c',
+    'diff.external=',
+    '-c',
+    'color.ui=false',
+    'status',
+]
 _HARDENED_GIT_STATUS_SHORT = [*_HARDENED_GIT_STATUS, '--short']
 
 class TestShellPrimitive:
@@ -682,7 +701,7 @@ class TestShellPrimitive:
             pid = runtime.process.spawn(image='review-agent:v0', goal='file url shell')
             runtime.shell.grant_policy(pid, runtime.config.shell.always_allow_level, issued_by='test')
 
-            with pytest.raises(CapabilityDenied, match='file URL'):
+            with pytest.raises(ValidationError, match='raw Git'):
                 runtime.shell.run(pid, ['git', 'status', f'file://{Path(tempfile.gettempdir())}/secret.txt'])
 
             assert provider.calls == []
@@ -713,55 +732,44 @@ class TestShellPrimitive:
             finally:
                 runtime.close()
 
-    def test_unlisted_command_requires_approval_and_consumes_once(self) -> None:
+    def test_unlisted_git_command_is_deterministically_rejected(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='run unlisted shell')
             runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
-            with pytest.raises(HumanApprovalRequired):
+            with pytest.raises(ValidationError, match='typed git_'):
                 runtime.shell.run(pid, ['git', 'show', '--stat'])
-            pending = runtime.human.pending()
-            assert len(pending) == 1
-            assert pending[0].payload['context']['argv'] == ['git', 'show', '--stat']
-            assert runtime.human.drain_terminal_queue(auto_approve=True)[0].status == HumanRequestStatus.APPROVED
-            allowed = runtime.shell.run(pid, ['git', 'show', '--stat'])
-            assert allowed.stdout == 'ok\n'
-            assert provider.calls == [(['git', 'show', '--stat'], runtime.config.tools.shell_timeout_s)]
-            with pytest.raises(HumanApprovalRequired):
-                runtime.shell.run(pid, ['git', 'show', '--stat'])
+            assert runtime.human.pending() == []
+            assert provider.calls == []
         finally:
             runtime.close()
 
-    def test_human_shell_approval_is_bound_to_exact_argv(self) -> None:
+    def test_human_approval_cannot_override_typed_git_boundary(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='argv-bound shell')
             runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
-            with pytest.raises(HumanApprovalRequired):
+            with pytest.raises(ValidationError, match='typed git_'):
                 runtime.shell.run(pid, ['git', 'show', '--stat'])
-            runtime.human.drain_terminal_queue(auto_approve=True)
-            with pytest.raises(HumanApprovalRequired):
+            with pytest.raises(ValidationError, match='typed git_'):
                 runtime.shell.run(pid, ['git', 'push'])
             assert provider.calls == []
-            allowed = runtime.shell.run(pid, ['git', 'show', '--stat'])
-            assert allowed.stdout == 'ok\n'
-            assert provider.calls == [(['git', 'show', '--stat'], runtime.config.tools.shell_timeout_s)]
+            assert runtime.human.pending() == []
         finally:
             runtime.close()
 
-    def test_git_diff_with_output_requires_approval(self) -> None:
+    def test_git_diff_with_output_is_rejected_before_approval(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='diff output')
             runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
-            with pytest.raises(HumanApprovalRequired):
+            with pytest.raises(ValidationError, match='typed git_'):
                 runtime.shell.run(pid, ['git', 'diff', '--output=patch.diff'])
-            context = runtime.human.pending()[0].payload['context']
-            assert context['rule_id'] != 'shell.low.git'
+            assert runtime.human.pending() == []
         finally:
             runtime.close()
 
-    def test_auto_allowed_git_diff_disables_repo_configured_external_helper(self) -> None:
+    def test_auto_allowed_git_diff_rejects_repo_configured_external_helper(self) -> None:
         temp_dir = tempfile.TemporaryDirectory()
         self._temp_dirs.append(temp_dir)
         root = Path(temp_dir.name)
@@ -784,13 +792,36 @@ class TestShellPrimitive:
                 issued_by='test',
             )
 
-            result = runtime.shell.run(pid, ['git', 'diff'])
+            with pytest.raises(GitError) as exc_info:
+                runtime.shell.run(pid, ['git', 'diff'])
 
-            assert result.returncode == 0
-            assert result.argv == ['git', 'diff']
+            assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
             assert not marker.exists()
         finally:
             runtime.close()
+
+    def test_local_pty_git_status_rejects_active_repository_filter(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self._temp_dirs.append(temp_dir)
+        root = Path(temp_dir.name)
+        marker = root / 'filter-ran'
+        helper = root / 'filter-helper.sh'
+        helper.write_text(f'#!/bin/sh\nprintf ran > "{marker}"\ncat\n', encoding='utf-8')
+        helper.chmod(0o700)
+        subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
+        subprocess.run(['git', 'config', 'filter.evil.clean', str(helper)], cwd=root, check=True)
+        (root / '.gitattributes').write_text('*.txt filter=evil\n', encoding='utf-8')
+        (root / 'tracked.txt').write_text('content\n', encoding='utf-8')
+        provider = LocalPtyProvider(root)
+
+        with pytest.raises(GitError) as exc_info:
+            provider.spawn(
+                harden_read_only_git_argv(['git', 'status']),
+                cwd='.',
+            )
+
+        assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+        assert not marker.exists()
 
     def test_high_risk_network_command_requires_approval_with_rule_profile(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
@@ -1106,7 +1137,7 @@ class TestShellPrimitive:
                 runtime.shell.run(pid, ['git', 'status'])
             runtime.capability.grant(pid, 'shell:git:*', [CapabilityRight.EXECUTE], issued_by='test')
             result = runtime.shell.run(pid, ['git', 'status'])
-            with pytest.raises(CapabilityDenied):
+            with pytest.raises(ValidationError, match='typed git_'):
                 runtime.shell.run(pid, ['git', 'push'])
             assert result.stdout == 'ok\n'
             assert provider.calls == [(_HARDENED_GIT_STATUS, runtime.config.tools.shell_timeout_s)]
@@ -1164,7 +1195,7 @@ class TestShellPrimitive:
             runtime.human.drain_terminal_queue(auto_policy=CapabilityManager.ALWAYS_ALLOW)
             request = runtime.tools.call(pid, 'request_permission', {'resource': 'shell:git', 'rights': ['execute'], 'reason': 'inspect git state'})
             allowed = runtime.shell.run(pid, ['git', 'status'])
-            with pytest.raises(CapabilityDenied):
+            with pytest.raises(ValidationError, match='typed git_'):
                 runtime.shell.run(pid, ['git', 'push', 'origin'])
             assert request.ok
             assert request.payload['status'] == 'approved'
@@ -1196,12 +1227,12 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
-    def test_path_qualified_whitelist_command_does_not_match_bare_rule(self) -> None:
+    def test_path_qualified_git_is_rejected_before_policy(self) -> None:
         runtime, _provider = self._runtime_with_fake_shell()
         try:
             pid = runtime.process.spawn(image='review-agent:v0', goal='path bypass')
             runtime.shell.grant_policy(pid, runtime.config.shell.allowlist_auto_else_ask_level, issued_by='test')
-            with pytest.raises(HumanApprovalRequired):
+            with pytest.raises(ValidationError, match='executable paths'):
                 runtime.shell.run(pid, ['./git', 'status', '--short'])
         finally:
             runtime.close()

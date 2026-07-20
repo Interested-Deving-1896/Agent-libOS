@@ -105,6 +105,34 @@ class ValidationError(LibOSError):
     pass
 
 
+class GitError(LibOSError):
+    """Stable domain error raised by the first-class Git boundary."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        operation: str | None = None,
+        retryable: bool = False,
+        details: dict | None = None,
+    ) -> None:
+        self.code = str(code)
+        self.operation = str(operation) if operation is not None else None
+        self.retryable = bool(retryable)
+        self.details = dict(details or {})
+        super().__init__(message)
+
+    def to_dict(self) -> dict:
+        return {
+            "code": self.code,
+            "message": str(self),
+            "operation": self.operation,
+            "retryable": self.retryable,
+            "details": dict(self.details),
+        }
+
+
 class DurableObjectFinalizerUnavailable(ValidationError):
     """A durable cleanup intent has no restart-stable handler."""
 

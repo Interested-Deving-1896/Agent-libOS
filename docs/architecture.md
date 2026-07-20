@@ -35,6 +35,7 @@ Agent personality / application
      - audit manager
   -> Resource Provider Substrate
      - filesystem provider
+     - pinned system-Git provider
      - clock provider
      - shell provider
      - human provider
@@ -103,7 +104,7 @@ not change tool schemas or skip primitive authorization. The concrete provider
 inventory, containment guarantees, extension checklist, and environment
 limitations are documented in [Providers](providers.md).
 
-LLM, filesystem, clock, shell, Human, JSON-RPC, MCP, and PTY provider boundaries use
+LLM, filesystem, Git, clock, shell, Human, JSON-RPC, MCP, and PTY provider boundaries use
 the public [`agent_libos.sdk`](protected_operation_sdk.md) contract. The SDK is
 the only provider-facing lifecycle for finite capability reservation, effect
 prepare/dispatch/finalize, classification fallback, event/audit evidence, and
@@ -127,7 +128,7 @@ observed. The runtime persists the selected classification for checkpoint
 reports, but v1 does not apply external compensation. Filesystem mutation,
 clock, shell, and PTY spawn paths use explicit finite-use reservations around
 the provider boundary.
-A filesystem, clock, shell, human-output/terminal-I/O, PTY, JSON-RPC, or live
+A filesystem, Git, clock, shell, human-output/terminal-I/O, PTY, JSON-RPC, or live
 MCP primitive also persists a conservative `unknown` external-effect intent
 immediately before entering that boundary. On a classified success or
 ambiguous failure, the store conditionally updates that same `effect_id` from
@@ -318,8 +319,8 @@ The assembled graph includes:
 - `ObjectMemoryManager` provides typed memory and namespace resolution.
 - `HumanObjectManager` owns questions, approvals, terminal queue processing,
   and human output.
-- `FilesystemAdapter`, `ShellAdapter`, `ClockPrimitive`, `JsonRpcPrimitive`,
-  and `McpPrimitive` expose protected primitive operations over provider
+- `FilesystemAdapter`, `GitPrimitive`, `ShellAdapter`, `ClockPrimitive`,
+  `JsonRpcPrimitive`, and `McpPrimitive` expose protected primitive operations over provider
   backends. `ShellExecutionPolicy` is the public protocol implemented directly
   by `ShellAdapter` for one-shot Shell and interactive PTY execution; Runtime
   Modules do not call `ShellAdapter` private methods or depend on a forwarding
@@ -558,7 +559,7 @@ agent_libos/
   models/          dataclass and enum models split by runtime domain
   modules/         trusted startup Runtime Module loader, registry, and core module
   ports/           narrow subsystem protocols and dependency-inversion boundaries
-  primitives/      libOS primitives for filesystem, clock, shell, JSON-RPC, and MCP
+  primitives/      libOS primitives for filesystem, Git, clock, shell, JSON-RPC, and MCP
   runtime/         composition, syscalls, scheduler, processes, events, checkpoints, audit
   sdk/             public protected-operation lifecycle and provider-facing contracts
   skills/          Skill schema, strict loader, trust registry, and SkillManager

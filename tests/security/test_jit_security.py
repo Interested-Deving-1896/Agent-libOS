@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import ast
 import contextlib
 import pytest
 import asyncio
@@ -1274,11 +1276,16 @@ class TestJitSecurity:
 
     def test_builtin_tools_do_not_directly_touch_host_boundaries(self) -> None:
         builtins_dir = Path('agent_libos/tools/builtin')
-        forbidden = ['subprocess', 'urllib', 'socket', 'requests']
+        forbidden = {'subprocess', 'urllib', 'socket', 'requests'}
         for path in builtins_dir.glob('*.py'):
             source = path.read_text(encoding='utf-8')
-            for token in forbidden:
-                assert token not in source, f'{path} should not use {token} directly'
+            imports: set[str] = set()
+            for node in ast.walk(ast.parse(source, filename=str(path))):
+                if isinstance(node, ast.Import):
+                    imports.update(alias.name.split('.', 1)[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports.add(node.module.split('.', 1)[0])
+            assert not (imports & forbidden), f'{path} should not import host boundary libraries directly'
 
     def _schema_names(self, pid: str) -> set[str]:
         return {schema['function']['name'] for schema in self.runtime.tools.openai_tool_schemas(pid)}

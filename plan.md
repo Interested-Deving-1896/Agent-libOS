@@ -67,9 +67,9 @@ prototype:
   exit, process-local cwd, and message queues.
 - Capability: typed resource matching, deny/ask/allow effects, issue,
   delegate, revoke, one-shot consumption, attenuation, and audit lineage.
-- Primitive boundary: filesystem, shell, clock, human, process, image,
-  checkpoint, Object Memory, Skill, JIT syscall, and JSON-RPC calls go through
-  runtime primitives instead of direct model-facing tool authority.
+- Primitive boundary: filesystem, typed Git, shell, clock, human, process,
+  image, checkpoint, Object Memory, Skill, JIT syscall, JSON-RPC, and MCP calls
+  go through runtime primitives instead of direct model-facing tool authority.
 - Object Memory: process-private namespaces by default, explicit shared
   namespaces through capabilities, and file/object bridges.
 - Human-as-device: questions, output, approval, ordinary messages, and
@@ -87,12 +87,16 @@ prototype:
   runtime components but are TCB, not process authority.
 - JSON-RPC over HTTP: client-only, pre-registered endpoints/methods, no
   model-supplied URLs or secrets, capability-checked method invocation.
+- Typed Git: the system-Git provider is pinned to the workspace repository and
+  covers local changes, managed worktrees, immutable patch Objects, existing
+  Host-configured remotes, and repository-local simulated pull requests with
+  capability/state-token/approval enforcement. It is not a GitHub/GitLab API.
 - Scoped checkpointing: reconstructable process-subtree state can be restored
   or forked while audit/events/LLM calls/external effects remain append-only.
 - SQLite persistence: process metadata, capabilities, messages, human
   requests, LLM calls, audit, events, tool candidates, Skills, JSON-RPC
   endpoints, modules, checkpoints, and external-effect records.
-- M1 benchmark harness: 20+ deterministic runtime-safety tasks, baselines,
+- M1 benchmark harness: 32 deterministic runtime-safety tasks, baselines,
   ablations, self-evolution subset, side-effect oracle, and metrics output.
 
 The remaining gap is evaluation depth and paper-grade explanation, not another
@@ -199,6 +203,10 @@ operational surface.
 
 Deliverables:
 
+Status as of 0.3.2: the local Git/worktree, patch artifact, and simulated-PR
+deliverables below are implemented through `Runtime.git`; hosted Git provider
+integration remains intentionally out of scope.
+
 - A workload where agents use or attempt to use:
   - standard `SKILL.md` packages,
   - Deno/TypeScript JIT tools,
@@ -226,7 +234,9 @@ Tests and checks:
 - Checkpoint fork remaps process/object/capability identity and does not
   resurrect revoked authority.
 - JSON-RPC method calls require method capability and redact secrets in audit.
-- Local worktree writes cannot mutate the main repository.
+- Managed worktree paths remain workspace-contained and separately authorized;
+  every selected worktree still shares the repository's refs/common metadata
+  under the typed provider lock and state-token checks.
 
 Exit criteria:
 
@@ -408,8 +418,10 @@ Final checklist:
 Minimal acceptable versions:
 
 - Agent adapter: benchmark adapter, not ecosystem-complete adapter.
-- MCP/GitHub: fake/adversarial or local provider workloads, not production
-  integrations.
+- Hosted Git providers: repository-local simulated PR and adversarial/local
+  remote workloads, not production GitHub/GitLab integrations. MCP Tools have a
+  separate client implementation but broader ecosystem compatibility remains
+  out of scope.
 - Durable execution: scoped checkpoint restore/fork and replay diagnostics,
   with overhead and authority-resurrection evaluation.
 - Risk-aware approval: deterministic rules, not intelligent classifier.

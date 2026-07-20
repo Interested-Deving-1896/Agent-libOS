@@ -1,5 +1,6 @@
 from agent_libos.primitives.clock import ClockPrimitive
 from agent_libos.primitives.filesystem import FilesystemAdapter
+from agent_libos.primitives.git import GitPrimitive
 from agent_libos.primitives.jsonrpc import JsonRpcPrimitive
 from agent_libos.primitives.mcp import McpPrimitive
 from agent_libos.primitives.shell import ShellAdapter, ShellExecutionPolicy
@@ -7,6 +8,7 @@ from agent_libos.primitives.shell import ShellAdapter, ShellExecutionPolicy
 __all__ = [
     "ClockPrimitive",
     "FilesystemAdapter",
+    "GitPrimitive",
     "JsonRpcPrimitive",
     "McpPrimitive",
     "ShellAdapter",

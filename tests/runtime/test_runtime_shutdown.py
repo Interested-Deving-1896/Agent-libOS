@@ -753,6 +753,7 @@ class TestRuntimeShutdown:
                 "clock": runtime.clock,
                 "data_flow": runtime.data_flow,
                 "filesystem": runtime.filesystem,
+                "git": runtime.git,
                 "human": runtime.human,
                 "image_registry": runtime.image_registry,
                 "image_boot": runtime.image_boot,

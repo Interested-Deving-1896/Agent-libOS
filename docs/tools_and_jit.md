@@ -5,7 +5,7 @@ schemas, validation, and model ergonomics. Primitives enforce authority.
 
 Tool visibility is not resource authority. A process can call only tools in its
 process tool table, but filesystem, shell, JSON-RPC, MCP, human, memory, image,
-clock, and process effects are still authorized by the primitive path. `ToolPolicy`
+Git, clock, and process effects are still authorized by the primitive path. `ToolPolicy`
 contains declaration metadata such as `declared_permissions` and
 `declared_confirmation_required`; it is shown in tool specs for humans and UI,
 but it does not grant permissions or approve execution.
@@ -32,6 +32,9 @@ The current built-in tool surface includes tools for:
 - Context: `compact_process_context` compresses the caller's
   `llm_context:<pid>` object through a `context-compressor:v0` child process.
 - Shell: argv-only subprocess execution through policy.
+- Git: 32 strict tools for bounded inspection, local mutation, managed
+  worktrees, immutable patch Objects, existing remotes, and repository-local
+  simulated pull requests through `Runtime.git`; no arbitrary Git argv or URL.
 - JSON-RPC: list/inspect registered endpoints and call registered methods.
 - MCP: list/inspect registered servers, list manifest-allowed tools, and call
   registered MCP tools.
@@ -73,6 +76,7 @@ The built-in groups are:
 | `filesystem` | `read_text_file`, `write_text_file`, `read_directory`, `write_directory`, `delete_file`, `delete_directory`, `create_object_from_file`, `write_object_to_file`, `get_working_directory`, `set_working_directory` |
 | `process` | `list_child_processes`, `spawn_child_process`, `fork_child_process`, `wait_child_process`, `signal_child_process`, `merge_child_memory`, `send_process_message`, `read_process_messages`, `receive_process_messages`, `exec_process` |
 | `remote` | `list_jsonrpc_endpoints`, `inspect_jsonrpc_endpoint`, `call_jsonrpc_method`, `list_mcp_servers`, `inspect_mcp_server`, `list_mcp_tools`, `call_mcp_tool` |
+| `git` | `git_repository_info`, `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_list_refs`, `git_list_remotes`, `git_list_worktrees`, `git_stage`, `git_unstage`, `git_commit`, `git_restore`, `git_branch`, `git_switch`, `git_tag`, `git_integrate`, `git_stash`, `git_reset`, `git_clean`, `git_worktree`, `git_create_patch`, `git_apply_patch`, `git_fetch`, `git_pull`, `git_push`, `git_create_pull_request`, `git_list_pull_requests`, `git_inspect_pull_request`, `git_review_pull_request`, `git_merge_pull_request`, `git_close_pull_request` |
 | `checkpoint` | `create_checkpoint`, `list_checkpoints`, `inspect_checkpoint`, `diff_checkpoint`, `fork_checkpoint`, `restore_checkpoint`, `commit_checkpoint_to_image` |
 | `memory` | `create_memory_namespace`, `list_memory_namespace`, `create_memory_object`, `append_memory_object`, `read_memory_object`, `create_object_from_file`, `write_object_to_file` |
 | `skills` | `discover_skills`, `activate_skill`, `read_skill_resource`, `unload_skill` |

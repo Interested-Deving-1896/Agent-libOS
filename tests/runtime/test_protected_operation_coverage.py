@@ -59,6 +59,56 @@ def test_static_check_rejects_protected_provider_helper_called_directly(tmp_path
     assert any("provider helper provider_phase is called outside" in error for error in errors)
 
 
+def test_static_check_accepts_callback_invoked_only_inside_sdk_phase(tmp_path: Path) -> None:
+    source = tmp_path / "safe_gateway.py"
+    source.write_text(
+        "class SafePrimitive:\n"
+        "    def provider_phase_gateway(self, callback):\n"
+        "        return callback()\n"
+        "    def protected_gateway(self, callback):\n"
+        "        def dispatch():\n"
+        "            return self.provider_phase_gateway(lambda: callback())\n"
+        "        with self.protected.start('primitive.safe.call', self.invocation(), provider=self.provider) as operation:\n"
+        "            return operation.call(ProviderPhase('call'), dispatch)\n"
+        "    def public(self):\n"
+        "        def provider_phase():\n"
+        "            return self.provider.call()\n"
+        "        return self.protected_gateway(provider_phase)\n",
+        encoding="utf-8",
+    )
+
+    assert scan_source(
+        source,
+        relative=Path("agent_libos/primitives/safe_gateway.py"),
+    ) == []
+
+
+def test_static_check_rejects_callback_gateway_with_pre_phase_invocation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "unsafe_gateway.py"
+    source.write_text(
+        "class UnsafePrimitive:\n"
+        "    def unsafe_gateway(self, callback):\n"
+        "        callback()\n"
+        "        def dispatch():\n"
+        "            return callback()\n"
+        "        with self.protected.start('primitive.unsafe.call', self.invocation(), provider=self.provider) as operation:\n"
+        "            return operation.call(ProviderPhase('call'), dispatch)\n"
+        "    def public(self):\n"
+        "        def provider_phase():\n"
+        "            return self.provider.call()\n"
+        "        return self.unsafe_gateway(provider_phase)\n",
+        encoding="utf-8",
+    )
+
+    errors = scan_source(
+        source,
+        relative=Path("agent_libos/primitives/unsafe_gateway.py"),
+    )
+    assert any("outside an active ProtectedOperation phase" in error for error in errors)
+
+
 def test_static_check_rejects_provider_handle_call_outside_sdk_phase(tmp_path: Path) -> None:
     source = tmp_path / "bad_handle.py"
     source.write_text(
@@ -235,6 +285,11 @@ def test_contract_registry_declares_explicit_data_flow_directions() -> None:
         "primitive.filesystem.delete_file": DataFlowDirection.EGRESS,
         "primitive.filesystem.delete_directory": DataFlowDirection.EGRESS,
         "primitive.shell.run": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.git.read": DataFlowDirection.INGRESS,
+        "primitive.git.mutate": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.git.fetch": DataFlowDirection.BIDIRECTIONAL,
+        "primitive.git.push": DataFlowDirection.EGRESS,
+        "primitive.git.pull_request": DataFlowDirection.BIDIRECTIONAL,
         "primitive.jsonrpc.call": DataFlowDirection.BIDIRECTIONAL,
         "primitive.mcp.list_tools": DataFlowDirection.BIDIRECTIONAL,
         "primitive.mcp.list_tools.internal": DataFlowDirection.BIDIRECTIONAL,

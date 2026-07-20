@@ -30,6 +30,11 @@ KNOWN_CONSTRAINT_KEYS = frozenset(
         AUTHORITY_RULES_KEY,
         APPROVAL_BINDING_KEY,
         DATA_RELEASE_BINDING_KEY,
+        "git_remote",
+        "git_allowed_refs",
+        "git_url_fingerprint",
+        "git_expected_state_token",
+        "git_old_oid",
     }
 )
 
@@ -55,6 +60,11 @@ _STRING_RULE_CONDITIONS = frozenset(
         "content_sha256",
         "network",
         "filesystem_intent",
+        "git_remote",
+        "git_remote_ref",
+        "git_url_fingerprint",
+        "git_expected_state_token",
+        "git_old_oid",
     }
 )
 
@@ -249,9 +259,57 @@ class CapabilityEvaluator:
                 results[key] = self._evaluate_approval_binding(value, selected_context)
             elif key == DATA_RELEASE_BINDING_KEY:
                 results[key] = self._evaluate_data_release_binding(value, selected_context)
+            elif key == "git_remote":
+                results[key] = self._evaluate_git_equal(
+                    value,
+                    selected_context.get("git_remote"),
+                    "remote",
+                )
+            elif key == "git_url_fingerprint":
+                results[key] = self._evaluate_git_equal(
+                    value,
+                    selected_context.get("git_url_fingerprint"),
+                    "remote URL fingerprint",
+                )
+            elif key == "git_expected_state_token":
+                results[key] = self._evaluate_git_equal(
+                    value,
+                    selected_context.get("git_expected_state_token"),
+                    "state token",
+                )
+            elif key == "git_old_oid":
+                results[key] = self._evaluate_git_equal(
+                    value,
+                    selected_context.get("git_old_oid"),
+                    "old object id",
+                )
+            elif key == "git_allowed_refs":
+                allowed = value if isinstance(value, (list, tuple, set, frozenset)) else ()
+                actual = selected_context.get("git_remote_ref")
+                matched = isinstance(actual, str) and actual in {str(item) for item in allowed}
+                results[key] = {
+                    "ok": matched,
+                    "reason": (
+                        "Git ref matched"
+                        if matched
+                        else "Git ref is outside the capability allowlist"
+                    ),
+                }
             else:
                 results[key] = {"ok": True, "value": value}
         return results
+
+    @staticmethod
+    def _evaluate_git_equal(expected: Any, actual: Any, label: str) -> dict[str, Any]:
+        matched = isinstance(expected, str) and expected == actual
+        return {
+            "ok": matched,
+            "reason": (
+                f"Git {label} matched"
+                if matched
+                else f"Git {label} did not match"
+            ),
+        }
 
     def _evaluate_rule_constraint(self, value: Any, context: dict[str, Any]) -> dict[str, Any]:
         try:

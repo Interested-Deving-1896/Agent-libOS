@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from agent_libos.models import AgentImage, PROMPT_MODE_LIBOS_DEFAULT
+from agent_libos.tools.builtin.git import GIT_TOOL_NAMES
 
 
 REVIEW_AGENT_PROMPT = """
@@ -68,6 +69,7 @@ def build_review_agent_image() -> AgentImage:
             "get_current_time",
             "get_object_task",
             "get_working_directory",
+            *GIT_TOOL_NAMES,
             "human_output",
             "inspect_capability",
             "inspect_checkpoint",

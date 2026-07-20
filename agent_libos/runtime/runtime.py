@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from agent_libos.primitives import (
         ClockPrimitive,
         FilesystemAdapter,
+        GitPrimitive,
         JsonRpcPrimitive,
         McpPrimitive,
         ShellAdapter,
@@ -146,6 +147,7 @@ class Runtime:
     human: HumanObjectManager
     clock: ClockPrimitive
     filesystem: FilesystemAdapter
+    git: GitPrimitive
     shell: ShellAdapter
     jsonrpc: JsonRpcPrimitive
     mcp: McpPrimitive

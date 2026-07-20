@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 from urllib.parse import quote
 
 from agent_libos.capability.manager import CapabilityManager
@@ -136,6 +136,21 @@ class FilesystemAdapter:
         self.human = human
         self.resources = resources
         self._file_label_io_lock = _FileLabelPathLocks()
+
+    @contextmanager
+    def hold_file_label_io_paths(self, paths: Iterable[str]) -> Iterator[None]:
+        """Serialize provider writes with file-label binding updates.
+
+        Typed repository primitives use this narrow coordination surface so
+        file bytes and their lineage binding cannot be observed half-updated.
+        It intentionally exposes no underlying lock implementation.
+        """
+
+        normalized = sorted(dict.fromkeys(str(path) for path in paths))
+        with ExitStack() as stack:
+            for path in normalized:
+                stack.enter_context(self._file_label_io_lock.hold(path))
+            yield
 
     def validate_directory(
         self,
@@ -1708,6 +1723,12 @@ class FilesystemAdapter:
         cwd: str | os.PathLike[str] | None = None,
     ) -> tuple[ResolvedPath, str]:
         target = self.provider.resolve(self._path_with_cwd(path, cwd))
+        if self.config.git.protect_git_metadata and any(
+            part.casefold() == ".git" for part in target.relative.split("/")
+        ):
+            raise CapabilityDenied(
+                "Git metadata is only accessible through the Runtime Git primitive"
+            )
         return target, target.relative
 
     def _logical_path(self, path: str | os.PathLike[str]) -> str:

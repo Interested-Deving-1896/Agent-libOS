@@ -26,6 +26,7 @@ from agent_libos.tools.builtin import (
     ExecProcessTool,
     ForkCheckpointTool,
     ForkChildProcessTool,
+    GIT_TOOL_TYPES,
     GetCurrentTimeTool,
     GetObjectTaskTool,
     GetWorkingDirectoryTool,
@@ -148,6 +149,7 @@ def register_module(ctx: ModuleContext) -> None:
         RestoreCheckpointTool(),
         SendProcessMessageTool(),
         UnloadSkillTool(),
+        *[tool_type() for tool_type in GIT_TOOL_TYPES],
     ]:
         ctx.register_tool(tool)
 

@@ -6,12 +6,12 @@ import importlib.metadata
 import json
 import os
 import platform
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from agent_libos.config import DEFAULT_CONFIG
+from agent_libos.models.exceptions import GitError
 from benchmarks.runtime_safety.loader import load_task_file, load_tasks
 from benchmarks.runtime_safety.runners import (
     RUNNER_INTERVENTIONS,
@@ -21,6 +21,7 @@ from benchmarks.runtime_safety.runners import (
 )
 from benchmarks.runtime_safety.metrics import write_metrics
 from agent_libos.utils.serde import to_jsonable
+from agent_libos.substrate import LocalGitProvider
 
 MAX_FAILURE_PREVIEW = 20
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -247,10 +248,42 @@ def _workload_provenance(suite: Path, tasks: list[Any]) -> tuple[list[dict[str, 
 
 
 def _git_provenance() -> dict[str, Any]:
-    commit_result = _run_git("rev-parse", "HEAD")
-    status_result = _run_git("status", "--porcelain=v1", "-z", "--untracked-files=all")
-    diff_result = _run_git("diff", "--binary", "HEAD", "--")
-    untracked_result = _run_git("ls-files", "--others", "--exclude-standard", "-z")
+    guard = LocalGitProvider(REPO_ROOT, config=DEFAULT_CONFIG.git)
+    try:
+        for operation in ("repository_info", "list_refs", "status", "diff"):
+            guard.validate_read_only_operation(operation)
+    except GitError as exc:
+        return {
+            "available": False,
+            "commit": None,
+            "dirty": None,
+            "working_tree_sha256": None,
+            "error_code": exc.code,
+        }
+    commit_result = _run_git(guard, "rev-parse", "HEAD")
+    status_result = _run_git(
+        guard,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    )
+    diff_result = _run_git(
+        guard,
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--binary",
+        "HEAD",
+        "--",
+    )
+    untracked_result = _run_git(
+        guard,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
     if commit_result is None or status_result is None or diff_result is None or untracked_result is None:
         return {"available": False, "commit": None, "dirty": None, "working_tree_sha256": None}
     commit = commit_result.decode("utf-8", errors="replace").strip()
@@ -275,16 +308,14 @@ def _git_provenance() -> dict[str, Any]:
     }
 
 
-def _run_git(*args: str) -> bytes | None:
+def _run_git(provider: LocalGitProvider, *args: str) -> bytes | None:
     try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=REPO_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+        result = provider.run(
+            args,
+            read_only=True,
+            max_output_bytes=DEFAULT_CONFIG.git.output_hard_limit_bytes,
         )
-    except OSError:
+    except GitError:
         return None
     return result.stdout if result.returncode == 0 else None
 

@@ -31,6 +31,7 @@ from agent_libos.models import (
 )
 from agent_libos.models import ExternalEffectRollbackClass, ExternalEffectRollbackStatus, HumanRequestStatus, ObjectType, ResourceBudget
 from agent_libos.models.exceptions import CapabilityDenied, HumanApprovalRequired, ValidationError
+from agent_libos.primitives.git_command_policy import harden_read_only_git_argv
 from agent_libos.substrate import LocalResourceProviderSubstrate, ProviderEffectNotStarted, SubprocessLimits
 from modules.pty.pty_module import LocalPtyProvider, _PtyRuntimeSession
 
@@ -89,7 +90,9 @@ class TestPtyModule:
                 )
 
                 assert len(provider.spawned) == 1
-                assert provider.resolver_calls == [["git", "status"]]
+                assert provider.resolver_calls == [
+                    harden_read_only_git_argv(["git", "status"])
+                ]
                 assert written.bytes_written == len("pty-data-flow-sentinel\n".encode())
                 assert provider.sessions[0].writes == ["pty-data-flow-sentinel\n"]
             finally:
@@ -1136,7 +1139,9 @@ class TestPtyModule:
                         startup_timeout_s=0,
                     )
 
-                assert provider.resolver_calls == [["git", "status"]]
+                assert provider.resolver_calls == [
+                    harden_read_only_git_argv(["git", "status"])
+                ]
                 assert provider.spawned == []
                 effects = runtime.store.list_external_effects(pid=pid)
                 assert len(effects) == 1
@@ -1745,7 +1750,7 @@ class TestPtyModule:
                         max_sensitivity='secret',
                         identity_sha256=adapter.shell_policy.executable_data_sink(
                             'pty:spawn',
-                            'git',
+                            'echo',
                             cwd='.',
                         ).identity_sha256,
                     ),
@@ -1754,7 +1759,7 @@ class TestPtyModule:
                 )
                 secret = adapter.create(
                     pid,
-                    ['git', 'status', 'PTY_LIST_SECRET_ARGV_SENTINEL'],
+                    ['echo', 'PTY_LIST_SECRET_ARGV_SENTINEL'],
                     cwd='.',
                     startup_timeout_s=0,
                     source_oids=[source.oid],

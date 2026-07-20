@@ -449,8 +449,9 @@ Current behavior must not claim:
 
 - Python JIT compatibility,
 - direct external framework adapters as trusted boundaries,
-- MCP Resources/Prompts, real GitHub/provider integrations that are not
-  implemented,
+- MCP Resources/Prompts or real hosted GitHub/GitLab provider integrations that
+  are not implemented (the typed local Git provider and simulated PRs are
+  current),
 - provider-level compensation for rollbackable external side effects,
 - Skill activation as a capability grant.
 

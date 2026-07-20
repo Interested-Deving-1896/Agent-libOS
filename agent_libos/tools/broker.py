@@ -85,6 +85,15 @@ _TOOL_GROUPS: dict[str, tuple[str, ...]] = {
         "delete_file", "delete_directory", "create_object_from_file", "write_object_to_file",
         "get_working_directory", "set_working_directory",
     ),
+    "git": (
+        "git_repository_info", "git_status", "git_diff", "git_log", "git_show", "git_blame",
+        "git_list_refs", "git_list_remotes", "git_list_worktrees", "git_stage", "git_unstage",
+        "git_commit", "git_restore", "git_branch", "git_switch", "git_tag", "git_integrate",
+        "git_stash", "git_reset", "git_clean", "git_worktree", "git_create_patch",
+        "git_apply_patch", "git_fetch", "git_pull", "git_push", "git_create_pull_request",
+        "git_list_pull_requests", "git_inspect_pull_request", "git_review_pull_request",
+        "git_merge_pull_request", "git_close_pull_request",
+    ),
     "process": (
         "list_child_processes", "spawn_child_process", "fork_child_process", "wait_child_process",
         "signal_child_process", "merge_child_memory", "send_process_message", "read_process_messages",

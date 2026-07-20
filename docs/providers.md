@@ -1,8 +1,8 @@
 # Provider Substrate Reference
 
 The Resource Provider Substrate is the host-effect layer below Agent libOS
-primitives. A provider implements a concrete filesystem, clock, subprocess,
-Human I/O, JSON-RPC, or MCP backend; it is not an authority bypass. Process
+primitives. A provider implements a concrete filesystem, Git, clock,
+subprocess, Human I/O, JSON-RPC, or MCP backend; it is not an authority bypass. Process
 identity, Capability reservation, Human approval, Task Authority Manifest
 ceilings, pending-effect persistence, resource settlement, events, and audit
 remain primitive/runtime responsibilities.
@@ -20,6 +20,7 @@ provider hooks during startup. Every real provider boundary must use the
 | Filesystem | `LocalFilesystemProvider` rooted at one workspace | Typed `filesystem:<namespace>:<path>` rights; cwd and state probes occur only after authority | Reads are information-flow effects; successful mutations are `irreversible`/`not_supported` because the local provider records no preimage or undo log and exposes no compensation operation; mutations prepare one pending effect and finalize the same id; created parents inherit labels and recursive delete aggregates the bound subtree | Lexical resolution followed by no-follow containment, size/list bounds, safe write/delete handling |
 | Clock | `LocalClockProvider` | Clock resource/right plus process resource budget | `now`, monotonic observation, sleep/asleep cancellation, and result classification use one protected operation; later failures remain unknown rather than refunding authority | Finite sleep limit, monotonic elapsed accounting, sync and async paths |
 | Shell | `LocalShellProvider` | Exact executable resource, shell policy rule, approval, cwd read authority, process budget | Intent exists before spawn; timeout/cancel/limit/classifier failures conservatively retain performed/unknown evidence | No shell command string by default, scrubbed environment, workspace cwd, stdout/stderr bounds, wall/CPU/RSS supervision, process-tree termination |
+| Git | `LocalGitProvider` pinned to the Runtime workspace repository | `git:workspace`, affected filesystem resources, per-remote `git_remote:workspace:<name>`, per-PR `git_pr:workspace:<id>`, state-token CAS, and mandatory approval for destructive operations | Reads are ingress; local mutations, fetch, push, and simulated-PR transitions use distinct protected-operation descriptors and query-only reconciliation | System Git 2.22+, byte-safe parsing, repository/config identity validation, cross-process lock, no arbitrary argv/URL, executable extensions disabled, bounded output |
 | Human | `LocalHumanProvider` plus GUI/terminal host surfaces | Typed question/permission request and explicit policy decision | Terminal read/write and GUI request presentation are protected information-flow operations; conditional GUI views expose only bound metadata and reject parent responses until their exact one-shot release is consumed through presentation | Typed responses, queue state, bounded payload/output, lock-free blocking I/O with claimed request state |
 | JSON-RPC | `HttpJsonRpcProvider` | Registered endpoint and exact method capability; model-supplied URLs are forbidden | Registry metadata is gated before lookup; calls prepare the reservation/intent before resolving header values, then remote DNS starts inside that intent; transport/classification settles the same effect id | Closed manifest shape, header-env allowlist, request/response hard limits, timeout, resolved-address policy, client-only JSON-RPC 2.0 |
 | MCP | `SdkMcpProvider` for Streamable HTTP and stdio | Registered server/tool capability; stdio additionally requires `process:spawn` and exact `mcp_stdio:<digest>` execute authority exposed by server inspection | HTTP DNS and stdio spawn are covered by the call/validation intent; tool calls prepare before runtime env resolution, while live tool refresh resolves env first; registry lookup is gated; live discovery is bidirectional and tool results use bounded provider evidence | Tools-only v1 surface, closed manifest shape, header/stdio-env allowlists, request/response and timeout limits, contained stdio process lifecycle |
@@ -51,6 +52,13 @@ provider work started. MCP cached tool listing resolves nothing, while live
 `list_tools(refresh=true)` resolves its environment before reservation and
 intent creation. The operation-specific references below are authoritative for
 these orderings.
+
+Git repository reads are unclassified ingress from `external:git`; local
+mutations and fetch are bidirectional, push is egress, and simulated pull
+requests are bidirectional repository state transitions. Every mutation binds
+the current repository state token. Push also binds its remote/config/ref
+fingerprint as mutable target state. Patch Objects preserve source labels
+through application. See [Git Provider and Primitive](git.md).
 
 Shell and PTY derive the resolved executable Sink from Host-owned `argv[0]`,
 workspace/cwd, and the safe executable path without handing the remaining argv
@@ -119,7 +127,8 @@ syscall failures are reconstructed as the same envelope before ToolExecution
 persists them.
 
 Checkpoint restore and image commit report provider-classified effects but do
-not compensate or roll back provider state. Audit rows are append-only through
+not compensate or roll back provider state, including Git checkout/worktree,
+ref, remote, and simulated-PR state. Audit rows are append-only through
 RuntimeStore APIs; external-effect rows retain one causal identity while
 guarded prepare, dispatch, finalize, and retention transitions update their
 state. These guarantees exist only within the RuntimeStore trust boundary: an
@@ -167,5 +176,6 @@ A new backend or operation is not complete until it has:
 
 See [architecture.md](architecture.md) for composition,
 [capabilities.md](capabilities.md) for authority resources,
+[git.md](git.md) for the fixed-repository Git boundary,
 [jsonrpc.md](jsonrpc.md) and [mcp.md](mcp.md) for remote manifests, and
 [modules.md](modules.md) for trusted provider-hook registration.

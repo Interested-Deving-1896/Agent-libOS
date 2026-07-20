@@ -133,6 +133,9 @@ and unregister from changing the registry.
 | MCP | `mcp:<server-id>:<tool-id>` | server, transport, and tool manifest hash; stdio also binds the resolved executable path/content |
 | MCP live discovery | `mcp:<server-id>:list_tools` | server and transport manifest hash; stdio also binds the resolved executable path/content |
 | File | `filesystem:workspace:<normalized-path>` | canonical workspace path |
+| Git local mutation/fetch | `git:workspace` | repository/worktree identity plus expected state token; fetch also binds the existing remote fingerprint |
+| Git push | `git_remote:workspace:<remote>` | fetch/push URL hashes, effective config/helper identities, selected refs, and expected old remote OID |
+| Simulated Git PR | `git_pr:workspace:<pr-id>` | repository-local metadata hash plus immutable base/head snapshot OIDs |
 | Shell | `shell:<resolved-executable>` | resolved path plus executable content hash; mutable workspace executables dispatch from a Host-owned content snapshot |
 | PTY spawn | `pty:spawn:<resolved-executable>` | resolved path/content hash fixed at session creation; mutable workspace executables dispatch from a Host-owned content snapshot |
 | PTY input/control | `pty:session:<session-id>` | aliases the immutable content-bound spawn trust identity |
@@ -146,6 +149,18 @@ provider-certified not-started failure adds no ingress. A Host-internal refresh 
 no process actor uses the runtime's public/verified metadata request context.
 Deno/JIT code receives no direct external authority; its syscalls enter the
 same filesystem, shell, Human, JSON-RPC, MCP, and process boundaries.
+
+Git inspection is ingress from `external:git`. Local mutations and fetch are
+bidirectional protected operations, push is egress, and simulated-PR state
+transitions are bidirectional. The ordinary Git/remote/PR capability and Task
+Authority effect ceiling remain independent of Sink clearance. Mutation target
+state is the opaque repository token; remote operations additionally revalidate
+URL/config/ref fingerprints after approval and before dispatch. Patch creation
+derives the immutable `CODE_PATCH` Object from the exact contributing file
+bindings, and patch application propagates those source labels to the operation
+result and affected filesystem bindings. Audit and event payloads retain only
+hashes, OIDs, counts, and bounded metadata—not patch bytes, commit messages,
+credentials, or raw provider errors. See [Git Provider and Primitive](git.md).
 
 ## Enforcement order
 
