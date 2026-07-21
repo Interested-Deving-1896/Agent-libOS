@@ -54,17 +54,21 @@ uv run python scripts/test_matrix.py --lane all --workers 4
 uv run python scripts/test_matrix.py --lane runtime --workers auto
 ```
 
-`--workers` applies only to Python lanes. The `runtime` and `all` lanes default
-to bounded parallel execution with at most four workers and `--dist worksteal`,
-which keeps CI runtime bounded while balancing long persistence and
-runtime-reopen tests. Pass `--workers 1` for serial failure diagnosis, or set
-`AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to override defaults in CI.
+`--workers` applies only to Python lanes. The `runtime`, `security`,
+`self-evolution`, `providers`, and `all` lanes default to bounded parallel
+execution with at most four workers and `--dist worksteal`, which balances long
+persistence and runtime-reopen tests. Pass `--workers 1` for serial failure
+diagnosis, or set `AGENT_LIBOS_TEST_WORKERS` / `AGENT_LIBOS_TEST_DIST` to
+override defaults. Pass `--durations 25` to report the slowest tests.
 `--max-lane-seconds` is a hard process-tree timeout for every selected lane,
 including `all`; timeout exits with status 124 after terminating the process
-group/tree. CI also keeps an outer job timeout. Run the `gui` lane separately;
-it cleans Electron output before production compilation, excludes generated
-`dist-electron` files from Vitest, and never emits test files into the production
-Electron tree. Install GUI dependencies first with `npm --prefix gui install`.
+group/tree. Standard lanes deselect `postgres` tests because the PostgreSQL CI
+service runs them separately with `pytest -m postgres --run-postgres`. CI runs
+each standard lane with a 360-second process deadline and a 15-minute outer
+step deadline. Run the `gui` lane separately; it cleans Electron output before
+production compilation, excludes generated `dist-electron` files from Vitest,
+and never emits test files into the production Electron tree. Install GUI
+dependencies first with `npm --prefix gui install`.
 
 The architecture check covers the core package and repository-level Runtime
 Modules. It rejects new lower-layer Runtime/API imports,

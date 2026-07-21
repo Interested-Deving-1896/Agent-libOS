@@ -13,12 +13,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_release_version_identifiers_are_aligned() -> None:
-    assert validate_version_alignment(ROOT) == "0.3.2"
+    assert validate_version_alignment(ROOT) == "0.3.3"
 
 
 def test_release_status_contains_current_version_state_only() -> None:
     text = (ROOT / "docs" / "release_status.md").read_text(encoding="utf-8")
-    assert text.startswith("# Agent libOS 0.3.2 Status\n")
+    assert text.startswith("# Agent libOS 0.3.3 Status\n")
     forbidden = {
         "commit id": r"\bcommit\b",
         "dirty state": r"\bdirty\b",
@@ -70,31 +70,23 @@ def test_console_entrypoint_uses_the_domain_error_boundary() -> None:
     }
 
 
-def test_release_workflow_runs_combined_matrix_and_runtime_safety_smoke() -> None:
+def test_release_workflow_runs_release_smokes_without_repeating_lane_matrix() -> None:
     workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(
         encoding="utf-8"
     )
     parsed = yaml.safe_load(workflow)
     steps = parsed["jobs"]["deterministic-release"]["steps"]
-    combined = next(
-        step
-        for step in steps
-        if step.get("name") == "Run combined deterministic release matrix"
-    )
     runtime_safety = next(
         step
         for step in steps
         if step.get("name") == "Run runtime-safety release smoke"
     )
-    for step in (combined, runtime_safety):
-        assert "if" not in step
-        assert "continue-on-error" not in step
-    combined_step = str(combined["run"])
+    assert "if" not in runtime_safety
+    assert "continue-on-error" not in runtime_safety
+    release_commands = "\n".join(str(step.get("run") or "") for step in steps)
     runtime_safety_step = str(runtime_safety["run"])
-    assert "scripts/test_matrix.py --lane all" in combined_step
-    lane_timeout = re.search(r"--max-lane-seconds\s+(\d+)", combined_step)
-    assert lane_timeout is not None
-    assert int(combined["timeout-minutes"]) * 60 > int(lane_timeout.group(1))
+    assert "scripts/test_matrix.py" not in release_commands
+    assert "--lane all" not in release_commands
     assert "experiments/run_benchmark.py" in runtime_safety_step
     assert "--suite benchmarks/runtime_safety" in runtime_safety_step
     assert "--require-all-passed" in runtime_safety_step
@@ -155,11 +147,6 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         ("security", "Run complete security lane", "scripts/test_matrix.py --lane security"),
         (
             "deterministic-release",
-            "Run combined deterministic release matrix",
-            "scripts/test_matrix.py --lane all",
-        ),
-        (
-            "deterministic-release",
             "Run runtime-safety release smoke",
             "--require-all-passed",
         ),
@@ -204,6 +191,19 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         assert all(fragment in str(step["run"]) for fragment in expected_fragments)
         if job_name in {"python", "security", "deterministic-release"}:
             assert "--skip-real-deno" not in str(step["run"])
+    for job_name, step_name in (
+        ("python", "Run pytest lane"),
+        ("security", "Run complete security lane"),
+    ):
+        step = next(
+            item
+            for item in parsed["jobs"][job_name]["steps"]
+            if item.get("name") == step_name
+        )
+        assert step["timeout-minutes"] == 15
+        command = str(step["run"])
+        assert "--durations 25" in command
+        assert "--max-lane-seconds 360" in command
     postgres_job = parsed["jobs"]["postgres"]
     postgres_service = postgres_job["services"]["postgres"]
     assert postgres_service["image"] == "postgres:17"

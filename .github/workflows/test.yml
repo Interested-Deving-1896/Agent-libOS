@@ -141,22 +141,12 @@ jobs:
         run: uv sync --frozen --all-groups
 
       - name: Run pytest lane
-        timeout-minutes: 40
-        run: |
-          lane="${{ matrix.lane }}"
-          cmd=(uv run python scripts/test_matrix.py --lane "$lane")
-          case "$lane" in
-            runtime)
-              cmd+=(--max-lane-seconds 1800)
-              ;;
-            self-evolution)
-              cmd+=(-n 4 --max-lane-seconds 1800)
-              ;;
-            providers)
-              cmd+=(-n 4 --dist worksteal --max-lane-seconds 1800)
-              ;;
-          esac
-          "${cmd[@]}"
+        timeout-minutes: 15
+        run: >-
+          uv run python scripts/test_matrix.py
+          --lane ${{ matrix.lane }}
+          --durations 25
+          --max-lane-seconds 360
 
   security:
     needs: static
@@ -191,10 +181,10 @@ jobs:
         run: uv sync --frozen --all-groups
 
       - name: Run complete security lane
-        timeout-minutes: 40
+        timeout-minutes: 15
         run: >-
           uv run python scripts/test_matrix.py --lane security
-          -n 4 --dist worksteal --max-lane-seconds 1800
+          --durations 25 --max-lane-seconds 360
 
   deterministic-release:
     needs: static
@@ -221,12 +211,6 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --frozen --all-groups
-
-      - name: Run combined deterministic release matrix
-        timeout-minutes: 70
-        run: >-
-          uv run python scripts/test_matrix.py --lane all
-          -n 4 --dist worksteal --max-lane-seconds 3600
 
       - name: Run runtime-safety release smoke
         run: >-

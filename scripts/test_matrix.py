@@ -21,16 +21,21 @@ LANE_PATHS = {
     "benchmark": ("tests/benchmarks",),
 }
 PYTHON_LANES = tuple(LANE_PATHS)
-# The deterministic security lane alone is close to five minutes on the
-# supported development baseline, and the combined four-worker matrix is
-# longer than that. Keep a bounded process-tree deadline while leaving enough
-# headroom for normal collection and worker teardown variance.
+# Standard lanes target five minutes on the bounded-parallel development
+# baseline. Keep a larger local default for serial diagnosis and host variance;
+# CI supplies its tighter 360-second regression deadline explicitly.
 DEFAULT_MAX_LANE_SECONDS = 600.0
 DEFAULT_WORKERS = "1"
 DEFAULT_PARALLEL_WORKER_CAP = 4
 PROCESS_TIMEOUT_EXIT_CODE = 124
 PROCESS_TERMINATION_GRACE_SECONDS = 2.0
-PARALLEL_BY_DEFAULT_LANES = {"runtime", "all"}
+PARALLEL_BY_DEFAULT_LANES = {
+    "runtime",
+    "security",
+    "self-evolution",
+    "providers",
+    "all",
+}
 DEFAULT_SERIAL_DIST = "loadfile"
 DEFAULT_PARALLEL_DIST = "worksteal"
 WORKERS_ENV = "AGENT_LIBOS_TEST_WORKERS"
@@ -67,6 +72,13 @@ def main(argv: list[str] | None = None) -> int:
         type=_positive_seconds,
         default=DEFAULT_MAX_LANE_SECONDS,
         help="hard process-tree timeout for the selected lane command",
+    )
+    parser.add_argument(
+        "--durations",
+        type=_nonnegative_integer,
+        default=None,
+        metavar="N",
+        help="report the N slowest pytest durations; use 0 to report all durations",
     )
     parser.add_argument(
         "-n",
@@ -125,7 +137,9 @@ def _pytest_args(paths: tuple[str, ...], args: argparse.Namespace) -> list[str]:
     command = [sys.executable, "-m", "pytest", *paths]
     if _workers_enabled(args):
         command.extend(["-n", args.workers, "--dist", args.dist])
-    marker_filters: list[str] = []
+    if args.durations is not None:
+        command.extend(["--durations", str(args.durations)])
+    marker_filters: list[str] = ["not postgres"]
     if args.skip_real_deno:
         command.append("--skip-real-deno")
         marker_filters.append("not real_deno")
@@ -319,6 +333,16 @@ def _positive_seconds(value: str) -> float:
         raise argparse.ArgumentTypeError("must be a positive number") from exc
     if not selected > 0 or not selected < float("inf"):
         raise argparse.ArgumentTypeError("must be a finite positive number")
+    return selected
+
+
+def _nonnegative_integer(value: str) -> int:
+    try:
+        selected = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if selected < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
     return selected
 
 

@@ -419,7 +419,7 @@ class RuntimeModuleRegistry:
         )
 
     def _preflight_context(self, ctx: ModuleContext) -> None:
-        pending_tools = {tool.spec().name for tool in ctx.tools}
+        pending_tools = set(ctx.registered_tool_names)
         for tool_name in pending_tools:
             try:
                 self._tools.resolve(tool_name)

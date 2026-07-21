@@ -54,10 +54,12 @@ Legend:
 
 ## Release-gate policy
 
-The deterministic `scripts/test_matrix.py --lane all`, invariant checker, GUI
-lane, release-artifact build and clean-install smoke, PostgreSQL CI job, and
-runtime-safety smoke are necessary but not sufficient for a cross-platform
-release. Before advertising a platform or provider configuration as
+The per-lane deterministic matrix on every supported CI Python version,
+invariant checker, GUI lane, release-artifact build and clean-install smoke,
+PostgreSQL CI job, and runtime-safety smoke are necessary but not sufficient
+for a cross-platform release. `scripts/test_matrix.py --lane all` remains the
+local aggregate command; CI does not repeat it after the equivalent per-lane
+matrix has passed. Before advertising a platform or provider configuration as
 release-validated, record a fresh native run for the corresponding
 environment-gate cells above. Do not copy counts or “remaining gates” from
 `docs/prelaunch_hardening_report.md`; that file is bound to its historical

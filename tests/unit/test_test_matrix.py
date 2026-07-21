@@ -20,6 +20,7 @@ def _args(**overrides: object) -> argparse.Namespace:
         "workers": "1",
         "dist": "loadfile",
         "max_lane_seconds": test_matrix.DEFAULT_MAX_LANE_SECONDS,
+        "durations": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -36,6 +37,7 @@ class TestTestMatrix:
         assert command[:4] == [test_matrix.sys.executable, "-m", "pytest", "tests/runtime"]
         assert "-n" not in command
         assert "--dist" not in command
+        assert command[-2:] == ["-m", "not postgres and not real_llm and not mcp"]
         assert "not real_deno" not in command
         assert "--skip-real-deno" not in command
 
@@ -43,19 +45,27 @@ class TestTestMatrix:
         command = test_matrix._pytest_args(("tests/security",), _args(skip_real_deno=True))
 
         assert "--skip-real-deno" in command
-        assert command[-2:] == ["-m", "not real_deno and not real_llm and not mcp"]
+        assert command[-2:] == [
+            "-m",
+            "not postgres and not real_deno and not real_llm and not mcp",
+        ]
 
     def test_pytest_args_can_run_mcp_tests(self) -> None:
         command = test_matrix._pytest_args(("tests/providers",), _args(run_mcp=True))
 
         assert "--run-mcp" in command
-        assert command[-2:] == ["-m", "not real_llm"]
+        assert command[-2:] == ["-m", "not postgres and not real_llm"]
 
     def test_pytest_args_include_xdist_workers_when_requested(self) -> None:
         command = test_matrix._pytest_args(("tests",), _args(workers="4", dist="load"))
 
         assert command[:4] == [test_matrix.sys.executable, "-m", "pytest", "tests"]
         assert command[4:8] == ["-n", "4", "--dist", "load"]
+
+    def test_pytest_args_include_requested_slowest_durations(self) -> None:
+        command = test_matrix._pytest_args(("tests/security",), _args(durations=25))
+
+        assert command[4:6] == ["--durations", "25"]
 
     def test_runtime_lane_defaults_to_bounded_parallel_worksteal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         parser = argparse.ArgumentParser()
@@ -82,9 +92,25 @@ class TestTestMatrix:
 
         assert command.enforce_timeout is True
 
-    def test_non_runtime_lane_defaults_to_serial_execution(self) -> None:
+    @pytest.mark.parametrize("lane", ["security", "self-evolution", "providers"])
+    def test_long_lane_defaults_to_bounded_parallel_worksteal(
+        self,
+        lane: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         parser = argparse.ArgumentParser()
-        args = _args(lane="security", workers=None, dist=None)
+        args = _args(lane=lane, workers=None, dist=None)
+        monkeypatch.setattr(test_matrix.os, "cpu_count", lambda: 12)
+
+        test_matrix._resolve_defaults(parser, args)
+
+        assert args.workers == str(test_matrix.DEFAULT_PARALLEL_WORKER_CAP)
+        assert args.dist == "worksteal"
+
+    @pytest.mark.parametrize("lane", ["unit", "benchmark"])
+    def test_short_lane_defaults_to_serial_execution(self, lane: str) -> None:
+        parser = argparse.ArgumentParser()
+        args = _args(lane=lane, workers=None, dist=None)
 
         test_matrix._resolve_defaults(parser, args)
 
@@ -135,6 +161,13 @@ class TestTestMatrix:
         for value in ("0", "-1", "nan", "inf", "not-a-number"):
             with pytest.raises(argparse.ArgumentTypeError):
                 test_matrix._positive_seconds(value)
+
+    def test_durations_requires_a_nonnegative_integer(self) -> None:
+        assert test_matrix._nonnegative_integer("0") == 0
+        assert test_matrix._nonnegative_integer("25") == 25
+        for value in ("-1", "1.5", "not-a-number"):
+            with pytest.raises(argparse.ArgumentTypeError):
+                test_matrix._nonnegative_integer(value)
 
     def test_individual_lane_timeout_terminates_the_command(self) -> None:
         started = time.monotonic()

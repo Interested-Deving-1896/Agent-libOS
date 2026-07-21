@@ -240,13 +240,16 @@ uv run python scripts/check_architecture.py
 uv run python scripts/check_test_invariants.py
 ```
 
-The `runtime` and `all` lanes use bounded pytest-xdist parallelism by default
-to keep CI wall-clock time under control. Pass `--workers 1` for serial failure
-diagnosis, or `--workers N` / `--workers auto` to override the worker count for
-any Python lane. The GUI lane builds shared frontend artifacts and should be run
-separately after `npm --prefix gui install`. Pytest removes files created under
-ignored `agent_outputs/` at the end of a test session; use
-`--keep-agent-outputs` when debugging generated files.
+The `runtime`, `security`, `self-evolution`, `providers`, and `all` lanes use
+bounded pytest-xdist parallelism by default to keep feedback time under
+control. Pass `--workers 1` for serial failure diagnosis, or `--workers N` /
+`--workers auto` to override the worker count for any Python lane. Pass
+`--durations 25` to report the slowest tests. Standard lanes deselect tests
+marked `postgres`; the dedicated PostgreSQL service gate runs those tests with
+`pytest -m postgres --run-postgres`. The GUI lane builds shared frontend
+artifacts and should be run separately after `npm --prefix gui install`.
+Pytest removes files created under ignored `agent_outputs/` at the end of a
+test session; use `--keep-agent-outputs` when debugging generated files.
 
 Run the deterministic local demo:
 

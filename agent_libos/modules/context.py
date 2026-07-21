@@ -105,8 +105,13 @@ class ModuleContext:
         init=False,
         repr=False,
     )
+    _tool_names: list[str] = field(default_factory=list, init=False, repr=False)
+    _tool_name_set: set[str] = field(default_factory=set, init=False, repr=False)
+    _registered_tools: list[BaseAgentTool] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        initial_tools = tuple(self.tools)
+        self.tools.clear()
         self._declared_tools = frozenset(self.manifest.provides.tools)
         self._declared_images = frozenset(self.manifest.provides.images)
         self._declared_syscalls = frozenset(self.manifest.provides.syscalls)
@@ -115,6 +120,8 @@ class ModuleContext:
         self._declared_durable_object_release_finalizers = frozenset(
             self.manifest.provides.durable_object_release_finalizers
         )
+        for tool in initial_tools:
+            self.register_tool(tool)
 
     @property
     def module_id(self) -> str:
@@ -124,12 +131,26 @@ class ModuleContext:
     def actor(self) -> str:
         return f"module:{self.module_id}"
 
+    @property
+    def registered_tool_names(self) -> tuple[str, ...]:
+        """Return buffered tool names without regenerating their schemas."""
+
+        if len(self.tools) != len(self._registered_tools) or any(
+            current is not registered
+            for current, registered in zip(self.tools, self._registered_tools)
+        ):
+            raise ValidationError("module tools must be added through register_tool")
+        return tuple(self._tool_names)
+
     def register_tool(self, tool: BaseAgentTool) -> None:
         spec = tool.spec()
         self._require_declared(spec.name, self._declared_tools, "tool")
-        if any(existing.spec().name == spec.name for existing in self.tools):
+        if spec.name in self._tool_name_set:
             raise ValidationError(f"module registered duplicate tool: {spec.name}")
         self.tools.append(tool)
+        self._registered_tools.append(tool)
+        self._tool_names.append(spec.name)
+        self._tool_name_set.add(spec.name)
 
     def register_image(self, image: AgentImage | dict[str, Any]) -> None:
         candidate = image if isinstance(image, AgentImage) else AgentImage(**dict(image))
@@ -196,7 +217,7 @@ class ModuleContext:
 
     def registered_summary(self) -> dict[str, Any]:
         return {
-            "tools": [tool.spec().name for tool in self.tools],
+            "tools": list(self.registered_tool_names),
             "images": [image.image_id for image in self.images],
             "syscalls": sorted(self.syscalls),
             "provider_hooks": {kind: len(hooks) for kind, hooks in self.provider_hooks.items()},
