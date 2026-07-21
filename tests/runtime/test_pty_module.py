@@ -1363,6 +1363,30 @@ class TestPtyModule:
             finally:
                 runtime.close()
 
+    def test_pty_create_rejects_launcher_wrapped_git_before_provider_spawn(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = FakePtyProvider()
+            runtime = _open_pty_runtime(temp_dir, provider)
+            try:
+                pid = runtime.process.spawn(image="pty-agent:v0", goal="reject wrapped Git")
+                runtime.shell.grant_policy(
+                    pid,
+                    runtime.config.shell.always_allow_level,
+                    issued_by="test",
+                )
+
+                with pytest.raises(ValidationError, match="typed git_"):
+                    _pty_adapter(runtime).create(
+                        pid,
+                        ["env", "git", "branch", "wrapper-created"],
+                        cwd=".",
+                        startup_timeout_s=0,
+                    )
+
+                assert provider.spawned == []
+            finally:
+                runtime.close()
+
     def test_pty_create_post_spawn_failure_closes_handle_and_removes_object(self, monkeypatch: pytest.MonkeyPatch) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             provider = FakePtyProvider()

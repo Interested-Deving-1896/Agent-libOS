@@ -647,6 +647,19 @@ class GitPrimitive:
             raise GitError(GitErrorCode.INVALID_REF.value, "Git returned an invalid object id")
         return oid
 
+    def _resolve_ref_oid(self, value: str, *, worktree_id: str) -> str:
+        selected = self._validate_ref_name(value)
+        result = self._run(
+            ["rev-parse", "--verify", "--end-of-options", selected],
+            worktree_id=worktree_id,
+            max_output_bytes=65536,
+        )
+        self._require_success(result, "resolve_ref")
+        oid = result.stdout.strip().decode("ascii", errors="strict")
+        if not _OID_RE.fullmatch(oid):
+            raise GitError(GitErrorCode.INVALID_REF.value, "Git returned an invalid object id")
+        return oid
+
     @classmethod
     def _parse_status(
         cls,
@@ -4080,6 +4093,12 @@ class GitPrimitive:
             )
             if current_fingerprint["fingerprint"] != fingerprint["fingerprint"]:
                 raise GitError(GitErrorCode.STALE_STATE.value, "Git remote configuration or refs changed before pull", retryable=True)
+            branch_name = selected_branch
+            if branch_name is None:
+                if not before.head_ref or not before.head_ref.startswith("refs/heads/"):
+                    raise GitError(GitErrorCode.INVALID_REF.value, "detached or unborn HEAD requires an explicit pull branch")
+                branch_name = before.head_ref[len("refs/heads/") :]
+            tracking_ref = f"refs/remotes/{selected_remote}/{branch_name}"
             self._mutation_command(
                 before,
                 "pull",
@@ -4090,18 +4109,13 @@ class GitPrimitive:
                     "--no-prune",
                     "--no-prune-tags",
                     selected_remote,
+                    f"+refs/heads/{branch_name}:{tracking_ref}",
                 ],
                 worktree_id=worktree_id,
                 remote=selected_remote,
                 expected_remote_fingerprint=fingerprint["fingerprint"],
             )
             fetched = self.provider.repository_state(worktree=self._worktree_path(worktree_id))
-            branch_name = selected_branch
-            if branch_name is None:
-                if not fetched.head_ref or not fetched.head_ref.startswith("refs/heads/"):
-                    raise GitError(GitErrorCode.INVALID_REF.value, "detached or unborn HEAD requires an explicit pull branch")
-                branch_name = fetched.head_ref[len("refs/heads/") :]
-            tracking_ref = f"refs/remotes/{selected_remote}/{branch_name}"
             target_oid = self._resolve_commit(tracking_ref, worktree_id=worktree_id)
             self._mark_git_source_carrier("commit", target_oid)
             if strategy == "ff_only":
@@ -4283,7 +4297,7 @@ class GitPrimitive:
             local_oid = (
                 None
                 if selected_local_ref is None
-                else self._resolve_commit(selected_local_ref, worktree_id=worktree_id)
+                else self._resolve_ref_oid(selected_local_ref, worktree_id=worktree_id)
             )
             args = [
                 "push",
@@ -4405,6 +4419,7 @@ class GitPrimitive:
             review_bodies=review_bodies,
         )
         content_sha256 = _sha256(data)
+        self._mark_git_effect_started()
         persisted_sha256 = self.provider.write_pull_request_metadata(
             pull_request.pr_id,
             data,

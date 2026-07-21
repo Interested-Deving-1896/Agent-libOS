@@ -145,7 +145,7 @@ configurable. A runtime release emits only the snapshot version it can decode.
   Manifests reference those names; resolved secret values must not be persisted
   in registry rows, audit metadata, benchmark provenance, or GUI responses.
 - `git.executable` is resolved on a Host path outside the workspace and must be
-  Git 2.22 or newer. `git.worktree_root` must remain below the workspace, while
+  Git 2.26 or newer. `git.worktree_root` must remain below the workspace, while
   `git.trusted_metadata_roots` is a Host trust decision for linked-worktree
   metadata and should be as narrow as possible. Remote URL schemes, local file
   remotes, credential-helper inheritance, SSH-agent inheritance, and metadata

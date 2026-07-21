@@ -21,8 +21,9 @@ is explicitly listed in `git.trusted_metadata_roots`.
 Git is optional at Runtime startup. `git.enabled: false`, a missing executable,
 or a version older than `git.minimum_version` leaves the rest of the Runtime
 usable. Git calls then fail with a stable `git_unavailable` or
-`unsupported_git_version` error. The default minimum is Git 2.22.0. Both SHA-1
-and SHA-256 repositories are supported.
+`unsupported_git_version` error. The default minimum is Git 2.26.0 because safe
+effective-configuration inspection requires `git config --show-scope`. Both
+SHA-1 and SHA-256 repositories are supported.
 
 At every call the provider verifies the workspace root, worktree, Git directory,
 common directory, object format, and filesystem identity. It rejects:
@@ -192,6 +193,9 @@ remote's matching `refs/remotes/<remote>/` namespace. Typed fetch/pull also
 override implicit prune and tag-fetch settings; typed push disables implicit
 follow-tags, push certificates, and configured push options, so repository or
 Host defaults cannot broaden the approved effect.
+Typed pull supplies a Host-generated exact refspec and updates only the selected
+branch's matching remote-tracking ref, including when repository configuration
+contains a wildcard fetch refspec.
 Local `file:` remotes are disabled by default and exist only as an explicit
 Host configuration option for controlled deployments and deterministic tests.
 

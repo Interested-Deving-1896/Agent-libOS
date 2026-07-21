@@ -32,7 +32,11 @@ from agent_libos.models.exceptions import (
     ValidationError,
 )
 from agent_libos.primitives.git import GitPrimitive
-from agent_libos.substrate import LocalGitProvider, LocalResourceProviderSubstrate
+from agent_libos.substrate import (
+    GitProviderEffectNotStarted,
+    LocalGitProvider,
+    LocalResourceProviderSubstrate,
+)
 
 
 _T = TypeVar("_T")
@@ -1529,6 +1533,40 @@ def test_file_remote_push_and_fetch_use_only_configured_remote(tmp_path: Path) -
         runtime.close()
 
 
+def test_file_remote_push_preserves_annotated_tag_object(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    _init_repository(root)
+    remote.mkdir()
+    _git(remote, "init", "--bare", "-q")
+    _git(root, "remote", "add", "origin", remote.as_uri())
+    _git(root, "tag", "-a", "v1", "-m", "annotated release")
+    local_tag_oid = _git(root, "rev-parse", "refs/tags/v1").strip().decode("ascii")
+    assert _git(root, "cat-file", "-t", local_tag_oid).strip() == b"tag"
+
+    git_config = replace(DEFAULT_CONFIG.git, allow_file_remotes=True)
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="push annotated tag")
+        _grant_git_authority(runtime, pid, remote="origin")
+        state = runtime.git.status(pid).state.token
+
+        pushed = runtime.git.push(
+            pid,
+            "origin",
+            "refs/tags/v1",
+            state,
+            local_ref="refs/tags/v1",
+        )
+
+        remote_tag_oid = _git(remote, "rev-parse", "refs/tags/v1").strip().decode("ascii")
+        assert pushed.created_oid == pushed.details["local_oid"] == local_tag_oid
+        assert remote_tag_oid == local_tag_oid
+        assert _git(remote, "cat-file", "-t", remote_tag_oid).strip() == b"tag"
+    finally:
+        runtime.close()
+
+
 def test_remote_url_userinfo_query_and_custom_protocol_are_rejected(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     _init_repository(root)
@@ -1812,6 +1850,64 @@ def test_fast_forward_pull_from_configured_bare_remote(tmp_path: Path) -> None:
         runtime.close()
 
 
+def test_pull_fetches_only_the_capability_scoped_branch(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    other = tmp_path / "other"
+    _init_repository(root)
+    remote.mkdir()
+    _git(remote, "init", "--bare", "-q")
+    _git(root, "remote", "add", "origin", remote.as_uri())
+    _git(root, "push", "-q", "origin", "main:refs/heads/main")
+
+    other.mkdir()
+    _git(other, "init", "-q")
+    _git(other, "config", "user.name", "Remote Test")
+    _git(other, "config", "user.email", "remote@example.test")
+    _git(other, "remote", "add", "origin", remote.as_uri())
+    _git(other, "fetch", "-q", "origin", "main")
+    _git(other, "checkout", "-q", "-b", "main", "FETCH_HEAD")
+    (other / "remote.txt").write_text("from remote\n", encoding="utf-8")
+    _git(other, "add", "--", "remote.txt")
+    _git(other, "commit", "-q", "-m", "remote main change")
+    _git(other, "push", "-q", "origin", "main:refs/heads/main")
+    _git(other, "switch", "-q", "-c", "secret")
+    (other / "secret.txt").write_text("remote secret\n", encoding="utf-8")
+    _git(other, "add", "--", "secret.txt")
+    _git(other, "commit", "-q", "-m", "remote secret change")
+    _git(other, "push", "-q", "origin", "secret:refs/heads/secret")
+    _git(root, "update-ref", "-d", "refs/remotes/origin/main")
+    _git(root, "update-ref", "-d", "refs/remotes/origin/secret")
+
+    git_config = replace(DEFAULT_CONFIG.git, allow_file_remotes=True)
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="pull only authorized main")
+        _grant_git_authority(runtime, pid)
+        runtime.capability.issue_trusted(
+            pid,
+            "git_remote:workspace:origin",
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+            constraints={"git_allowed_refs": ["refs/heads/main"]},
+        )
+        state = runtime.git.status(pid).state.token
+
+        runtime.git.pull(pid, "origin", state, branch="main", strategy="ff_only")
+
+        assert (root / "remote.txt").read_text(encoding="utf-8") == "from remote\n"
+        secret_ref = subprocess.run(
+            ["git", "rev-parse", "--verify", "refs/remotes/origin/secret"],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        assert secret_ref.returncode != 0
+    finally:
+        runtime.close()
+
+
 def test_simulated_pull_request_create_review_close_and_merge_requires_approval(
     tmp_path: Path,
 ) -> None:
@@ -1862,6 +1958,64 @@ def test_simulated_pull_request_create_review_close_and_merge_requires_approval(
             reviewed["operation"].after.token,
         )
         assert closed["pull_request"].status is GitPullRequestStatus.CLOSED
+    finally:
+        runtime.close()
+
+
+def test_pull_request_metadata_failure_after_write_is_retained_as_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "feature")
+    (root / "feature.txt").write_text("feature\n", encoding="utf-8")
+    _git(root, "add", "--", "feature.txt")
+    _git(root, "commit", "-q", "-m", "feature")
+    _git(root, "switch", "-q", "main")
+
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="retain ambiguous PR write")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+        created = runtime.git.create_pull_request(
+            pid,
+            "Feature",
+            "Adds feature.txt",
+            "main",
+            "feature",
+            state,
+        )
+        pr_id = created["pull_request"].pr_id
+        original = runtime.git.provider.write_pull_request_metadata
+
+        def write_then_report_wrong_digest(*args: Any, **kwargs: Any) -> str:
+            original(*args, **kwargs)
+            return "0" * 64
+
+        monkeypatch.setattr(
+            runtime.git.provider,
+            "write_pull_request_metadata",
+            write_then_report_wrong_digest,
+        )
+
+        with pytest.raises(GitError) as exc_info:
+            runtime.git.review_pull_request(
+                pid,
+                pr_id,
+                "comment",
+                "persisted despite error",
+                created["operation"].after.token,
+            )
+
+        assert exc_info.value.code == GitErrorCode.UNKNOWN_EFFECT.value
+        assert not isinstance(exc_info.value, GitProviderEffectNotStarted)
+        metadata = runtime.git.provider.read_pull_request_metadata(pr_id)
+        assert metadata is not None and b"persisted despite error" in metadata[0]
+        effect = runtime.store.list_external_effects(pid=pid)[-1]
+        assert effect.provider == "git"
+        assert effect.transaction_state == "unknown"
     finally:
         runtime.close()
 
@@ -1955,6 +2109,22 @@ def test_filesystem_and_raw_shell_cannot_bypass_typed_git_boundary(tmp_path: Pat
         hardened = runtime.shell.run(pid, ["GIT.EXE", "diff"])
         assert hardened.returncode == 0
         assert hardened.argv == ["git", "diff"]
+        if os.name != "nt":
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by="git-provider-test",
+            )
+            with pytest.raises(ValidationError, match="typed git_"):
+                runtime.shell.run(pid, ["env", "git", "branch", "wrapper-created"])
+            wrapped_ref = subprocess.run(
+                ["git", "show-ref", "--verify", "refs/heads/wrapper-created"],
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            assert wrapped_ref.returncode != 0
     finally:
         runtime.close()
 

@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError as PydanticValidationError
 
+from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import GitErrorCode, GitStatusKind
-from agent_libos.models.exceptions import GitError
+from agent_libos.models.exceptions import GitError, ValidationError
 from agent_libos.primitives.git import GitPrimitive
 from agent_libos.primitives.git_command_policy import (
     READ_ONLY_GIT_COMMANDS,
@@ -33,7 +34,7 @@ def _state(status: bytes, *, head_oid: str | None = _SHA1_A) -> GitRepositorySta
         linked_worktree=False,
         repository_id="repository-id",
         worktree_id="worktree-id",
-        git_version="2.22.0",
+        git_version="2.26.0",
     )
     return GitRepositoryState(
         layout=layout,
@@ -239,3 +240,50 @@ def test_legacy_git_reads_share_case_insensitive_exact_hardening(
     if command[1] == "diff":
         assert "--no-textconv" in hardened
         assert "--no-ext-diff" in hardened
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ["env", "git", "branch", "wrapper-created"],
+        ["nohup", "GiT.ExE", "push"],
+        ["env", "FOO=bar", "nohup", "git", "reset", "--hard"],
+        ["env", "-a", "masked", "git", "branch", "wrapper-created"],
+    ],
+)
+def test_raw_git_policy_rejects_launcher_wrapped_git(requested: list[str]) -> None:
+    with pytest.raises(ValidationError, match="typed git_"):
+        validate_and_normalize_raw_git(requested)
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ["env", "printf", "git"],
+        ["nohup", "printf", "git"],
+    ],
+)
+def test_raw_git_policy_preserves_non_git_launcher_arguments(
+    requested: list[str],
+) -> None:
+    assert validate_and_normalize_raw_git(requested) == requested
+
+
+@pytest.mark.parametrize(
+    "requested",
+    [
+        ["env", "-Sgit branch wrapper-created"],
+        ["env", "--split-string=git branch wrapper-created"],
+    ],
+)
+def test_raw_git_policy_rejects_uninspectable_env_split_string(
+    requested: list[str],
+) -> None:
+    with pytest.raises(ValidationError, match="split-string"):
+        validate_and_normalize_raw_git(requested)
+
+
+def test_default_git_version_supports_config_scope_inspection() -> None:
+    version = tuple(int(part) for part in DEFAULT_CONFIG.git.minimum_version.split("."))
+
+    assert version >= (2, 26, 0)

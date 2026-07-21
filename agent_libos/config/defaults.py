@@ -524,7 +524,7 @@ class ShellDefaults:
 class GitDefaults:
     enabled: bool = True
     executable: str = "git"
-    minimum_version: str = "2.22.0"
+    minimum_version: str = "2.26.0"
     repository_resource: str = "git:workspace"
     worktree_root: str = "agent_outputs/git_worktrees"
     trusted_metadata_roots: tuple[str, ...] = ()

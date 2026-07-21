@@ -2713,6 +2713,8 @@
         "tests/providers/test_git_primitive.py::test_remote_url_userinfo_query_and_custom_protocol_are_rejected",
         "tests/providers/test_git_primitive.py::test_shell_credential_helper_is_rejected_without_execution",
         "tests/providers/test_git_primitive.py::test_filesystem_and_raw_shell_cannot_bypass_typed_git_boundary",
+        "tests/runtime/test_pty_module.py::TestPtyModule::test_pty_create_rejects_launcher_wrapped_git_before_provider_spawn",
+        "tests/security/test_shell_primitive.py::TestShellPrimitive::test_launcher_wrapped_git_is_rejected_before_policy_or_evidence",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_auto_allowed_git_diff_rejects_repo_configured_external_helper",
         "tests/security/test_shell_primitive.py::TestShellPrimitive::test_local_pty_git_status_rejects_active_repository_filter"
       ],
@@ -2733,6 +2735,8 @@
         "tests/providers/test_git_primitive.py::test_managed_worktree_is_generated_inside_ignored_runtime_directory",
         "tests/providers/test_git_primitive.py::test_missing_remote_authority_denies_before_remote_metadata_lookup",
         "tests/providers/test_git_primitive.py::test_post_dispatch_git_failure_is_retained_as_unknown",
+        "tests/providers/test_git_primitive.py::test_pull_fetches_only_the_capability_scoped_branch",
+        "tests/providers/test_git_primitive.py::test_pull_request_metadata_failure_after_write_is_retained_as_unknown",
         "tests/providers/test_git_primitive.py::test_git_model_tools_are_visible_but_still_require_capability",
         "tests/providers/test_git_primitive.py::test_simulated_pull_request_create_review_close_and_merge_requires_approval"
       ],
@@ -2754,6 +2758,7 @@
         "tests/providers/test_git_primitive.py::test_stash_round_trip_preserves_secret_worktree_lineage",
         "tests/providers/test_git_primitive.py::test_internal_git_lineage_carriers_are_excluded_from_workspace_tree_labels",
         "tests/providers/test_git_primitive.py::test_file_remote_push_and_fetch_use_only_configured_remote",
+        "tests/providers/test_git_primitive.py::test_file_remote_push_preserves_annotated_tag_object",
         "tests/providers/test_git_primitive.py::test_remote_fingerprint_change_is_rejected_before_dispatch",
         "tests/providers/test_git_primitive.py::test_non_fast_forward_push_and_exact_force_with_lease",
         "tests/providers/test_git_primitive.py::test_fast_forward_pull_from_configured_bare_remote",

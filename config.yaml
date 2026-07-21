@@ -4,7 +4,7 @@ runtime:
 git:
   enabled: true
   executable: git
-  minimum_version: 2.22.0
+  minimum_version: 2.26.0
   worktree_root: agent_outputs/git_worktrees
   trusted_metadata_roots: []
   allowed_remote_schemes: [https, ssh]

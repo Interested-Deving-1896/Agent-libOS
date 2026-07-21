@@ -706,7 +706,9 @@ no-lazy-fetch hardening. Matching is case-insensitive and accepts `git.exe`.
 Authorization and returned results retain the original argv. Every other raw
 Git argv—including mutation and remote commands—is deterministically rejected
 before Shell policy or Human approval, even under `always_allow`; callers must
-use the typed `Runtime.git` boundary.
+use the typed `Runtime.git` boundary. The shared Shell/PTY check also unwraps
+`env` and `nohup` executable launchers. `env --split-string`/`env -S` dispatch is
+rejected because its eventual executable cannot be validated as an argv token.
 
 Scoped denies are supported with `AuthorityRule` constraints. An unconstrained
 deny still dominates all matching grants; a constrained deny dominates only when

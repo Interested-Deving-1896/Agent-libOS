@@ -744,6 +744,30 @@ class TestShellPrimitive:
         finally:
             runtime.close()
 
+    def test_launcher_wrapped_git_is_rejected_before_policy_or_evidence(self) -> None:
+        runtime, provider = self._runtime_with_fake_shell()
+        try:
+            pid = runtime.process.spawn(image='review-agent:v0', goal='reject wrapped Git')
+            runtime.shell.grant_policy(
+                pid,
+                runtime.config.shell.always_allow_level,
+                issued_by='test',
+            )
+            audit_before = runtime.audit.trace()
+            events_before = runtime.events.list()
+            effects_before = runtime.store.list_external_effects(pid=pid)
+
+            with pytest.raises(ValidationError, match='typed git_'):
+                runtime.shell.run(pid, ['env', 'git', 'branch', 'wrapper-created'])
+
+            assert provider.calls == []
+            assert runtime.human.pending() == []
+            assert runtime.audit.trace() == audit_before
+            assert runtime.events.list() == events_before
+            assert runtime.store.list_external_effects(pid=pid) == effects_before
+        finally:
+            runtime.close()
+
     def test_human_approval_cannot_override_typed_git_boundary(self) -> None:
         runtime, provider = self._runtime_with_fake_shell()
         try:
