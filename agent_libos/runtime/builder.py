@@ -3006,6 +3006,7 @@ class RuntimeBuilder(Generic[RuntimeT]):
                 host.substrate,
                 require_recovery_lease=host.lifecycle.require_recovery_lease,
                 page_size=recovery_page_size,
+                provider_overrides={"git": host.git.provider},
             )
             host.recovered_resource_usage_reservations = host.resources.recover_usage_reservations()
             host.recovered_exec_publications = host.image_boot.recover_incomplete_publications()

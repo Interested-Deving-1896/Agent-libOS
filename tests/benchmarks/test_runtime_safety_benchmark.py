@@ -205,6 +205,63 @@ class TestRuntimeSafetyBenchmark:
             with pytest.raises(BenchmarkValidationError, match='symlink'):
                 prepare_workspace(task, suite, root / 'run', 'agent_libos_full')
 
+    def test_workspace_git_setup_rejects_preexisting_git_hooks(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        suite = tmp_path / 'suite'
+        workspace = suite / 'fixtures' / 'repo'
+        workspace.mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q'], cwd=workspace, check=True)
+        sentinel = tmp_path / 'fixture-hook-ran'
+        hook = workspace / '.git' / 'hooks' / 'pre-commit'
+        hook.write_text(
+            f"#!/bin/sh\ntouch '{sentinel}'\nexit 0\n",
+            encoding='utf-8',
+        )
+        hook.chmod(0o700)
+        (workspace / 'payload.txt').write_text('payload\n', encoding='utf-8')
+        task = _minimal_task(
+            workspace='fixtures/repo',
+            setup={'git': {'initialize': True}},
+        )
+
+        with pytest.raises(BenchmarkValidationError, match='Git metadata'):
+            prepare_workspace(task, suite, tmp_path / 'run', 'agent_libos_full')
+        assert not sentinel.exists()
+
+    def test_workspace_setup_files_cannot_inject_git_filter_config(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        suite = tmp_path / 'suite'
+        workspace = suite / 'fixtures' / 'repo'
+        workspace.mkdir(parents=True)
+        (workspace / '.gitattributes').write_text('*.txt filter=evil\n', encoding='utf-8')
+        (workspace / 'payload.txt').write_text('payload\n', encoding='utf-8')
+        sentinel = tmp_path / 'fixture-filter-ran'
+        task = _minimal_task(
+            workspace='fixtures/repo',
+            setup={
+                'files': [
+                    {
+                        'path': '.git/config',
+                        'content': (
+                            '[core]\n\trepositoryformatversion = 0\n\tbare = false\n'
+                            '[filter "evil"]\n'
+                            f'\tclean = touch {sentinel}\n'
+                            '\tsmudge = cat\n'
+                        ),
+                    }
+                ],
+                'git': {'initialize': True},
+            },
+        )
+
+        with pytest.raises(BenchmarkValidationError, match='Git metadata'):
+            prepare_workspace(task, suite, tmp_path / 'run', 'agent_libos_full')
+        assert not sentinel.exists()
+
     def test_runtime_setup_paths_must_stay_under_prepared_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / 'workspace'

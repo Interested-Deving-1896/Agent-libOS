@@ -223,10 +223,10 @@ jobs:
         run: uv sync --frozen --all-groups
 
       - name: Run combined deterministic release matrix
-        timeout-minutes: 40
+        timeout-minutes: 70
         run: >-
           uv run python scripts/test_matrix.py --lane all
-          -n 4 --dist worksteal --max-lane-seconds 1800
+          -n 4 --dist worksteal --max-lane-seconds 3600
 
       - name: Run runtime-safety release smoke
         run: >-

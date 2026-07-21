@@ -8745,7 +8745,12 @@ class SQLRuntimeStore:
         last_path: str | None = None
         while True:
             params: list[Any] = []
-            clauses = ["active = 1", "tombstoned = 0"]
+            clauses = [
+                "active = 1",
+                "tombstoned = 0",
+                "normalized_path COLLATE BINARY != '.git'",
+                "normalized_path COLLATE BINARY NOT LIKE '.git/%'",
+            ]
             if selected not in {"", "."}:
                 descendant_prefix = f"{selected}/"
                 escaped_prefix = (

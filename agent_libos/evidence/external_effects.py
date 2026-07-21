@@ -9,7 +9,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import asdict, replace
 import hashlib
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from agent_libos.models import (
     AuditRecord,
@@ -444,6 +444,7 @@ def reconcile_pending_external_effects(
     *,
     require_recovery_lease: Callable[[], None],
     page_size: int = 500,
+    provider_overrides: Mapping[str, Any] | None = None,
 ) -> ExternalEffectRecoverySummary:
     """Reconcile without replay; unsupported providers remain explicitly unknown."""
 
@@ -459,7 +460,11 @@ def reconcile_pending_external_effects(
             # domain-state restoration. Never ask a provider about a boundary
             # that was durably proven not to have been dispatched.
             continue
-        provider = getattr(substrate, effect.provider, None)
+        provider = (
+            provider_overrides[effect.provider]
+            if provider_overrides is not None and effect.provider in provider_overrides
+            else getattr(substrate, effect.provider, None)
+        )
         reconcile = getattr(provider, "reconcile_external_effect", None)
         if not callable(reconcile):
             mark_external_effect_unknown(

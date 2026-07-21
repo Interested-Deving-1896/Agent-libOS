@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
+from agent_libos.config import DEFAULT_CONFIG
 from benchmarks.runtime_safety.loader import _safe_relative_path
 from benchmarks.runtime_safety.models import BenchmarkTask, BenchmarkValidationError
 
@@ -15,18 +18,22 @@ def prepare_workspace(task: BenchmarkTask, suite_root: str | Path, run_root: str
     if not source.exists() or not source.is_dir():
         raise BenchmarkValidationError(f"{task.id}: workspace fixture does not exist: {source}")
     _reject_symlinks(source, task.id)
+    _reject_git_metadata(source, task.id)
     target = Path(run_root) / "workspaces" / runner / task.id
     if target.exists():
         shutil.rmtree(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
     _apply_setup_files(task, target)
+    _reject_git_metadata(target, task.id)
     _apply_setup_git(task, target)
     return target
 
 
 def safe_workspace_path(workspace: Path, raw_path: str) -> Path:
     relative = _safe_relative_path(raw_path, Path("<runtime>"), "path")
+    if any(part.casefold() == ".git" for part in Path(relative).parts):
+        raise BenchmarkValidationError(f"Git metadata paths are not valid benchmark setup paths: {raw_path}")
     target = (workspace / relative).resolve()
     root = workspace.resolve()
     if root not in target.parents and target != root:
@@ -64,49 +71,98 @@ def _apply_setup_git(task: BenchmarkTask, workspace: Path) -> None:
             f"{task.id}: setup.git must enable deterministic initialize"
         )
 
-    def run(*args: str) -> None:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=workspace,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
+    with tempfile.TemporaryDirectory(prefix="agent-libos-benchmark-git-") as isolated:
+        isolated_root = Path(isolated)
+        global_config = isolated_root / "global-config"
+        global_config.write_text("", encoding="utf-8")
+        hooks = isolated_root / "hooks"
+        hooks.mkdir()
+        environment = {
+            key: value
+            for key in (
+                "COMSPEC",
+                "LANG",
+                "LC_ALL",
+                "PATH",
+                "PATHEXT",
+                "SYSTEMROOT",
+                "TEMP",
+                "TMP",
+                "WINDIR",
+            )
+            if (value := os.environ.get(key)) is not None
+        }
+        environment.update(
+            {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": str(global_config),
+                "GIT_TERMINAL_PROMPT": "0",
+            }
         )
-        if result.returncode != 0:
-            raise BenchmarkValidationError(
-                f"{task.id}: deterministic Git fixture setup failed"
+
+        def run(*args: str) -> None:
+            try:
+                result = subprocess.run(
+                    [
+                        DEFAULT_CONFIG.git.executable,
+                        "-c",
+                        f"core.hooksPath={hooks}",
+                        *args,
+                    ],
+                    cwd=workspace,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=DEFAULT_CONFIG.git.local_timeout_s,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise BenchmarkValidationError(
+                    f"{task.id}: deterministic Git fixture setup timed out"
+                ) from exc
+            if result.returncode != 0:
+                raise BenchmarkValidationError(
+                    f"{task.id}: deterministic Git fixture setup failed"
+                )
+
+        run("init", "-q")
+        run("symbolic-ref", "HEAD", "refs/heads/main")
+        run("config", "user.name", "Agent libOS Benchmark")
+        run("config", "user.email", "benchmark@agent-libos.invalid")
+        run("add", "--all", "--", ".")
+        run("-c", "commit.gpgSign=false", "commit", "-q", "--allow-empty", "-m", "fixture")
+
+        for index, item in enumerate(raw.get("post_commit_files", []) or []):
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                raise BenchmarkValidationError(
+                    f"{task.id}: setup.git.post_commit_files[{index}] is invalid"
+                )
+            target = safe_workspace_path(workspace, str(item["path"]))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(
+                str(item.get("content", "")),
+                encoding=str(item.get("encoding") or "utf-8"),
+                newline="\n",
             )
 
-    run("init", "-q")
-    run("symbolic-ref", "HEAD", "refs/heads/main")
-    run("config", "user.name", "Agent libOS Benchmark")
-    run("config", "user.email", "benchmark@agent-libos.invalid")
-    run("add", "--all", "--", ".")
-    run("-c", "commit.gpgSign=false", "commit", "-q", "--allow-empty", "-m", "fixture")
-
-    for index, item in enumerate(raw.get("post_commit_files", []) or []):
-        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
-            raise BenchmarkValidationError(
-                f"{task.id}: setup.git.post_commit_files[{index}] is invalid"
+        if raw.get("active_filter") is True:
+            run("config", "filter.agent-libos-benchmark.clean", "agent-libos-filter-must-not-run")
+            (workspace / ".gitattributes").write_text(
+                "*.txt filter=agent-libos-benchmark\n",
+                encoding="utf-8",
             )
-        target = safe_workspace_path(workspace, str(item["path"]))
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            str(item.get("content", "")),
-            encoding=str(item.get("encoding") or "utf-8"),
-            newline="\n",
-        )
-
-    if raw.get("active_filter") is True:
-        run("config", "filter.agent-libos-benchmark.clean", "agent-libos-filter-must-not-run")
-        (workspace / ".gitattributes").write_text(
-            "*.txt filter=agent-libos-benchmark\n",
-            encoding="utf-8",
-        )
 
 
 def _reject_symlinks(source: Path, task_id: str) -> None:
     for item in source.rglob("*"):
         if item.is_symlink():
             raise BenchmarkValidationError(f"{task_id}: workspace fixture contains symlink: {item}")
+
+
+def _reject_git_metadata(source: Path, task_id: str) -> None:
+    for item in source.rglob("*"):
+        if item.name.casefold() == ".git":
+            raise BenchmarkValidationError(
+                f"{task_id}: workspace fixture contains preexisting Git metadata"
+            )

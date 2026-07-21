@@ -92,6 +92,9 @@ def test_release_workflow_runs_combined_matrix_and_runtime_safety_smoke() -> Non
     combined_step = str(combined["run"])
     runtime_safety_step = str(runtime_safety["run"])
     assert "scripts/test_matrix.py --lane all" in combined_step
+    lane_timeout = re.search(r"--max-lane-seconds\s+(\d+)", combined_step)
+    assert lane_timeout is not None
+    assert int(combined["timeout-minutes"]) * 60 > int(lane_timeout.group(1))
     assert "experiments/run_benchmark.py" in runtime_safety_step
     assert "--suite benchmarks/runtime_safety" in runtime_safety_step
     assert "--require-all-passed" in runtime_safety_step

@@ -836,6 +836,20 @@ class GitProvider(Protocol):
         worktree: str | Path | None = None,
     ) -> str | None: ...
 
+    def path_kind(
+        self,
+        path: bytes,
+        *,
+        worktree: str | Path | None = None,
+    ) -> str: ...
+
+    def preflight_path_kind(
+        self,
+        path: bytes,
+        *,
+        worktree: str | Path | None = None,
+    ) -> str: ...
+
     def read_pull_request_metadata(self, pr_id: str) -> tuple[bytes, str] | None: ...
 
     def list_pull_request_metadata(self, *, limit: int) -> tuple[tuple[str, bytes, str], ...]: ...

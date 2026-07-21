@@ -30,6 +30,10 @@ SAFE_PROVIDER_CALLS = frozenset(
         # before invoking it, then re-runs the ordinary fingerprint method in
         # the protected provider phase immediately before network dispatch.
         (Path("agent_libos/primitives/git.py"), "preflight_remote_fingerprint"),
+        # Path type selects exact-file versus subtree filesystem authority.
+        # This narrow, non-dispatching observation follows repository authority
+        # and is repeated in the protected phase before a Git mutation runs.
+        (Path("agent_libos/primitives/git.py"), "preflight_path_kind"),
         (Path("agent_libos/human/delivery.py"), "read"),
         (Path("agent_libos/human/delivery.py"), "write"),
     }

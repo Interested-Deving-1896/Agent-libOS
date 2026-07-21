@@ -8,7 +8,7 @@ import os
 import re
 import threading
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any, TypeVar
 
@@ -71,6 +71,7 @@ _GitMutationCallback = Callable[
     tuple[str | None, dict[str, Any], Sequence[bytes]],
 ]
 _OID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,254}\Z")
 _REF_RE = re.compile(r"refs/(?:heads|tags|remotes|agent-libos)/[A-Za-z0-9][A-Za-z0-9._/-]{0,500}\Z")
 _REMOTE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -116,6 +117,28 @@ _GIT_MUTATION_DESCRIPTORS = frozenset(
         "primitive.git.pull_request",
     }
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _GitCleanSnapshot:
+    flags: str
+    preview_sha256: str
+    preview_bytes: int
+    candidate_paths: tuple[bytes, ...]
+    manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _GitFlowSnapshot:
+    context: DataFlowContext
+    state_version: str
+    state_version_resolver: Callable[[], str]
+
+
+_GitFlowSnapshotResolver = Callable[
+    [Sequence[tuple[bytes | None, bool]]],
+    _GitFlowSnapshot,
+]
 
 
 def _sha256(value: bytes) -> str:
@@ -1532,6 +1555,187 @@ class GitPrimitive:
             else self.filesystem.resource_for(relative or ".")
         )
 
+    @staticmethod
+    def _flow_state_version(items: Sequence[tuple[str, str, str]]) -> str:
+        digest = hashlib.sha256()
+        for kind, path, version in items:
+            for value in (kind, path, version):
+                encoded = value.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _combined_flow_state_version(
+        expected_state_token: str,
+        source_state_version: str,
+    ) -> str:
+        return _sha256(
+            expected_state_token.encode("ascii")
+            + b"\0"
+            + source_state_version.encode("ascii")
+        )
+
+    def _filesystem_flow_snapshot(
+        self,
+        scopes: Sequence[tuple[bytes | None, bool]],
+        *,
+        worktree_id: str,
+    ) -> _GitFlowSnapshot:
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        contexts: list[DataFlowContext] = []
+        captures: list[tuple[str, str, str]] = []
+        selectors: list[tuple[str, str]] = []
+        for raw_path, subtree in scopes:
+            if raw_path is None:
+                continue
+            normalized = self._normalized_file_path(
+                raw_path,
+                worktree_id=worktree_id,
+            )
+            if subtree:
+                context, version = self.data_flow.file_tree_snapshot(normalized)
+                kind = "tree"
+            else:
+                context, version = self.data_flow.file_snapshot(normalized)
+                kind = "file"
+            contexts.append(context)
+            captures.append((kind, normalized, version))
+            selectors.append((kind, normalized))
+
+        def resolve() -> str:
+            current = [
+                (
+                    kind,
+                    path,
+                    self.data_flow.file_tree_state_version(path)
+                    if kind == "tree"
+                    else self.data_flow.file_state_version(path),
+                )
+                for kind, path in selectors
+            ]
+            return self._flow_state_version(current)
+
+        return _GitFlowSnapshot(
+            context=DataFlowContext.aggregate(contexts),
+            state_version=self._flow_state_version(captures),
+            state_version_resolver=resolve,
+        )
+
+    @staticmethod
+    def _git_lineage_path(
+        state: GitRepositoryState,
+        carrier_kind: str,
+        carrier_id: str,
+    ) -> str:
+        repository = _sha256(state.layout.repository_id.encode("utf-8"))
+        carrier = _sha256(
+            carrier_kind.encode("ascii")
+            + b"\0"
+            + carrier_id.encode("ascii")
+        )
+        return f".git/agent-libos-flow/{repository}/{carrier_kind}/{carrier}"
+
+    @staticmethod
+    def _git_lineage_digest(
+        state: GitRepositoryState,
+        carrier_kind: str,
+        carrier_id: str,
+    ) -> str:
+        return _sha256(
+            state.layout.repository_id.encode("utf-8")
+            + b"\0"
+            + carrier_kind.encode("ascii")
+            + b"\0"
+            + carrier_id.encode("ascii")
+        )
+
+    def _git_lineage_snapshot(
+        self,
+        state: GitRepositoryState,
+        carriers: Sequence[tuple[str, str]],
+    ) -> _GitFlowSnapshot:
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        contexts: list[DataFlowContext] = []
+        captures: list[tuple[str, str, str]] = []
+        paths: list[str] = []
+        for carrier_kind, carrier_id in carriers:
+            path = self._git_lineage_path(state, carrier_kind, carrier_id)
+            context, version = self.data_flow.file_snapshot(path)
+            contexts.append(context)
+            captures.append((carrier_kind, path, version))
+            paths.append(path)
+
+        def resolve() -> str:
+            return self._flow_state_version(
+                [
+                    (kind, path, self.data_flow.file_state_version(path))
+                    for (kind, _carrier_id), path in zip(carriers, paths, strict=True)
+                ]
+            )
+
+        return _GitFlowSnapshot(
+            context=DataFlowContext.aggregate(contexts),
+            state_version=self._flow_state_version(captures),
+            state_version_resolver=resolve,
+        )
+
+    def _current_git_lineage_snapshot(
+        self,
+        expected_state_token: str,
+        *,
+        worktree_id: str,
+        include_index: bool,
+        include_head: bool,
+        local_ref: str | None = None,
+    ) -> _GitFlowSnapshot:
+        state = self.provider.repository_state(
+            worktree=self._worktree_path(worktree_id)
+        )
+        self._require_same_state(expected_state_token, state)
+        carriers: list[tuple[str, str]] = []
+        if include_index:
+            carriers.append(("index", state.index_sha256))
+        if local_ref is not None:
+            oid = self._resolve_commit(local_ref, worktree_id=worktree_id)
+            current = self.provider.repository_state(
+                worktree=self._worktree_path(worktree_id)
+            )
+            self._require_same_state(expected_state_token, current)
+            state = current
+            carriers.append(("commit", oid))
+        elif include_head and state.head_oid is not None:
+            carriers.append(("commit", state.head_oid))
+        return self._git_lineage_snapshot(state, carriers)
+
+    def _bind_git_lineage(
+        self,
+        *,
+        pid: str,
+        state: GitRepositoryState,
+        carrier_kind: str,
+        carrier_id: str,
+        context: DataFlowContext,
+        only_if_missing: bool = False,
+    ) -> None:
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        path = self._git_lineage_path(state, carrier_kind, carrier_id)
+        if only_if_missing and self.data_flow.store.get_file_label_binding(path) is not None:
+            return
+        self.data_flow.bind_written_file_digest(
+            pid=pid,
+            normalized_path=path,
+            content_sha256=self._git_lineage_digest(
+                state,
+                carrier_kind,
+                carrier_id,
+            ),
+            context=context,
+        )
+
     def _filesystem_authorizations(
         self,
         *,
@@ -1543,15 +1747,30 @@ class GitPrimitive:
         base_context: dict[str, Any],
         source_oids: Iterable[str] | None,
         path_subtree: bool = False,
-    ) -> list[CapabilityDecision]:
+    ) -> tuple[list[CapabilityDecision], tuple[tuple[bytes | None, bool], ...]]:
         decisions: list[CapabilityDecision] = []
+        if not rights:
+            return decisions, ()
         targets: tuple[bytes | None, ...] = tuple(paths) if paths else (None,)
+        scopes = tuple(
+            (
+                path,
+                path is None
+                or path_subtree
+                or self.provider.preflight_path_kind(
+                    path,
+                    worktree=self._worktree_path(worktree_id),
+                )
+                in {"directory", "missing"},
+            )
+            for path in targets
+        )
         for right in rights:
-            for path in targets:
+            for path, subtree in scopes:
                 resource = self._filesystem_resource(
                     path,
                     worktree_id=worktree_id,
-                    subtree=path is None or path_subtree,
+                    subtree=subtree,
                 )
                 path_sha256 = _sha256(path) if path is not None else None
                 context = {
@@ -1561,7 +1780,7 @@ class GitPrimitive:
                     "resource": resource,
                     "right": right.value,
                     "path_sha256": path_sha256,
-                    "path_scope": "exact" if path is not None else "subtree",
+                    "path_scope": "subtree" if subtree else "exact",
                 }
                 decisions.append(
                     self._authorize(
@@ -1573,7 +1792,7 @@ class GitPrimitive:
                         source_oids=source_oids,
                     )
                 )
-        return decisions
+        return decisions, scopes
 
     def _mutation_command(
         self,
@@ -1636,6 +1855,59 @@ class GitPrimitive:
         if isinstance(state, dict):
             state["started"] = True
 
+    def _mark_git_source_carrier(self, carrier_kind: str, carrier_id: str) -> None:
+        if carrier_kind == "commit":
+            valid = bool(_OID_RE.fullmatch(carrier_id))
+        elif carrier_kind == "index":
+            valid = bool(_SHA256_RE.fullmatch(carrier_id))
+        else:
+            valid = False
+        if not valid:
+            raise ValidationError("invalid Git data-flow source carrier")
+        state = getattr(self._dispatch_state, "current", None)
+        if isinstance(state, dict):
+            carriers = state.setdefault("source_carriers", [])
+            if isinstance(carriers, list):
+                carriers.append((carrier_kind, carrier_id))
+
+    def _mark_git_source_context(self, context: DataFlowContext) -> None:
+        state = getattr(self._dispatch_state, "current", None)
+        if isinstance(state, dict):
+            contexts = state.setdefault("source_contexts", [])
+            if isinstance(contexts, list):
+                contexts.append(context)
+
+    def _resolve_stash_commit(
+        self,
+        index: int,
+        *,
+        worktree_id: str,
+        optional: bool = False,
+    ) -> str | None:
+        if isinstance(index, bool) or index < 0 or index > 100_000:
+            raise ValidationError("Git stash index is invalid")
+        selected = f"stash@{{{index}}}"
+        result = self._run(
+            [
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                f"{selected}^{{commit}}",
+            ],
+            worktree_id=worktree_id,
+            max_output_bytes=65536,
+        )
+        if optional and result.returncode != 0:
+            return None
+        self._require_success(result, "resolve_stash")
+        oid = result.stdout.strip().decode("ascii", errors="strict")
+        if not _OID_RE.fullmatch(oid):
+            raise GitError(
+                GitErrorCode.INVALID_REF.value,
+                "Git returned an invalid stash object id",
+            )
+        return oid
+
     def _revalidate_mutation_authority(
         self,
         decisions: Sequence[CapabilityDecision],
@@ -1671,7 +1943,12 @@ class GitPrimitive:
         paths: Sequence[bytes],
         filesystem_rights: Sequence[CapabilityRight],
         filesystem_path_subtree: bool,
-    ) -> tuple[list[CapabilityDecision], set[int], dict[str, Any] | None]:
+    ) -> tuple[
+        list[CapabilityDecision],
+        set[int],
+        dict[str, Any] | None,
+        tuple[tuple[bytes | None, bool], ...],
+    ]:
         decisions = [
             self._authorize(
                 pid=pid,
@@ -1731,19 +2008,18 @@ class GitPrimitive:
                     )
                 mandatory_indexes.add(len(decisions) - 1)
                 approval_context = additional_context
-        decisions.extend(
-            self._filesystem_authorizations(
-                pid=pid,
-                operation=operation,
-                worktree_id=worktree_id,
-                paths=paths,
-                rights=filesystem_rights,
-                base_context=context,
-                source_oids=source_oids,
-                path_subtree=filesystem_path_subtree,
-            )
+        filesystem_decisions, filesystem_scopes = self._filesystem_authorizations(
+            pid=pid,
+            operation=operation,
+            worktree_id=worktree_id,
+            paths=paths,
+            rights=filesystem_rights,
+            base_context=context,
+            source_oids=source_oids,
+            path_subtree=filesystem_path_subtree,
         )
-        return decisions, mandatory_indexes, approval_context
+        decisions.extend(filesystem_decisions)
+        return decisions, mandatory_indexes, approval_context, filesystem_scopes
 
     def _mutation_context(
         self,
@@ -1790,10 +2066,16 @@ class GitPrimitive:
         approval_context: dict[str, Any] | None,
         observation: dict[str, Any],
         source_oids: Iterable[str] | None,
-    ) -> ProtectedOperationInvocation:
+        flow_snapshot: _GitFlowSnapshot | None,
+    ) -> tuple[ProtectedOperationInvocation, DataFlowContext, DataFlowContext | None]:
         if self.data_flow is None:
             raise ValidationError("Git data-flow manager is not attached")
-        flow_context = self.data_flow.context_from_source_oids(pid, source_oids)
+        flow_context = DataFlowContext.aggregate(
+            (
+                self.data_flow.context_from_source_oids(pid, source_oids),
+                *(() if flow_snapshot is None else (flow_snapshot.context,)),
+            )
+        )
         ingress_context = (
             None
             if selected_descriptor == "primitive.git.push"
@@ -1802,7 +2084,23 @@ class GitPrimitive:
                 origin="external:git",
             )
         )
-        return ProtectedOperationInvocation(
+        target_state_version = (
+            expected
+            if flow_snapshot is None
+            else self._combined_flow_state_version(
+                expected,
+                flow_snapshot.state_version,
+            )
+        )
+        target_state_resolver = (
+            None
+            if flow_snapshot is None
+            else lambda: self._combined_flow_state_version(
+                expected,
+                flow_snapshot.state_version_resolver(),
+            )
+        )
+        invocation = ProtectedOperationInvocation(
             pid=pid,
             actor=pid,
             target=target,
@@ -1818,21 +2116,394 @@ class GitPrimitive:
             data_flow_ingress_context=ingress_context,
             data_flow_payload=context,
             data_flow_operation=f"git.{operation}",
-            data_flow_target_state_version=expected,
+            data_flow_target_state_version=target_state_version,
+            data_flow_target_state_version_resolver=target_state_resolver,
         )
+        return invocation, flow_context, ingress_context
+
+    def _protected_flow_snapshot(
+        self,
+        *,
+        pid: str,
+        operation: str,
+        worktree_id: str,
+        scope_count: int,
+        resolver: Callable[[], _GitFlowSnapshot],
+    ) -> _GitFlowSnapshot:
+        def read_snapshot() -> tuple[_GitFlowSnapshot, dict[str, Any]]:
+            snapshot = resolver()
+            return snapshot, {
+                "scope_count": scope_count,
+                "state_version": snapshot.state_version,
+            }
+
+        return self._read(
+            pid,
+            f"{operation}_flow_snapshot",
+            read_snapshot,
+            worktree_id=worktree_id,
+        )
+
+    def _complete_mutation(
+        self,
+        *,
+        pid: str,
+        operation: str,
+        descriptor: str,
+        target: str,
+        remote: str | None,
+        invocation: ProtectedOperationInvocation,
+        observation: dict[str, Any],
+        input_refs: Iterable[str],
+        dispatch: Callable[[], tuple[GitOperationResult, dict[str, Any]]],
+    ) -> GitOperationResult:
+        def provider_phase() -> tuple[GitOperationResult, dict[str, Any]]:
+            return dispatch()
+
+        with self.protected_operations.start(
+            descriptor,
+            invocation,
+            provider=self.provider,
+        ) as protected:
+            result, summary = protected.call(
+                ProviderPhase(
+                    operation,
+                    state_mutation=True,
+                    information_flow=remote is not None,
+                ),
+                provider_phase,
+            )
+            return protected.complete(
+                result,
+                self._evidence(
+                    pid=pid,
+                    operation=operation,
+                    resource=target,
+                    summary=summary,
+                    mutation=True,
+                    input_refs=input_refs,
+                ),
+                classification_context=observation,
+                classification_result=summary,
+            )
+
+    def _status_worktree_paths(self, state: GitRepositoryState) -> tuple[bytes, ...]:
+        parsed = self._parse_status(
+            state,
+            limit=self.config.git.status_entry_hard_limit,
+        )
+        paths: list[bytes] = []
+        for entry in parsed.entries:
+            paths.append(self._decode_path(entry.path))
+            if entry.original_path is not None:
+                paths.append(self._decode_path(entry.original_path))
+        return tuple(dict.fromkeys(paths))
+
+    def _changed_worktree_paths(
+        self,
+        before: GitRepositoryState,
+        after: GitRepositoryState,
+        *,
+        worktree_id: str,
+    ) -> tuple[bytes, ...]:
+        paths = [
+            *self._status_worktree_paths(before),
+            *self._status_worktree_paths(after),
+        ]
+        if (
+            before.head_oid is not None
+            and after.head_oid is not None
+            and before.head_oid != after.head_oid
+        ):
+            changed = self._require_success(
+                self._run(
+                    [
+                        "diff",
+                        "--name-only",
+                        "-z",
+                        "--no-renames",
+                        before.head_oid,
+                        after.head_oid,
+                        "--",
+                    ],
+                    worktree_id=worktree_id,
+                    max_output_bytes=self.config.git.output_hard_limit_bytes,
+                ),
+                "changed_worktree_paths",
+            )
+            paths.extend(
+                self._decode_path(path)
+                for path in self._bounded_git_paths(changed.stdout)
+            )
+        return tuple(dict.fromkeys(paths))
+
+    def _tracked_worktree_paths(self, worktree_id: str) -> tuple[bytes, ...]:
+        listed = self._require_success(
+            self._run(
+                ["ls-files", "-z"],
+                worktree_id=worktree_id,
+                max_output_bytes=self.config.git.output_hard_limit_bytes,
+            ),
+            "list_tracked_worktree_paths",
+        )
+        return tuple(
+            self._decode_path(path)
+            for path in self._bounded_git_paths(listed.stdout)
+        )
+
+    def _reconcile_worktree_labels(
+        self,
+        *,
+        pid: str,
+        worktree_id: str,
+        paths: Sequence[bytes],
+        context: DataFlowContext,
+    ) -> None:
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        with self.data_flow.store.transaction():
+            for raw_path in paths:
+                normalized = self._normalized_file_path(
+                    raw_path,
+                    worktree_id=worktree_id,
+                )
+                kind = self.provider.path_kind(
+                    raw_path,
+                    worktree=self._worktree_path(worktree_id),
+                )
+                if kind == "missing":
+                    bindings = self.data_flow.store.list_file_label_bindings_for_tree(
+                        normalized
+                    )
+                    self.data_flow.tombstone_path_tree(
+                        pid=pid,
+                        expected_bindings={
+                            item.normalized_path: (item.binding_id, item.generation)
+                            for item in bindings
+                        },
+                    )
+                    continue
+                if kind == "directory":
+                    binding = self.data_flow.store.get_file_label_binding(normalized)
+                    if binding is not None:
+                        self.data_flow.tombstone_file(
+                            pid=pid,
+                            normalized_path=normalized,
+                            expected_binding_id=binding.binding_id,
+                            expected_generation=binding.generation,
+                        )
+                    continue
+                digest = self.provider.path_content_sha256(
+                    raw_path,
+                    worktree=self._worktree_path(worktree_id),
+                )
+                if digest is None:
+                    binding = self.data_flow.store.get_file_label_binding(normalized)
+                    if binding is not None:
+                        self.data_flow.tombstone_file(
+                            pid=pid,
+                            normalized_path=normalized,
+                            expected_binding_id=binding.binding_id,
+                            expected_generation=binding.generation,
+                        )
+                    continue
+                binding = self.data_flow.store.get_file_label_binding(normalized)
+                if binding is not None and binding.content_sha256 == digest:
+                    continue
+                self.data_flow.bind_written_file_digest(
+                    pid=pid,
+                    normalized_path=normalized,
+                    content_sha256=digest,
+                    context=context,
+                )
+
+    def _settle_git_lineage(
+        self,
+        *,
+        pid: str,
+        before: GitRepositoryState,
+        after: GitRepositoryState,
+        created_oid: str | None,
+        context: DataFlowContext,
+    ) -> None:
+        if self.data_flow is None:
+            raise ValidationError("Git data-flow manager is not attached")
+        with self.data_flow.store.transaction():
+            if before.index_sha256 != after.index_sha256:
+                previous_index = self._git_lineage_snapshot(
+                    before,
+                    (("index", before.index_sha256),),
+                )
+                self._bind_git_lineage(
+                    pid=pid,
+                    state=after,
+                    carrier_kind="index",
+                    carrier_id=after.index_sha256,
+                    context=DataFlowContext.aggregate(
+                        (previous_index.context, context)
+                    ),
+                )
+            if created_oid is None or not _OID_RE.fullmatch(created_oid):
+                return
+            carriers: list[tuple[str, str]] = [
+                ("index", after.index_sha256),
+            ]
+            if before.head_oid is not None:
+                carriers.append(("commit", before.head_oid))
+            sources = self._git_lineage_snapshot(after, carriers)
+            self._bind_git_lineage(
+                pid=pid,
+                state=after,
+                carrier_kind="commit",
+                carrier_id=created_oid,
+                context=DataFlowContext.aggregate((sources.context, context)),
+                only_if_missing=True,
+            )
+
+    def _settle_mutation_state(
+        self,
+        *,
+        pid: str,
+        before: GitRepositoryState,
+        after: GitRepositoryState,
+        created_oid: str | None,
+        changed_raw: Sequence[bytes],
+        reconciliation_paths: Sequence[bytes],
+        writes_worktree: bool,
+        worktree_id: str,
+        context: DataFlowContext,
+        source_carriers: Sequence[tuple[str, str]],
+        source_contexts: Sequence[DataFlowContext],
+        materialized_worktree_id: str | None,
+    ) -> tuple[bytes, ...]:
+        selected_carriers = tuple(dict.fromkeys(source_carriers))
+        contexts = [context, *source_contexts]
+        if selected_carriers:
+            sources = self._git_lineage_snapshot(after, selected_carriers)
+            contexts.append(sources.context)
+        settled_context = DataFlowContext.aggregate(contexts)
+        changed = tuple(
+            dict.fromkeys(
+                (
+                    *changed_raw,
+                    *reconciliation_paths,
+                    *(
+                        self._changed_worktree_paths(
+                            before,
+                            after,
+                            worktree_id=worktree_id,
+                        )
+                        if writes_worktree
+                        else ()
+                    ),
+                )
+            )
+        )
+        self._settle_git_lineage(
+            pid=pid,
+            before=before,
+            after=after,
+            created_oid=created_oid,
+            context=settled_context,
+        )
+        if writes_worktree:
+            self._reconcile_worktree_labels(
+                pid=pid,
+                worktree_id=worktree_id,
+                paths=changed,
+                context=settled_context,
+            )
+        if materialized_worktree_id is not None:
+            self.provider.repository_layout(
+                worktree=self._worktree_path(materialized_worktree_id)
+            )
+            self._reconcile_worktree_labels(
+                pid=pid,
+                worktree_id=materialized_worktree_id,
+                paths=self._tracked_worktree_paths(materialized_worktree_id),
+                context=settled_context,
+            )
+        return changed
+
+    def _revalidate_exact_path_scopes(
+        self,
+        scopes: Sequence[tuple[bytes | None, bool]],
+        *,
+        worktree_id: str,
+    ) -> None:
+        for raw_path, subtree in scopes:
+            if raw_path is None or subtree:
+                continue
+            if self.provider.path_kind(
+                raw_path,
+                worktree=self._worktree_path(worktree_id),
+            ) == "directory":
+                raise GitError(
+                    GitErrorCode.STALE_STATE.value,
+                    "Git path changed from an exact file to a directory before dispatch",
+                    retryable=True,
+                )
+
+    def _settle_failed_mutation(
+        self,
+        *,
+        pid: str,
+        before: GitRepositoryState,
+        worktree_id: str,
+        reconciliation_paths: Sequence[bytes],
+        writes_worktree: bool,
+        mutation_context: DataFlowContext,
+        current_state: dict[str, Any],
+        materialized_worktree_id: str | None,
+        operation_error: BaseException,
+    ) -> None:
+        try:
+            after = self.provider.repository_state(
+                worktree=self._worktree_path(worktree_id)
+            )
+            self._settle_mutation_state(
+                pid=pid,
+                before=before,
+                after=after,
+                created_oid=(
+                    after.head_oid if after.head_oid != before.head_oid else None
+                ),
+                changed_raw=(),
+                reconciliation_paths=reconciliation_paths,
+                writes_worktree=writes_worktree,
+                worktree_id=worktree_id,
+                context=mutation_context,
+                source_carriers=tuple(current_state["source_carriers"]),
+                source_contexts=tuple(current_state["source_contexts"]),
+                materialized_worktree_id=materialized_worktree_id,
+            )
+        except BaseException as settlement_error:
+            raise BaseExceptionGroup(
+                "Git mutation failed and its data-flow state could not be reconciled",
+                [operation_error, settlement_error],
+            ) from None
 
     def _dispatch_mutation(
         self,
         *,
+        pid: str,
         operation: str,
         expected: str,
         worktree_id: str,
         paths: Sequence[bytes],
+        reconciliation_paths: Sequence[bytes],
+        materialized_worktree_id: str | None,
         filesystem_rights: Sequence[CapabilityRight],
+        filesystem_path_scopes: Sequence[tuple[bytes | None, bool]],
+        mutation_context: DataFlowContext,
         callback: _GitMutationCallback,
     ) -> tuple[GitOperationResult, dict[str, Any]]:
         previous_state = getattr(self._dispatch_state, "current", None)
-        current_state: dict[str, bool] = {"started": False}
+        current_state: dict[str, Any] = {
+            "started": False,
+            "source_carriers": [],
+            "source_contexts": [],
+        }
         self._dispatch_state.current = current_state
         try:
             with self.provider.repository_lock(
@@ -1842,6 +2513,10 @@ class GitPrimitive:
                     worktree=self._worktree_path(worktree_id)
                 )
                 before_token = self._require_same_state(expected, before_state)
+                self._revalidate_exact_path_scopes(
+                    filesystem_path_scopes,
+                    worktree_id=worktree_id,
+                )
                 lock_paths = tuple(paths) if paths else (None,)
                 worktree_root = self._normalized_worktree_root(worktree_id)
                 normalized_locks = [
@@ -1856,12 +2531,45 @@ class GitPrimitive:
                 with self.filesystem.hold_file_label_io_paths(
                     normalized_locks if filesystem_rights else ()
                 ):
-                    created_oid, details, changed_raw = callback(before_state)
-                after_state = self.provider.repository_state(
-                    worktree=self._worktree_path(worktree_id)
-                )
+                    writes_worktree = any(
+                        right in {CapabilityRight.WRITE, CapabilityRight.DELETE}
+                        for right in filesystem_rights
+                    )
+                    try:
+                        created_oid, details, changed_raw = callback(before_state)
+                    except BaseException as operation_error:
+                        if not current_state["started"]:
+                            raise
+                        self._settle_failed_mutation(
+                            pid=pid,
+                            before=before_state,
+                            worktree_id=worktree_id,
+                            reconciliation_paths=reconciliation_paths,
+                            writes_worktree=writes_worktree,
+                            mutation_context=mutation_context,
+                            current_state=current_state,
+                            materialized_worktree_id=materialized_worktree_id,
+                            operation_error=operation_error,
+                        )
+                        raise
+                    after_state = self.provider.repository_state(
+                        worktree=self._worktree_path(worktree_id)
+                    )
+                    changed = self._settle_mutation_state(
+                        pid=pid,
+                        before=before_state,
+                        after=after_state,
+                        created_oid=created_oid,
+                        changed_raw=changed_raw,
+                        reconciliation_paths=reconciliation_paths,
+                        writes_worktree=writes_worktree,
+                        worktree_id=worktree_id,
+                        context=mutation_context,
+                        source_carriers=tuple(current_state["source_carriers"]),
+                        source_contexts=tuple(current_state["source_contexts"]),
+                        materialized_worktree_id=materialized_worktree_id,
+                    )
                 after_token = self._state_token(after_state)
-                changed = tuple(dict.fromkeys(changed_raw))
                 result = GitOperationResult(
                     operation=operation,
                     repository_id=before_state.layout.repository_id,
@@ -1904,6 +2612,8 @@ class GitPrimitive:
         *,
         worktree_id: str = "main",
         paths: Sequence[bytes] = (),
+        reconciliation_paths: Sequence[bytes] = (),
+        materialized_worktree_id: str | None = None,
         filesystem_rights: Sequence[CapabilityRight] = (),
         destructive: bool = False,
         extra: dict[str, Any] | None = None,
@@ -1916,18 +2626,16 @@ class GitPrimitive:
         filesystem_path_subtree: bool = False,
         additional_authorities: Sequence[tuple[str, CapabilityRight, bool]] = (),
         mandatory_primary_approval: bool = False,
+        flow_snapshot_resolver: _GitFlowSnapshotResolver | None = None,
+        protected_flow_snapshot_resolver: _GitFlowSnapshotResolver | None = None,
     ) -> GitOperationResult:
         if descriptor not in _GIT_MUTATION_DESCRIPTORS:
             raise ValidationError("unsupported protected Git operation descriptor")
-        selected_descriptor = (
-            "primitive.git.push"
-            if descriptor == "primitive.git.push"
-            else "primitive.git.fetch"
-            if descriptor == "primitive.git.fetch"
-            else "primitive.git.pull_request"
-            if descriptor == "primitive.git.pull_request"
-            else "primitive.git.mutate"
-        )
+        if (
+            flow_snapshot_resolver is not None
+            and protected_flow_snapshot_resolver is not None
+        ):
+            raise ValidationError("Git mutation accepts only one flow snapshot resolver")
         expected, target, context = self._mutation_context(
             pid=pid,
             operation=operation,
@@ -1938,7 +2646,7 @@ class GitPrimitive:
             paths=paths,
             extra=extra,
         )
-        decisions, mandatory_indexes, approval_context = self._authorize_mutation(
+        decisions, mandatory_indexes, approval_context, filesystem_path_scopes = self._authorize_mutation(
             pid=pid,
             operation=operation,
             target=target,
@@ -1960,11 +2668,25 @@ class GitPrimitive:
             "expected_state_token": expected,
             **dict(extra or {}),
         }
-        invocation = self._mutation_invocation(
+        flow_snapshot = None
+        if flow_snapshot_resolver is not None:
+            flow_snapshot = flow_snapshot_resolver(filesystem_path_scopes)
+        elif protected_flow_snapshot_resolver is not None:
+            def resolve_protected_snapshot() -> _GitFlowSnapshot:
+                return protected_flow_snapshot_resolver(filesystem_path_scopes)
+
+            flow_snapshot = self._protected_flow_snapshot(
+                pid=pid,
+                operation=operation,
+                worktree_id=worktree_id,
+                scope_count=len(filesystem_path_scopes),
+                resolver=resolve_protected_snapshot,
+            )
+        invocation, flow_context, ingress_context = self._mutation_invocation(
             pid=pid,
             operation=operation,
             target=target,
-            selected_descriptor=selected_descriptor,
+            selected_descriptor=descriptor,
             expected=expected,
             context=context,
             decisions=decisions,
@@ -1972,6 +2694,7 @@ class GitPrimitive:
             approval_context=approval_context,
             observation=observation,
             source_oids=source_oids,
+            flow_snapshot=flow_snapshot,
         )
 
         def dispatch() -> tuple[GitOperationResult, dict[str, Any]]:
@@ -1980,36 +2703,26 @@ class GitPrimitive:
                 expected=expected,
                 worktree_id=worktree_id,
                 paths=paths,
+                reconciliation_paths=reconciliation_paths,
+                materialized_worktree_id=materialized_worktree_id,
                 filesystem_rights=filesystem_rights,
+                filesystem_path_scopes=filesystem_path_scopes,
+                pid=pid,
+                mutation_context=ingress_context or flow_context,
                 callback=lambda before: callback(before),
             )
 
-        with self.protected_operations.start(
-            selected_descriptor,
-            invocation,
-            provider=self.provider,
-        ) as protected:
-            result, summary = protected.call(
-                ProviderPhase(
-                    operation,
-                    state_mutation=True,
-                    information_flow=remote is not None,
-                ),
-                dispatch,
-            )
-            return protected.complete(
-                result,
-                self._evidence(
-                    pid=pid,
-                    operation=operation,
-                    resource=target,
-                    summary=summary,
-                    mutation=True,
-                    input_refs=input_refs,
-                ),
-                classification_context=observation,
-                classification_result=summary,
-            )
+        return self._complete_mutation(
+            pid=pid,
+            operation=operation,
+            descriptor=descriptor,
+            target=target,
+            remote=remote,
+            invocation=invocation,
+            observation=observation,
+            input_refs=input_refs,
+            dispatch=dispatch,
+        )
 
     def stage(
         self,
@@ -2038,6 +2751,10 @@ class GitPrimitive:
             worktree_id=worktree_id,
             paths=selected,
             filesystem_rights=(CapabilityRight.READ,),
+            flow_snapshot_resolver=lambda scopes: self._filesystem_flow_snapshot(
+                scopes,
+                worktree_id=worktree_id,
+            ),
         )
 
     def unstage(
@@ -2119,6 +2836,12 @@ class GitPrimitive:
                 "message_sha256": _sha256(encoded),
                 "message_bytes": len(encoded),
             },
+            protected_flow_snapshot_resolver=lambda _scopes: self._current_git_lineage_snapshot(
+                expected_state_token,
+                worktree_id=worktree_id,
+                include_index=True,
+                include_head=True,
+            ),
         )
 
     def restore(
@@ -2145,6 +2868,10 @@ class GitPrimitive:
             oid = self._resolve_commit(source, worktree_id=worktree_id) if source is not None else before.head_oid
             if oid is None:
                 raise GitError(GitErrorCode.INVALID_REF.value, "restore source is unavailable in an unborn repository")
+            if staged:
+                self._mark_git_source_carrier("commit", oid)
+            else:
+                self._mark_git_source_carrier("index", before.index_sha256)
             if staged and worktree:
                 args = ["checkout", oid, "--", *self._path_argv(selected)]
             elif staged:
@@ -2162,6 +2889,7 @@ class GitPrimitive:
             worktree_id=worktree_id,
             paths=selected,
             filesystem_rights=(CapabilityRight.WRITE, CapabilityRight.DELETE),
+            filesystem_path_subtree=True,
             destructive=True,
             extra={"staged": staged, "worktree": worktree, "source": source},
         )
@@ -2242,17 +2970,21 @@ class GitPrimitive:
             created_oid: str | None = None
             if detach:
                 oid = self._resolve_commit(target, worktree_id=worktree_id)
+                self._mark_git_source_carrier("commit", oid)
                 args.extend(["--detach", oid])
                 created_oid = oid
             elif create:
                 oid = self._resolve_commit(start, worktree_id=worktree_id) if start is not None else before.head_oid
                 if oid is None:
                     raise GitError(GitErrorCode.INVALID_REF.value, "new branch start is unavailable")
+                self._mark_git_source_carrier("commit", oid)
                 assert selected_branch is not None
                 args.extend(["-b", selected_branch, oid])
                 created_oid = oid
             else:
                 assert selected_branch is not None
+                oid = self._resolve_commit(selected_branch, worktree_id=worktree_id)
+                self._mark_git_source_carrier("commit", oid)
                 args.append(selected_branch)
             self._mutation_command(before, "switch", args, worktree_id=worktree_id)
             return created_oid, {
@@ -2370,6 +3102,7 @@ class GitPrimitive:
             else:
                 assert ref is not None
                 oid = self._resolve_commit(ref, worktree_id=worktree_id)
+                self._mark_git_source_carrier("commit", oid)
                 if operation == "merge":
                     args = ["merge", "--no-edit", "--no-gpg-sign", oid]
                 elif operation == "rebase":
@@ -2418,11 +3151,30 @@ class GitPrimitive:
         stash_ref = f"stash@{{{index}}}"
 
         def dispatch(before: GitRepositoryState) -> tuple[str | None, dict[str, Any], Sequence[bytes]]:
+            previous_stash_oid: str | None = None
             if action == "push":
+                previous_stash_oid = self._resolve_stash_commit(
+                    0,
+                    worktree_id=worktree_id,
+                    optional=True,
+                )
+                if self.data_flow is None:
+                    raise ValidationError("Git data-flow manager is not attached")
+                worktree_root = self._normalized_worktree_root(worktree_id)
+                source_context, _state_version = self.data_flow.file_tree_snapshot(
+                    worktree_root or "."
+                )
+                self._mark_git_source_context(source_context)
                 args = ["stash", "push", "--message", "agent-libos"]
                 if include_untracked:
                     args.append("--include-untracked")
             elif action in {"apply", "pop"}:
+                stash_oid = self._resolve_stash_commit(
+                    index,
+                    worktree_id=worktree_id,
+                )
+                assert stash_oid is not None
+                self._mark_git_source_carrier("commit", stash_oid)
                 args = ["stash", action]
                 if reinstate_index:
                     args.append("--index")
@@ -2432,7 +3184,21 @@ class GitPrimitive:
             else:
                 args = ["stash", "clear"]
             self._mutation_command(before, "stash", args, worktree_id=worktree_id)
-            return None, {
+            current_stash_oid = (
+                self._resolve_stash_commit(
+                    0,
+                    worktree_id=worktree_id,
+                    optional=True,
+                )
+                if action == "push"
+                else None
+            )
+            created_oid = (
+                current_stash_oid
+                if current_stash_oid != previous_stash_oid
+                else None
+            )
+            return created_oid, {
                 "action": action,
                 "stash_index": index if action != "clear" else None,
                 "include_untracked": include_untracked,
@@ -2474,6 +3240,7 @@ class GitPrimitive:
 
         def dispatch(before: GitRepositoryState) -> tuple[str | None, dict[str, Any], Sequence[bytes]]:
             oid = self._resolve_commit(target, worktree_id=worktree_id)
+            self._mark_git_source_carrier("commit", oid)
             self._mutation_command(before, "reset", ["reset", f"--{mode}", oid], worktree_id=worktree_id)
             return oid, {"mode": mode, "target_oid": oid, "old_head_oid": before.head_oid}, ()
 
@@ -2493,6 +3260,80 @@ class GitPrimitive:
             extra={"mode": mode, "target": target},
         )
 
+    def _clean_snapshot(
+        self,
+        paths: Sequence[bytes],
+        *,
+        directories: bool,
+        ignored: bool,
+        worktree_id: str,
+    ) -> _GitCleanSnapshot:
+        flags = "-f"
+        if directories:
+            flags += "d"
+        if ignored:
+            flags += "x"
+        suffix = ["--", *self._path_argv(paths)]
+        preview = self._require_success(
+            self._run(
+                ["clean", flags.replace("f", "n", 1), *suffix],
+                worktree_id=worktree_id,
+                max_output_bytes=self.config.git.output_hard_limit_bytes,
+            ),
+            "clean_preview",
+        )
+        candidate_commands = [
+            ["ls-files", "--others", "--exclude-standard", "-z", *suffix]
+        ]
+        if ignored:
+            candidate_commands.append(
+                [
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z",
+                    *suffix,
+                ]
+            )
+        candidates: dict[bytes, None] = {}
+        for command in candidate_commands:
+            listed = self._require_success(
+                self._run(
+                    command,
+                    worktree_id=worktree_id,
+                    max_output_bytes=self.config.git.output_hard_limit_bytes,
+                ),
+                "clean_candidates",
+            )
+            for path in self._bounded_git_paths(listed.stdout):
+                candidates.setdefault(self._decode_path(path), None)
+
+        digest = hashlib.sha256()
+        digest.update(len(preview.stdout).to_bytes(8, "big"))
+        digest.update(preview.stdout)
+        selected_paths = tuple(sorted(candidates))
+        for raw_path in selected_paths:
+            content_sha256 = self.provider.path_content_sha256(
+                raw_path,
+                worktree=self._worktree_path(worktree_id),
+            )
+            kind = self.provider.path_kind(
+                raw_path,
+                worktree=self._worktree_path(worktree_id),
+            )
+            digest.update(len(raw_path).to_bytes(8, "big"))
+            digest.update(raw_path)
+            digest.update(kind.encode("ascii"))
+            digest.update((content_sha256 or "missing").encode("ascii"))
+        return _GitCleanSnapshot(
+            flags=flags,
+            preview_sha256=preview.stdout_sha256,
+            preview_bytes=len(preview.stdout),
+            candidate_paths=selected_paths,
+            manifest_sha256=digest.hexdigest(),
+        )
+
     def clean(
         self,
         pid: str,
@@ -2505,27 +3346,56 @@ class GitPrimitive:
     ) -> GitOperationResult:
         selected = self._decode_paths(paths)
 
-        def dispatch(before: GitRepositoryState) -> tuple[str | None, dict[str, Any], Sequence[bytes]]:
-            flags = "-f"
-            if directories:
-                flags += "d"
-            if ignored:
-                flags += "x"
-            preview_flags = flags.replace("f", "n", 1)
-            suffix = ["--", *self._path_argv(selected)]
-            preview = self._run(
-                ["clean", preview_flags, *suffix],
+        def read_snapshot() -> tuple[_GitCleanSnapshot, dict[str, Any]]:
+            current = self._clean_snapshot(
+                selected,
+                directories=directories,
+                ignored=ignored,
                 worktree_id=worktree_id,
-                max_output_bytes=self.config.git.output_hard_limit_bytes,
             )
-            self._require_success(preview, "clean_preview")
-            self._mutation_command(before, "clean", ["clean", flags, *suffix], worktree_id=worktree_id)
+            return current, {
+                "candidate_count": len(current.candidate_paths),
+                "candidate_manifest_sha256": current.manifest_sha256,
+                "preview_bytes": current.preview_bytes,
+                "preview_sha256": current.preview_sha256,
+            }
+
+        snapshot = self._read(
+            pid,
+            "clean_snapshot",
+            read_snapshot,
+            worktree_id=worktree_id,
+            extra={"directories": directories, "ignored": ignored},
+        )
+
+        def dispatch(before: GitRepositoryState) -> tuple[str | None, dict[str, Any], Sequence[bytes]]:
+            current = self._clean_snapshot(
+                selected,
+                directories=directories,
+                ignored=ignored,
+                worktree_id=worktree_id,
+            )
+            if current.manifest_sha256 != snapshot.manifest_sha256:
+                raise GitError(
+                    GitErrorCode.STALE_STATE.value,
+                    "Git clean candidates changed after approval",
+                    retryable=True,
+                )
+            suffix = ["--", *self._path_argv(selected)]
+            self._mutation_command(
+                before,
+                "clean",
+                ["clean", snapshot.flags, *suffix],
+                worktree_id=worktree_id,
+            )
             return None, {
                 "directories": directories,
                 "ignored": ignored,
-                "preview_sha256": preview.stdout_sha256,
-                "preview_bytes": len(preview.stdout),
-            }, selected
+                "preview_sha256": snapshot.preview_sha256,
+                "preview_bytes": snapshot.preview_bytes,
+                "candidate_manifest_sha256": snapshot.manifest_sha256,
+                "candidate_count": len(snapshot.candidate_paths),
+            }, snapshot.candidate_paths or selected
 
         return self._mutate(
             pid,
@@ -2534,9 +3404,17 @@ class GitPrimitive:
             dispatch,
             worktree_id=worktree_id,
             paths=selected,
+            reconciliation_paths=snapshot.candidate_paths,
             filesystem_rights=(CapabilityRight.READ, CapabilityRight.DELETE),
             destructive=True,
-            extra={"directories": directories, "ignored": ignored},
+            extra={
+                "directories": directories,
+                "ignored": ignored,
+                "preview_sha256": snapshot.preview_sha256,
+                "preview_bytes": snapshot.preview_bytes,
+                "candidate_manifest_sha256": snapshot.manifest_sha256,
+                "candidate_count": len(snapshot.candidate_paths),
+            },
         )
 
     def worktree(
@@ -2580,6 +3458,7 @@ class GitPrimitive:
                 oid = self._resolve_commit(ref, worktree_id="main") if ref is not None else before.head_oid
                 if oid is None:
                     raise GitError(GitErrorCode.INVALID_REF.value, "managed worktree start is unavailable")
+                self._mark_git_source_carrier("commit", oid)
                 if selected_branch is None:
                     args = ["worktree", "add", "--detach", str(target), oid]
                 else:
@@ -2610,6 +3489,9 @@ class GitPrimitive:
             dispatch,
             worktree_id="main",
             paths=(fs_path,),
+            materialized_worktree_id=(
+                selected_id if action == "create" else None
+            ),
             filesystem_rights=(
                 (CapabilityRight.WRITE,)
                 if action == "create"
@@ -3221,6 +4103,7 @@ class GitPrimitive:
                 branch_name = fetched.head_ref[len("refs/heads/") :]
             tracking_ref = f"refs/remotes/{selected_remote}/{branch_name}"
             target_oid = self._resolve_commit(tracking_ref, worktree_id=worktree_id)
+            self._mark_git_source_carrier("commit", target_oid)
             if strategy == "ff_only":
                 args = ["merge", "--ff-only", "--no-edit", target_oid]
             elif strategy == "merge":
@@ -3277,6 +4160,69 @@ class GitPrimitive:
             return selected
         return f"refs/heads/{self._validate_branch(value)}"
 
+    def _push_selection(
+        self,
+        *,
+        remote: str,
+        remote_ref: str,
+        local_ref: str | None,
+        delete: bool,
+        force_with_lease_oid: str | None,
+    ) -> tuple[str, str, str | None]:
+        selected_remote = self._validate_remote(remote)
+        selected_remote_ref = self._validate_ref_name(remote_ref)
+        if not selected_remote_ref.startswith(("refs/heads/", "refs/tags/")):
+            raise GitError(
+                GitErrorCode.INVALID_REF.value,
+                "push remote ref must be a branch or tag",
+            )
+        if delete:
+            if local_ref is not None:
+                raise ValidationError("remote ref deletion does not accept local_ref")
+            selected_local_ref = None
+        else:
+            if local_ref is None:
+                raise GitError(
+                    GitErrorCode.INVALID_REF.value,
+                    "push requires an explicit local_ref",
+                )
+            selected_local_ref = self._canonical_local_ref(local_ref)
+        if (delete or force_with_lease_oid is not None) and force_with_lease_oid is None:
+            raise GitError(
+                GitErrorCode.INVALID_REF.value,
+                "destructive push requires expected remote OID",
+            )
+        if force_with_lease_oid is not None and not _OID_RE.fullmatch(
+            force_with_lease_oid
+        ):
+            raise GitError(
+                GitErrorCode.INVALID_REF.value,
+                "force-with-lease expected remote OID is invalid",
+            )
+        return selected_remote, selected_remote_ref, selected_local_ref
+
+    def _push_flow_snapshot(
+        self,
+        *,
+        expected_state_token: str,
+        worktree_id: str,
+        local_ref: str | None,
+    ) -> _GitFlowSnapshot:
+        if local_ref is None:
+            empty_version = self._flow_state_version(())
+            return _GitFlowSnapshot(
+                context=DataFlowContext(),
+                state_version=empty_version,
+                state_version_resolver=lambda: empty_version,
+            )
+        return self._current_git_lineage_snapshot(
+            expected_state_token,
+            worktree_id=worktree_id,
+            include_index=False,
+            include_head=False,
+            local_ref=local_ref,
+        )
+
     def push(
         self,
         pid: str,
@@ -3289,23 +4235,13 @@ class GitPrimitive:
         force_with_lease_oid: str | None = None,
         worktree_id: str = "main",
     ) -> GitOperationResult:
-        selected_remote = self._validate_remote(remote)
-        selected_remote_ref = self._validate_ref_name(remote_ref)
-        if not selected_remote_ref.startswith(("refs/heads/", "refs/tags/")):
-            raise GitError(GitErrorCode.INVALID_REF.value, "push remote ref must be a branch or tag")
-        if delete:
-            if local_ref is not None:
-                raise ValidationError("remote ref deletion does not accept local_ref")
-            selected_local_ref = None
-        else:
-            if local_ref is None:
-                raise GitError(GitErrorCode.INVALID_REF.value, "push requires an explicit local_ref")
-            selected_local_ref = self._canonical_local_ref(local_ref)
-        if (delete or force_with_lease_oid is not None) and force_with_lease_oid is None:
-            raise GitError(GitErrorCode.INVALID_REF.value, "destructive push requires expected remote OID")
-        if force_with_lease_oid is not None:
-            if not _OID_RE.fullmatch(force_with_lease_oid):
-                raise GitError(GitErrorCode.INVALID_REF.value, "force-with-lease expected remote OID is invalid")
+        selected_remote, selected_remote_ref, selected_local_ref = self._push_selection(
+            remote=remote,
+            remote_ref=remote_ref,
+            local_ref=local_ref,
+            delete=delete,
+            force_with_lease_oid=force_with_lease_oid,
+        )
         fingerprint = self._remote_preflight(
             pid,
             selected_remote,
@@ -3320,6 +4256,15 @@ class GitPrimitive:
             remote_ref=selected_remote_ref,
             old_oid=force_with_lease_oid,
         )
+
+        def read_push_flow(
+            _scopes: Sequence[tuple[bytes | None, bool]],
+        ) -> _GitFlowSnapshot:
+            return self._push_flow_snapshot(
+                expected_state_token=expected_state_token,
+                worktree_id=worktree_id,
+                local_ref=selected_local_ref,
+            )
 
         def dispatch(before: GitRepositoryState) -> tuple[str | None, dict[str, Any], Sequence[bytes]]:
             if force_with_lease_oid is not None:
@@ -3374,14 +4319,13 @@ class GitPrimitive:
                 "remote_fingerprint": fingerprint["fingerprint"],
             }, ()
 
-        destructive = delete or force_with_lease_oid is not None
         return self._mutate(
             pid,
             "push",
             expected_state_token,
             dispatch,
             worktree_id=worktree_id,
-            destructive=destructive,
+            destructive=delete or force_with_lease_oid is not None,
             extra={
                 **fingerprint_context,
                 "local_ref": selected_local_ref,
@@ -3394,6 +4338,7 @@ class GitPrimitive:
             primary_right=CapabilityRight.WRITE,
             additional_authorities=((self.repository_resource, CapabilityRight.READ, False),),
             remote=selected_remote,
+            protected_flow_snapshot_resolver=read_push_flow,
         )
 
     @staticmethod
@@ -3908,6 +4853,7 @@ class GitPrimitive:
             parsed_status = self._parse_status(before, limit=self.config.git.status_entry_hard_limit)
             if parsed_status.entries:
                 raise GitError(GitErrorCode.DIRTY_WORKTREE.value, "pull request merge requires a clean worktree")
+            self._mark_git_source_carrier("commit", pull_request.head_oid)
             if strategy == "fast_forward":
                 args = ["merge", "--ff-only", "--no-edit", pull_request.head_oid]
                 self._mutation_command(before, "merge_pull_request", args, worktree_id=worktree_id)

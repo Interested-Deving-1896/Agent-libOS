@@ -284,6 +284,10 @@ class LocalGitProvider:
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_ATTR_NOSYSTEM": "1",
             "GIT_CONFIG_NOSYSTEM": "0",
+            "GIT_TRACE": "0",
+            "GIT_TRACE2": "0",
+            "GIT_TRACE2_EVENT": "0",
+            "GIT_TRACE2_PERF": "0",
         }
         for key in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TMP", "TEMP"):
             value = os.environ.get(key)
@@ -690,6 +694,12 @@ class LocalGitProvider:
             "diff.external=",
             "-c",
             "color.ui=false",
+            "-c",
+            "trace2.eventTarget=",
+            "-c",
+            "trace2.normalTarget=",
+            "-c",
+            "trace2.perfTarget=",
             "-c",
             "commit.gpgSign=false",
             "-c",
@@ -1512,6 +1522,51 @@ class LocalGitProvider:
         if stat.S_ISDIR(metadata.st_mode):
             return hashlib.sha256(b"<agent-libos-directory>").hexdigest()
         raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "unsupported repository path type")
+
+    def path_kind(
+        self,
+        path: bytes,
+        *,
+        worktree: str | Path | None = None,
+    ) -> str:
+        if not isinstance(path, bytes) or not path or b"\x00" in path:
+            raise self._error(GitErrorCode.INVALID_PATH, "invalid repository path")
+        decoded = os.fsdecode(path)
+        lexical = Path(decoded)
+        if lexical.is_absolute() or any(part in {"", ".", ".."} for part in lexical.parts):
+            raise self._error(GitErrorCode.INVALID_PATH, "invalid repository path")
+        layout = self.repository_layout(worktree=worktree)
+        selected = layout.root.joinpath(*lexical.parts)
+        try:
+            metadata = selected.lstat()
+        except FileNotFoundError:
+            return "missing"
+        except OSError as exc:
+            raise self._error(
+                GitErrorCode.UNSAFE_REPOSITORY,
+                "repository path could not be inspected",
+            ) from exc
+        if stat.S_ISREG(metadata.st_mode):
+            return "file"
+        if stat.S_ISLNK(metadata.st_mode):
+            return "symlink"
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory"
+        raise self._error(GitErrorCode.UNSAFE_REPOSITORY, "unsupported repository path type")
+
+    def preflight_path_kind(
+        self,
+        path: bytes,
+        *,
+        worktree: str | Path | None = None,
+    ) -> str:
+        """Inspect only path type for capability-scope selection.
+
+        The primitive repeats this observation inside the protected mutation
+        phase before dispatch, so a file-to-directory race is fail-closed.
+        """
+
+        return self.path_kind(path, worktree=worktree)
 
     def _pull_request_directory(self, layout: GitRepositoryLayout, *, create: bool) -> Path:
         base = layout.common_dir / "agent-libos"

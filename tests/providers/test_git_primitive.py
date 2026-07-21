@@ -17,6 +17,7 @@ from agent_libos import Runtime
 from agent_libos.config import DEFAULT_CONFIG, AgentLibOSConfig, GitDefaults
 from agent_libos.models import (
     CapabilityRight,
+    EventType,
     GitErrorCode,
     GitPullRequestStatus,
     ObjectMetadata,
@@ -38,9 +39,19 @@ _T = TypeVar("_T")
 
 
 def _git(root: Path, *args: str, input_bytes: bytes | None = None) -> bytes:
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "GIT_TRACE": "0",
+            "GIT_TRACE2": "0",
+            "GIT_TRACE2_EVENT": "0",
+            "GIT_TRACE2_PERF": "0",
+        }
+    )
     result = subprocess.run(
         ["git", *args],
         cwd=root,
+        env=environment,
         input=input_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -89,6 +100,21 @@ def _open_runtime(root: Path, *, git: GitDefaults | None = None) -> Runtime:
 
 
 def _grant_git_authority(runtime: Runtime, pid: str, *, remote: str | None = None) -> None:
+    _grant_git_repository_authority(runtime, pid, remote=remote)
+    runtime.filesystem.grant_directory(
+        pid,
+        ".",
+        [CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.DELETE],
+        issued_by="git-provider-test",
+    )
+
+
+def _grant_git_repository_authority(
+    runtime: Runtime,
+    pid: str,
+    *,
+    remote: str | None = None,
+) -> None:
     runtime.capability.issue_trusted(
         pid,
         "git:workspace",
@@ -124,12 +150,6 @@ def _grant_git_authority(runtime: Runtime, pid: str, *, remote: str | None = Non
             ],
             issued_by="git-provider-test",
         )
-    runtime.filesystem.grant_directory(
-        pid,
-        ".",
-        [CapabilityRight.READ, CapabilityRight.WRITE, CapabilityRight.DELETE],
-        issued_by="git-provider-test",
-    )
 
 
 def _with_auto_approvals(runtime: Runtime, callback: Callable[[], _T]) -> _T:
@@ -200,6 +220,40 @@ def test_builder_does_not_eagerly_construct_a_fallback_git_provider(
         module_manifests=(),
     )
     runtime.close()
+
+
+def test_builder_registers_fallback_git_provider_for_effect_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    substrate = LocalResourceProviderSubstrate(root, git_config=DEFAULT_CONFIG.git)
+    del substrate.git
+    builder_module = importlib.import_module("agent_libos.runtime.builder")
+    original = builder_module.reconcile_pending_external_effects
+    captured: dict[str, Any] = {}
+
+    def capture_recovery(*args: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs.get("provider_overrides") or {})
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        builder_module,
+        "reconcile_pending_external_effects",
+        capture_recovery,
+    )
+    runtime = Runtime.open(
+        ":memory:",
+        config=_runtime_config(),
+        substrate=substrate,
+        module_manifests=(),
+    )
+    try:
+        assert isinstance(runtime.git.provider, LocalGitProvider)
+        assert captured["git"] is runtime.git.provider
+    finally:
+        runtime.close()
 
 
 def test_unsupported_git_version_is_lazy_and_stable(tmp_path: Path) -> None:
@@ -306,6 +360,34 @@ def test_provider_rejects_repository_config_includes(tmp_path: Path) -> None:
     with pytest.raises(GitError) as exc_info:
         LocalGitProvider(root).repository_state()
     assert exc_info.value.code == GitErrorCode.UNSAFE_CONFIG.value
+
+
+def test_provider_disables_host_git_trace_sinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    trace_output = tmp_path / "git-trace-events.json"
+    (fake_home / ".gitconfig").write_text(
+        "[trace2]\n"
+        f"\teventTarget = {trace_output}\n"
+        f"\tnormalTarget = {trace_output}\n"
+        f"\tperfTarget = {trace_output}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="inspect Git safely")
+        _grant_git_authority(runtime, pid)
+        runtime.git.status(pid)
+        assert not trace_output.exists()
+    finally:
+        runtime.close()
 
 
 def test_active_external_filter_is_rejected_before_status_can_execute_it(tmp_path: Path) -> None:
@@ -602,6 +684,565 @@ def test_stage_commit_and_state_token_cas(tmp_path: Path) -> None:
         committed = runtime.git.commit(pid, "add new file", staged.after.token)
         assert committed.created_oid == _git(root, "rev-parse", "HEAD").strip().decode("ascii")
         assert runtime.git.status(pid).entries == []
+    finally:
+        runtime.close()
+
+
+def test_directory_pathspec_requires_subtree_filesystem_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    source = root / "src"
+    source.mkdir()
+    (source / "inside.txt").write_text("inside\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="stage one exact path")
+        _grant_git_repository_authority(runtime, pid)
+        runtime.capability.issue_trusted(
+            pid,
+            runtime.filesystem.resource_for("src"),
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+        state = runtime.git.status(pid).state.token
+        effects_before_denial = runtime.store.list_external_effects(pid=pid)
+
+        with pytest.raises((CapabilityDenied, HumanApprovalRequired)):
+            runtime.git.stage(pid, ["src"], state)
+        assert _git(root, "diff", "--cached", "--name-only", "--").strip() == b""
+        directory_resource = runtime.filesystem.directory_resource_for("src")
+        assert any(
+            record.actor == pid
+            and record.action == "capability.authorize"
+            and record.target == directory_resource
+            and record.decision is not None
+            and record.decision.get("allowed") is False
+            for record in runtime.audit.trace(actor=pid)
+        )
+        assert runtime.store.list_external_effects(pid=pid) == effects_before_denial
+
+        runtime.capability.issue_trusted(
+            pid,
+            runtime.filesystem.resource_for("src/inside.txt"),
+            [CapabilityRight.READ],
+            issued_by="git-provider-test",
+        )
+        staged = runtime.git.stage(pid, ["src/inside.txt"], state)
+        assert staged.changed_paths[0].display == "src/inside.txt"
+        assert _git(root, "diff", "--cached", "--name-only", "--").strip() == b"src/inside.txt"
+    finally:
+        runtime.close()
+
+
+def test_clean_approval_is_invalidated_when_ignored_content_changes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    (root / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+    _git(root, "add", "--", ".gitignore")
+    _git(root, "commit", "-q", "-m", "ignore fixture")
+    ignored = root / "ignored.txt"
+    ignored.write_text("first\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="clean an approved snapshot")
+        _grant_git_authority(runtime, pid)
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.clean(pid, state, ignored=True)
+        ignored.write_text("changed after request\n", encoding="utf-8")
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+
+        with pytest.raises(HumanApprovalRequired):
+            runtime.git.clean(pid, state, ignored=True)
+        assert ignored.read_text(encoding="utf-8") == "changed after request\n"
+
+        assert runtime.human.drain_terminal_queue(auto_approve=True)
+        runtime.git.clean(pid, state, ignored=True)
+        assert not ignored.exists()
+    finally:
+        runtime.close()
+
+
+def test_git_commit_lineage_blocks_cross_process_secret_push(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+    _init_repository(root)
+    remote.mkdir()
+    _git(remote, "init", "--bare", "-q")
+    _git(root, "remote", "add", "origin", remote.as_uri())
+    secret_path = root / "secret.txt"
+    secret_path.write_text("classified\n", encoding="utf-8")
+    git_config = replace(DEFAULT_CONFIG.git, allow_file_remotes=True)
+    runtime = _open_runtime(root, git=git_config)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="write secret source")
+        stager = runtime.process.spawn(image="base-agent:v0", goal="stage secret bytes")
+        committer = runtime.process.spawn(image="base-agent:v0", goal="commit staged bytes")
+        pusher = runtime.process.spawn(image="base-agent:v0", goal="push committed bytes")
+        for pid in (writer, stager, committer, pusher):
+            _grant_git_authority(runtime, pid, remote="origin")
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(sensitivity="secret", origin="git-lineage-test"),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="secret.txt",
+            content_sha256=hashlib.sha256(secret_path.read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        state = runtime.git.status(stager).state.token
+        staged = runtime.git.stage(stager, ["secret.txt"], state)
+        committed = runtime.git.commit(committer, "secret lineage", staged.after.token)
+        with pytest.raises(CapabilityDenied, match="data-flow denied"):
+            runtime.git.push(
+                pusher,
+                "origin",
+                "refs/heads/main",
+                committed.after.token,
+                local_ref="main",
+            )
+        assert _git(remote, "for-each-ref").strip() == b""
+        denied = runtime.store.list_data_flow_decisions(pid=pusher, outcome="deny")
+        assert len(denied) == 1
+        assert denied[0].sink == runtime.git.remote_resource("origin")
+        assert denied[0].labels.sensitivity.value == "secret"
+        assert any(
+            record.action == "data_flow.egress"
+            and record.target == denied[0].sink
+            and record.decision is not None
+            and record.decision.get("decision_id") == denied[0].decision_id
+            and record.decision.get("outcome") == "deny"
+            for record in runtime.audit.trace(actor=pusher)
+        )
+        assert any(
+            event.type == EventType.DATA_FLOW_DECISION
+            and event.payload.get("decision_id") == denied[0].decision_id
+            and event.payload.get("outcome") == "deny"
+            for event in runtime.events.list(
+                target=f"data_flow_sink:{denied[0].sink}"
+            )
+        )
+    finally:
+        runtime.close()
+
+
+def test_worktree_git_write_rebinds_stale_trusted_file_label(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "untrusted")
+    (root / "tracked.txt").write_text("replacement\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "replacement")
+    _git(root, "switch", "-q", "main")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="bind trusted file")
+        switcher = runtime.process.spawn(image="base-agent:v0", goal="switch worktree")
+        _grant_git_authority(runtime, writer)
+        _grant_git_authority(runtime, switcher)
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"integrity": "trusted"},
+            metadata=ObjectMetadata(
+                trust_level="trusted",
+                integrity="verified",
+                origin="trusted-fixture",
+            ),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="tracked.txt",
+            content_sha256=hashlib.sha256((root / "tracked.txt").read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        state = runtime.git.status(switcher).state.token
+        runtime.git.switch(switcher, "untrusted", state)
+        binding = runtime.store.get_file_label_binding("tracked.txt")
+        assert binding is not None
+        assert binding.content_sha256 == hashlib.sha256(b"replacement\n").hexdigest()
+        assert binding.labels.trust_level == "untrusted"
+        assert binding.labels.integrity == "untrusted"
+    finally:
+        runtime.close()
+
+
+def test_failed_worktree_git_write_rebinds_partially_modified_file_label(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "conflict")
+    (root / "tracked.txt").write_text("conflict branch\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "conflicting branch")
+    _git(root, "switch", "-q", "main")
+    (root / "tracked.txt").write_text("main branch\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "conflicting main")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="bind trusted file")
+        integrator = runtime.process.spawn(image="base-agent:v0", goal="merge a conflict")
+        _grant_git_authority(runtime, writer)
+        _grant_git_authority(runtime, integrator)
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"integrity": "trusted"},
+            metadata=ObjectMetadata(
+                trust_level="trusted",
+                integrity="verified",
+                origin="trusted-fixture",
+            ),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="tracked.txt",
+            content_sha256=hashlib.sha256((root / "tracked.txt").read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        state = runtime.git.status(integrator).state.token
+        with pytest.raises(GitError):
+            runtime.git.integrate(integrator, "merge", state, ref="conflict")
+
+        current = (root / "tracked.txt").read_bytes()
+        assert b"<<<<<<<" in current
+        binding = runtime.store.get_file_label_binding("tracked.txt")
+        assert binding is not None
+        assert binding.content_sha256 == hashlib.sha256(current).hexdigest()
+        assert binding.labels.trust_level == "untrusted"
+        assert binding.labels.integrity == "untrusted"
+        effect = runtime.store.list_external_effects(pid=integrator)[-1]
+        assert effect.transaction_state == "unknown"
+    finally:
+        runtime.close()
+
+
+def test_worktree_git_write_preserves_unchanged_secret_file_label(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "replacement")
+    (root / "tracked.txt").write_text("replacement\n", encoding="utf-8")
+    _git(root, "commit", "-q", "-am", "replacement")
+    _git(root, "switch", "-q", "main")
+    secret_path = root / "secret.txt"
+    secret_path.write_text("secret\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="bind secret file")
+        switcher = runtime.process.spawn(image="base-agent:v0", goal="switch worktree")
+        _grant_git_authority(runtime, writer)
+        _grant_git_authority(runtime, switcher)
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(sensitivity="secret", origin="secret-fixture"),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="secret.txt",
+            content_sha256=hashlib.sha256(secret_path.read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        state = runtime.git.status(switcher).state.token
+        runtime.git.switch(switcher, "replacement", state)
+
+        binding = runtime.store.get_file_label_binding("secret.txt")
+        assert binding is not None
+        assert binding.content_sha256 == hashlib.sha256(b"secret\n").hexdigest()
+        assert binding.labels.sensitivity.value == "secret"
+    finally:
+        runtime.close()
+
+
+def test_switch_propagates_secret_commit_lineage_to_materialized_file(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "secret-branch")
+    secret_path = root / "secret.txt"
+    secret_path.write_text("classified\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="label secret bytes")
+        stager = runtime.process.spawn(image="base-agent:v0", goal="stage secret bytes")
+        committer = runtime.process.spawn(image="base-agent:v0", goal="commit secret bytes")
+        switcher = runtime.process.spawn(image="base-agent:v0", goal="materialize Git bytes")
+        for pid in (writer, stager, committer, switcher):
+            _grant_git_authority(runtime, pid)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(sensitivity="secret", origin="git-lineage-test"),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="secret.txt",
+            content_sha256=hashlib.sha256(secret_path.read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        state = runtime.git.status(stager).state.token
+        staged = runtime.git.stage(stager, ["secret.txt"], state)
+        committed = runtime.git.commit(committer, "secret branch", staged.after.token)
+        on_main = runtime.git.switch(switcher, "main", committed.after.token)
+        assert not secret_path.exists()
+
+        runtime.git.switch(switcher, "secret-branch", on_main.after.token)
+        binding = runtime.store.get_file_label_binding("secret.txt")
+        assert binding is not None
+        assert binding.content_sha256 == hashlib.sha256(b"classified\n").hexdigest()
+        assert binding.labels.sensitivity.value == "secret"
+        assert binding.labels.trust_level == "untrusted"
+    finally:
+        runtime.close()
+
+
+def test_internal_git_lineage_carriers_are_excluded_from_workspace_tree_labels(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="inspect Git lineage")
+        source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(sensitivity="secret", origin="git-lineage-test"),
+        )
+        internal_path = ".git/agent-libos-flow/test/commit/carrier"
+        runtime.data_flow.bind_written_file_digest(
+            pid=pid,
+            normalized_path=internal_path,
+            content_sha256=hashlib.sha256(b"carrier").hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(pid, [source.oid]),
+        )
+
+        exact, _exact_version = runtime.data_flow.file_snapshot(internal_path)
+        workspace, _workspace_version = runtime.data_flow.file_tree_snapshot(".")
+        assert exact.labels.sensitivity.value == "secret"
+        assert workspace.labels.sensitivity.value == "normal"
+    finally:
+        runtime.close()
+
+
+def test_stash_round_trip_preserves_secret_worktree_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    tracked = root / "tracked.txt"
+    tracked.write_text("classified stash\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="label stash bytes")
+        stasher = runtime.process.spawn(image="base-agent:v0", goal="round-trip stash")
+        _grant_git_authority(runtime, writer)
+        _grant_git_authority(runtime, stasher)
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(sensitivity="secret", origin="stash-lineage-test"),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="tracked.txt",
+            content_sha256=hashlib.sha256(tracked.read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        state = runtime.git.status(stasher).state.token
+        stashed = runtime.git.stash(stasher, "push", state)
+        assert stashed.created_oid is not None
+        applied = runtime.git.stash(stasher, "apply", stashed.after.token)
+
+        assert tracked.read_bytes() == b"classified stash\n"
+        binding = runtime.store.get_file_label_binding("tracked.txt")
+        assert binding is not None
+        assert binding.content_sha256 == hashlib.sha256(
+            b"classified stash\n"
+        ).hexdigest()
+        assert binding.labels.sensitivity.value == "secret"
+        assert applied.after.token != stashed.after.token
+    finally:
+        runtime.close()
+
+
+def test_managed_worktree_materialization_preserves_secret_commit_lineage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "secret-worktree")
+    secret_path = root / "secret.txt"
+    secret_path.write_text("classified worktree\n", encoding="utf-8")
+    runtime = _open_runtime(root)
+    try:
+        writer = runtime.process.spawn(image="base-agent:v0", goal="label secret bytes")
+        creator = runtime.process.spawn(image="base-agent:v0", goal="create worktree")
+        _grant_git_authority(runtime, writer)
+        _grant_git_authority(runtime, creator)
+        runtime.data_flow.register_sink_trust(
+            SinkTrustRule(
+                pattern="git:workspace",
+                trust_level=SinkTrustLevel.TRUSTED,
+                max_sensitivity="secret",
+            ),
+            actor="git-provider-test",
+            require_capability=False,
+        )
+        source = runtime.memory.create_object(
+            writer,
+            ObjectType.EVIDENCE,
+            {"classification": "secret"},
+            metadata=ObjectMetadata(sensitivity="secret", origin="git-lineage-test"),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=writer,
+            normalized_path="secret.txt",
+            content_sha256=hashlib.sha256(secret_path.read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(writer, [source.oid]),
+        )
+
+        state = runtime.git.status(writer).state.token
+        staged = runtime.git.stage(writer, ["secret.txt"], state)
+        committed = runtime.git.commit(writer, "secret worktree", staged.after.token)
+        created = runtime.git.worktree(
+            creator,
+            "create",
+            committed.after.token,
+            ref="secret-worktree",
+        )
+        worktree_id = str(created.details["managed_worktree_id"])
+        managed_root = Path(runtime.git.provider.managed_worktree_root)
+        normalized = (managed_root / worktree_id / "secret.txt").relative_to(root).as_posix()
+        binding = runtime.store.get_file_label_binding(normalized)
+        assert binding is not None
+        assert binding.content_sha256 == hashlib.sha256(
+            b"classified worktree\n"
+        ).hexdigest()
+        assert binding.labels.sensitivity.value == "secret"
+        assert binding.labels.trust_level == "untrusted"
+    finally:
+        runtime.close()
+
+
+def test_restore_source_tree_requires_subtree_filesystem_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "repo"
+    _init_repository(root)
+    _git(root, "switch", "-q", "-c", "tree-source")
+    (root / "node").mkdir()
+    (root / "node" / "child.txt").write_text("child\n", encoding="utf-8")
+    _git(root, "add", "--", "node/child.txt")
+    _git(root, "commit", "-q", "-m", "tree source")
+    _git(root, "switch", "-q", "main")
+    (root / "node").write_text("single file\n", encoding="utf-8")
+    _git(root, "add", "--", "node")
+    _git(root, "commit", "-q", "-m", "file target")
+    runtime = _open_runtime(root)
+    try:
+        pid = runtime.process.spawn(image="base-agent:v0", goal="restore a tree")
+        _grant_git_repository_authority(runtime, pid)
+        runtime.filesystem.grant_path(
+            pid,
+            "node",
+            [CapabilityRight.WRITE, CapabilityRight.DELETE],
+            issued_by="git-provider-test",
+        )
+        state = runtime.git.status(pid).state.token
+
+        with pytest.raises(CapabilityDenied):
+            _with_auto_approvals(
+                runtime,
+                lambda: runtime.git.restore(
+                    pid,
+                    ["node"],
+                    state,
+                    staged=True,
+                    source="tree-source",
+                ),
+            )
+        assert (root / "node").read_text(encoding="utf-8") == "single file\n"
+        trusted_source = runtime.memory.create_object(
+            pid,
+            ObjectType.EVIDENCE,
+            {"integrity": "trusted"},
+            metadata=ObjectMetadata(
+                trust_level="trusted",
+                integrity="verified",
+                origin="trusted-fixture",
+            ),
+        )
+        runtime.data_flow.bind_written_file_digest(
+            pid=pid,
+            normalized_path="node",
+            content_sha256=hashlib.sha256((root / "node").read_bytes()).hexdigest(),
+            context=runtime.data_flow.context_from_source_oids(
+                pid,
+                [trusted_source.oid],
+            ),
+        )
+
+        runtime.filesystem.grant_directory(
+            pid,
+            "node",
+            [CapabilityRight.WRITE, CapabilityRight.DELETE],
+            issued_by="git-provider-test",
+        )
+        restored = _with_auto_approvals(
+            runtime,
+            lambda: runtime.git.restore(
+                pid,
+                ["node"],
+                state,
+                staged=True,
+                source="tree-source",
+            ),
+        )
+        assert restored.changed_paths[0].display == "node"
+        assert (root / "node" / "child.txt").read_text(encoding="utf-8") == "child\n"
+        assert runtime.store.get_file_label_binding("node") is None
+        child_binding = runtime.store.get_file_label_binding("node/child.txt")
+        assert child_binding is not None
+        assert child_binding.labels.trust_level == "untrusted"
     finally:
         runtime.close()
 
