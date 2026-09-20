@@ -131,6 +131,8 @@ def test_rendering_is_bounded_and_payload_free() -> None:
     assert "SECRET_REASON" not in digest
     assert "llm" not in digest.split(REOPEN_DIGEST_HEADING, 1)[1].split("- guidance")[0]
     assert "Re-read only the files you must edit" in digest
+    assert "recreate one only if a later step needs it" in digest
+    assert "does not mean another reopen just happened" in digest
     assert render_reopen_activity_digest([]) == ""
 
     many = [
@@ -231,3 +233,18 @@ def test_prompt_without_lost_results_has_no_digest() -> None:
         assert REOPEN_DIGEST_HEADING not in client.user_prompts[0]
     finally:
         runtime.close()
+
+
+def test_digest_guidance_ranks_visible_results_above_historical_sizes() -> None:
+    """A later write result showing a different size is not a discrepancy.
+
+    In the 2026-09-16 candidate2 run the digest listed ``CHANGELOG.md (503 B)``
+    from before the reopen while the visible post-reopen write result carried
+    1053 bytes; the model called it a discrepancy and re-read the file.
+    """
+
+    from agent_libos.llm.reopen_digest import REOPEN_DIGEST_GUIDANCE
+
+    assert "Byte sizes are those recorded at the historical write" in REOPEN_DIGEST_GUIDANCE
+    assert "is newer than these entries and takes precedence" in REOPEN_DIGEST_GUIDANCE
+    assert "not a discrepancy to re-read" in REOPEN_DIGEST_GUIDANCE

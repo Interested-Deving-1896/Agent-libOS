@@ -76,6 +76,7 @@ class FileWriteResult:
     path: str
     bytes_written: int
     created: bool
+    content_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,7 @@ class _TextWritePlan:
     decision: CapabilityDecision
     authority_context: dict[str, Any]
     bytes_to_write: int
+    content_sha256: str
     effect_context: dict[str, Any]
 
 
@@ -630,7 +632,9 @@ class FilesystemAdapter:
             source_oids=source_oids,
             expected_content_sha256=expected_content_sha256,
         )
-        bytes_to_write = len(text.encode(encoding))
+        encoded_content = text.encode(encoding)
+        bytes_to_write = len(encoded_content)
+        content_sha256 = hashlib.sha256(encoded_content).hexdigest()
         effect_context = {
             "path": relative,
             "resource": resource,
@@ -656,6 +660,7 @@ class FilesystemAdapter:
             decision=decision,
             authority_context=authority_context,
             bytes_to_write=bytes_to_write,
+            content_sha256=content_sha256,
             effect_context=effect_context,
         )
 
@@ -807,10 +812,12 @@ class FilesystemAdapter:
                 path=plan.relative,
                 bytes_written=plan.bytes_to_write,
                 created=created,
+                content_sha256=plan.content_sha256,
             )
             result_payload = {
                 "bytes_written": plan.bytes_to_write,
                 "created": created,
+                "content_sha256": plan.content_sha256,
             }
             completed = protected.complete(
                 result,

@@ -655,7 +655,14 @@ is the policy for changing the repository default. It compares paired
 `legacy_v1` and candidate arms for the same two-or-more Provider/model pairs,
 requires at least three repetitions and six workflows per Provider, complete
 cache telemetry, all task/oracle/completion/security evidence, 100% success, and
-zero forbidden internal identifiers. The candidate must reduce uncached input
+zero forbidden internal identifiers. The identifier count excludes only the
+`process_exit` fields whose values the contract requires to be Host ids
+(`result_oid`, and under cumulative review `goal_oid`, `reviewed_message_ids`,
+and each `source_refs`); every other Model-emitted field and the whole
+Host-to-Model projection are counted, and the gate reports the per-category
+breakdown. A canary that pairs two arms of the same prompt layout requires zero
+Model-emitted identifiers and no increase in Host-projected identifiers rather
+than an identifier-free layout. The candidate must reduce uncached input
 by at least 20% and total input by at least 10%, must not lower cache hit rate,
 and, where prices are known, must not increase cost per successful task. Until
 that evidence passes, `legacy_v1` remains the default and rollback layout. See

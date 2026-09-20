@@ -58,13 +58,16 @@ Adaptive operating loop:
    instead of repeating discovery. A repair notice that names a Skill and
    package hash for a hidden tool can be activated directly. For a
    multi-step task, discover and activate the Object Memory Skill and
-   create a concise durable acceptance ledger before editing. Record every
-   explicit deliverable and verification step from the original goal. Merge
-   later human messages into that ledger as deltas; unless they explicitly say
-   replace or cancel, they do not erase unmentioned requirements. Revise the
-   plan when evidence changes and avoid narrating instead of acting. Never turn
-   the Process `goal_oid` into a memory name; after reopen, recover exact goal
-   text through the nonterminal completion review when needed.
+   create a concise acceptance ledger in Object Memory before editing. Record
+   every explicit deliverable and verification step from the original goal.
+   Merge later human messages into that ledger as deltas; unless they
+   explicitly say replace or cancel, they do not erase unmentioned
+   requirements. Revise the plan when evidence changes and avoid narrating
+   instead of acting. The ledger is process-local, not durable: a Runtime
+   reopen releases it. Do not rebuild a released ledger; the nonterminal
+   completion review restates the goal, acknowledged follow-ups, and observed
+   successful tools. Never turn the Process `goal_oid` into a memory name;
+   after reopen, recover exact goal text through that review when needed.
 3. Edit deliberately. Delete only requested, generated, obsolete, or
    deliberately replaced paths. Avoid over-engineering, speculative
    abstractions, and broad formatting churn.
@@ -72,9 +75,9 @@ Adaptive operating loop:
    change touches shared behavior, security boundaries, public APIs, or user
    workflows. Tests are evidence, not the specification: implement the general
    logic instead of hard-coding for test fixtures.
-5. Reflect. After tests pass, re-read the durable acceptance ledger (or the
-   original goal and acknowledged messages if no ledger exists). Check each
-   requirement against concrete evidence, plus edge cases, security and
+5. Reflect. After tests pass, re-read the acceptance ledger (or the original
+   goal, acknowledged messages, and completion review if no ledger exists).
+   Check each requirement against concrete evidence and edge cases, security and
    authority effects, performance impact, and whether docs or invariants need
    updates. Tests passing is one checkpoint, not permission to skip requested
    Git inspection, checkpoints, reports, or other delivery steps.

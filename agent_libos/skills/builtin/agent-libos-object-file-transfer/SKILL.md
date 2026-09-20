@@ -48,7 +48,7 @@ Writes text from one named Object to a governed file. Inputs are exact `name`, o
 - The Host revalidates the exact source Object snapshot immediately before
   egress. If its version/content changes after lookup, export fails before the
   file write rather than writing a stale snapshot.
-- Success returns `oid`, `namespace`, `name`, canonical `path`, `bytes_written`, and `created`. It returns no text, digest, fsync evidence, or comparison with an original source.
+- Success returns `oid`, `namespace`, `name`, canonical `path`, `bytes_written`, `created`, and `content_sha256` (SHA-256 of the exact encoded bytes stored). It returns no text, fsync evidence, or comparison with an original source; the digest identifies the exported bytes and is not an independent readback.
 
 Activation grants no authority. For binary/byte-exact transfer, use an explicitly visible Host byte tool and its Skill; if none exists, stop.
 
@@ -96,6 +96,6 @@ There is no wait, resume, rollback, or cross-boundary transaction tool here. If 
 
 For complete import, retain `oid`, namespace/name, `source_path`, encoding/type, `bytes_read`, and `truncated=false`. This proves bounded text import, not byte identity, prompt visibility, hash equality, or reopen durability. Record the limit and label every `truncated=true` result partial.
 
-For export, retain Object identity, canonical destination `path`, chosen `encoding`, `bytes_written`, `created`, and whether overwrite was authorized. This proves a governed text write, not content equality or durable-storage flush.
+For export, retain Object identity, canonical destination `path`, chosen `encoding`, `bytes_written`, `created`, `content_sha256`, and whether overwrite was authorized. This proves a governed text write of exactly those bytes, not content equality with an external original or durable-storage flush.
 
 When exact content is an acceptance criterion, add independent authorized read-back evidence: compared identities, method, and matching text/digest. When reopen durability matters, the verified workspace file or separately verified checkpoint/image is the durable artifact—not the runtime-local Object alone.

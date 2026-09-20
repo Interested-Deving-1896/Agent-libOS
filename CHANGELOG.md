@@ -9,6 +9,15 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+- Stop counting contract-required identifier echoes as prompt-cache leaks: the
+  `process_exit` scan excludes `result_oid` and the cumulative-review
+  `goal_oid`, `reviewed_message_ids`, and `source_refs` fields (decoding
+  string-encoded evidence where the Runtime does, scanning unparseable
+  arguments whole) while every other field and `human_output` stay scanned.
+  The prompt-cache gate now reports both arms' leak totals and category
+  breakdown, requires integer leak counts, and lets a same-layout `--canary`
+  pass with zero Model-emitted identifiers and no Host-projection increase;
+  the strict gate still requires a zero candidate total.
 - Align completion reviews, checkpoint results, and message projections with
   the process's effective LLM profile layout. Preserve validated hosted-tool
   continuation source reads across restart, and settle auto-wait Human input
@@ -137,6 +146,14 @@ release. Do not treat an entry in this section as shipped behavior.
   External-effect metadata retains its observation-time data labels, and the
   digest contributes those labels to LLM egress authorization. Legacy metadata
   without label provenance is omitted, except for already-visible Skill IDs.
+- Return `content_sha256` from `write_text_file` and `write_object_to_file`, and
+  echo the stored `content` and `encoding` from `write_text_file` for files
+  within the default complete-read bound. A content-echoing write supersedes the
+  earlier working-set read of its path and a later complete read supersedes it,
+  so a process no longer re-reads files it just wrote to see them. The legacy
+  prompt's materialized-context metadata renders counts instead of Object
+  identifier lists, and the workspace-editing, file-transfer, coding-image, and
+  reopen guidance treat the write digest as content evidence and CAS baseline.
 
 ## 1.5.3
 

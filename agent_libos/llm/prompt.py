@@ -1163,12 +1163,16 @@ def _context_metadata_section(
             f"- omitted_object_count: {len(context.omitted_objects)}"
             f"{stub_guidance}"
         )
+    # Every rendered object already carries its own ``object_oid`` and no
+    # tool accepts a bare OID, so identifier lists only add volatile,
+    # uncacheable text that grows with the process.  Render counts, like the
+    # cache-optimized layout, and keep the per-reason omission guidance.
     return (
         "Materialized context metadata (volatile):\n"
         f"- policy: {context.policy_used}\n"
         f"- token_estimate: {context.token_count}\n"
-        f"- object_refs: {_prompt_json(context.object_refs)}\n"
-        f"- omitted_objects: {_prompt_json(context.omitted_objects)}"
+        f"- materialized_object_count: {len(context.object_refs)}\n"
+        f"- omitted_object_count: {len(context.omitted_objects)}"
         f"{_compacted_feedback_guidance(context)}"
         f"{_omitted_object_guidance(context)}"
     )

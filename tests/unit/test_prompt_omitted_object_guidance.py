@@ -56,7 +56,30 @@ def test_no_omissions_adds_no_guidance() -> None:
 
     assert "omitted_object_reasons" not in section
     assert "omitted_object_guidance" not in section
-    assert section.endswith("- omitted_objects: []")
+    assert section.endswith("- omitted_object_count: 0")
+
+
+def test_legacy_layout_renders_counts_instead_of_identifier_lists() -> None:
+    """OID lists were volatile, uncacheable, and unusable by any tool."""
+
+    context = _context(
+        omitted=["obj-old-1", "obj-old-2"],
+        manifest=[
+            {"oid": "obj-goal", "disposition": "included", "reason": "selected"},
+            {"oid": "obj-old-1", "disposition": "omitted", "reason": "token_budget"},
+            {"oid": "obj-old-2", "disposition": "omitted", "reason": "token_budget"},
+        ],
+    )
+
+    section = _context_metadata_section(context, prompt_layout=PROMPT_LAYOUT_LEGACY_V1)
+
+    assert "- materialized_object_count: 1" in section
+    assert "- omitted_object_count: 2" in section
+    assert "token_budget=2" in section
+    assert "obj-goal" not in section
+    assert "obj-old-1" not in section
+    assert "object_refs" not in section
+    assert "omitted_objects:" not in section
 
 
 def test_cache_optimized_layout_keeps_its_compact_count_only_warning() -> None:

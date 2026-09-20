@@ -63,6 +63,24 @@ class WriteTextFileOutput(BaseModel):
     path: str = Field(description=_OUTPUT_PATH_DESCRIPTION)
     bytes_written: int
     created: bool
+    content_sha256: str | None = Field(
+        description=(
+            "SHA-256 of the exact encoded bytes this write stored. It equals the "
+            "content_sha256 of a later complete read_text_file while the file is "
+            "unchanged and is the expected_content_sha256 for the next conditional "
+            "write to the same path."
+        )
+    )
+    content: str | None = Field(
+        description=(
+            "The exact text this write stored, echoed whenever the file fits the "
+            "default complete read_text_file bound so the current content stays "
+            "visible in later context like a complete read result; null for larger "
+            "files. In working-set context a write that echoes content replaces "
+            "earlier reads of the same path and a later complete read replaces it."
+        )
+    )
+    encoding: str = Field(description="Encoding used to store content.")
 
 
 class ReadTextFileArgs(_WorkspaceFilesystemArgs):
@@ -273,10 +291,22 @@ class WriteTextFileTool(SyncAgentTool[WriteTextFileArgs]):
                 code=ToolErrorCode.EXECUTION_ERROR,
                 details={"path": args.path},
             ) from exc
+        # Echo what a complete default read of the file would return so the model
+        # keeps the current content in context without a readback. Larger files
+        # exceed that read bound anyway and return null, exactly as a truncated
+        # read returns no digest.
+        echoed = (
+            args.content
+            if result.bytes_written <= _TOOL_DEFAULTS.filesystem_read_max_bytes
+            else None
+        )
         return WriteTextFileOutput(
             path=result.path,
             bytes_written=result.bytes_written,
             created=result.created,
+            content_sha256=result.content_sha256,
+            content=echoed,
+            encoding=args.encoding,
         )
 
 

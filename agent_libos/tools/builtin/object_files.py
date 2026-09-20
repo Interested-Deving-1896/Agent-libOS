@@ -60,6 +60,9 @@ class WriteObjectToFileOutput(BaseModel):
     path: str
     bytes_written: int
     created: bool
+    content_sha256: str | None = Field(
+        description="SHA-256 of the exact encoded bytes written to the destination file."
+    )
 
 
 class CreateObjectFromFileTool(SyncAgentTool[CreateObjectFromFileArgs]):
@@ -272,6 +275,7 @@ class WriteObjectToFileTool(SyncAgentTool[WriteObjectToFileArgs]):
             path=result.path,
             bytes_written=result.bytes_written,
             created=result.created,
+            content_sha256=result.content_sha256,
         )
 
     def _extract_text(self, payload: Any) -> str:

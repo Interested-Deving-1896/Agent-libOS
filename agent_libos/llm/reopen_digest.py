@@ -24,7 +24,13 @@ REOPEN_DIGEST_GUIDANCE = (
     "- guidance: these are historical operations; later changes may have replaced "
     "or deleted their results. Re-read only the files you must edit or "
     "verify next, and use the Git inspection tools to see your own earlier edits "
-    "instead of re-reading every file."
+    "instead of re-reading every file. Byte sizes are those recorded at the "
+    "historical write; a write or read result visible elsewhere in this context "
+    "is newer than these entries and takes precedence, so a different size there "
+    "is not a discrepancy to re-read. Objects this process created before the "
+    "reopen (for example a ledger) were released with their payloads; recreate "
+    "one only if a later step needs it. This section stays visible for the rest "
+    "of the process; its presence does not mean another reopen just happened."
 )
 
 _LOST_OMISSION_REASONS = frozenset({"capability_denied", "missing"})

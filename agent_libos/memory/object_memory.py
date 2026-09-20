@@ -3462,8 +3462,12 @@ def _observation_supersession_key(payload: Any) -> tuple[Any, ...] | None:
     """Return the identity of an observed target, or ``None`` for actions.
 
     Only successful observation results carry a key; failures and mutations
-    (writes, checkpoints, activations, Human output) are actions whose record
-    must not be folded into a later one.
+    (checkpoints, activations, Human output, writes that do not echo their
+    stored content) are actions whose record must not be folded into a later
+    one. A ``write_text_file`` result that echoes the stored ``content`` is the
+    newest complete observation of that path: it replaces an earlier complete
+    read, and a later complete read replaces it, so the model never has to read
+    a file back merely to see what it wrote.
     """
 
     if not isinstance(payload, dict):
@@ -3485,6 +3489,8 @@ def _observation_supersession_key(payload: Any) -> tuple[Any, ...] | None:
         )
     if tool_name in {"read_text_file", "read_directory"}:
         return _filesystem_observation_supersession_key(tool_name, result)
+    if tool_name == "write_text_file":
+        return _text_write_supersession_key(result)
     if tool_name in _GIT_OBSERVATION_KEY_FIELDS:
         return _git_observation_supersession_key(tool_name, result)
     fields = _OBSERVATION_KEY_FIELDS.get(tool_name)
@@ -3511,6 +3517,18 @@ def _filesystem_observation_supersession_key(
         if type(extent) is not int or extent < 0:
             return None
     return (tool_name, path, encoding, truncated, extent)
+
+
+def _text_write_supersession_key(result: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Key a content-echoing write like the complete read it makes redundant."""
+
+    path = result.get("path")
+    encoding = result.get("encoding")
+    if not isinstance(path, str) or not isinstance(encoding, str):
+        return None
+    if not isinstance(result.get("content"), str):
+        return None
+    return ("read_text_file", path, encoding, False, None)
 
 
 def _git_observation_supersession_key(

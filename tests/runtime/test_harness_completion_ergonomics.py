@@ -158,7 +158,7 @@ def test_completion_guidance_batches_terminal_pair_without_repeating_reports() -
     assert "Include another human_output only if" in CODING_AGENT_PROMPT
 
 
-def test_edit_guidance_reuses_baseline_but_keeps_cas_and_final_readback() -> None:
+def test_edit_guidance_reuses_baseline_but_keeps_cas_and_content_evidence() -> None:
     package = get_builtin_skill_catalog().get("agent-libos-workspace-editing")
     assert package is not None
     instructions = package.instructions
@@ -167,5 +167,26 @@ def test_edit_guidance_reuses_baseline_but_keeps_cas_and_final_readback() -> Non
     assert "pass its exact digest as `expected_content_sha256`" in instructions
     assert "Never drop `expected_content_sha256` or replace it with `null`" in instructions
     assert "If conditional writes are unsupported, report" in instructions
-    assert "a written file re-reads completely" in instructions
+    assert "a written file's exact content is visible in its write result or in a later complete re-read" in instructions
     assert "tests or validations affected by the change ran after the final write" in instructions
+
+
+def test_edit_guidance_treats_write_digest_as_verification_and_cas_baseline() -> None:
+    package = get_builtin_skill_catalog().get("agent-libos-workspace-editing")
+    assert package is not None
+    instructions = package.instructions
+
+    # The write result now carries the digest a complete read would return, so the
+    # guide must let the model reuse it instead of re-reading files it just wrote.
+    assert "`created`, and `content_sha256`, the SHA-256 of the exact encoded bytes stored" in instructions
+    assert "pass that write digest as `expected_content_sha256`" in instructions
+    assert "or to confirm a write you just made" in instructions
+    assert "verify without redundant reads" in instructions
+    assert "Re-read a written file only when" in instructions
+    assert "a validation exercised the written content after the final write" in instructions
+    assert "mandatory exact readback" not in instructions
+    # The result now echoes the stored text: the model sees what it wrote without
+    # a readback, which was the last reason it kept re-reading written files.
+    assert "echoes the stored `content` and its `encoding`" in instructions
+    assert "reading the file back returns the same text and adds no evidence" in instructions
+    assert "does not echo content" not in instructions

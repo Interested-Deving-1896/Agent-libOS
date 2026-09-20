@@ -340,6 +340,25 @@ the deterministic security flag, zero forbidden identifiers, the token
 reduction thresholds, non-regressing hit rate, and non-increasing known-price
 cost per successful task.
 
+Forbidden-identifier evidence counts Host identifiers in the Host-to-Model
+projection and in the Model's `human_output` and `process_exit` arguments. The
+`process_exit` scan excludes only the fields whose values the tool contract
+itself requires to be Host identifiers: `result_oid`, and under cumulative exit
+review `completion_evidence.goal_oid`, `reviewed_message_ids`, and each
+acceptance check's `source_refs`. Copying an id into the field that exists to
+carry it is the contract, not a leak; every other field (`message`, `payload`,
+`requirement`, `evidence_summary`, `final_verification`, ...) is scanned in full,
+string-encoded evidence is decoded at the same positions the Runtime decodes it,
+and arguments that are not a JSON object are scanned whole. The gate result's
+`metrics` include the candidate and legacy leak totals and their closed-category
+breakdown so a failure shows whether the ids came from the Host projection
+(`completion_binding_fields`, `host_contract_fields`, ...) or from Model output
+(`terminal_host_identifiers`). The strict gate always requires a zero candidate
+total. A `--canary` comparison whose two arms share the same `prompt_layout` is
+not evaluating that layout's promise, so it requires zero Model-emitted
+identifiers and no increase in Host-projected identifiers relative to the
+legacy arm instead; a canary across layouts still requires zero.
+
 Explicit cache policy fields are dispatched to the Host-selected OpenAI-compatible
 endpoint, including a custom base URL. If the endpoint rejects a v2 cache field,
 bounded compatibility retry removes the whole v2 cache option group and records

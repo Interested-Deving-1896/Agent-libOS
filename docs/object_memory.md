@@ -657,11 +657,15 @@ as a compact stub record of type `object_memory_feedback_stub` that names the
 tool, its target (path, argv, namespace, changed paths), the outcome, and
 result sizes, never result content. With
 `memory.working_set_supersede_observations` (default on), a repeated
-observation of the same target (the same file path read again, the same
+observation of the same target (the same file path read again or rewritten by
+a `write_text_file` whose result echoes the stored content, the same
 directory listed, the newest Git status, a Git diff of the same scope and
 refs, discovery, or completion review) supersedes the earlier copy, which is omitted with manifest
 reason `superseded`, so stale file contents cannot contradict the current
-workspace after an edit. A Skill discovery supersedes only an earlier discovery
+workspace after an edit. A `write_text_file` result that echoes its stored
+`content` is the newest complete observation of that path: it supersedes the
+earlier read and a later complete read supersedes it, so the model never has to
+read a file back merely to see what it wrote. A Skill discovery supersedes only an earlier discovery
 that surfaced the same Skill set, so two different queries issued in one
 response both stay visible. When every omission is `superseded`, the legacy
 prompt names the reason without a re-observation cue; that cue is reserved for

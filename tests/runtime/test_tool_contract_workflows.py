@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -83,12 +84,20 @@ def test_wire_valid_contract_workflow_preserves_state_and_authority(tmp_path: Pa
         first_write = call("write_text_file", path="source.txt", content="initial\n", expected_content_sha256="missing")
         assert first_write["ok"], first_write
         digest = call("read_text_file", path="source.txt")["payload"]["content_sha256"]
+        # The write result already carries the digest a complete read returns.
+        assert first_write["payload"]["content_sha256"] == digest == hashlib.sha256(b"initial\n").hexdigest()
         assert not call("write_text_file", path="source.txt", content="lost update\n", expected_content_sha256="0" * 64)["ok"]
         assert (tmp_path / "source.txt").read_text() == "initial\n"
-        assert call("write_text_file", path="source.txt", content="verified\n", expected_content_sha256=digest)["ok"]
+        second_write = call("write_text_file", path="source.txt", content="verified\n", expected_content_sha256=digest)
+        assert second_write["ok"], second_write
+        # A write digest is a valid precondition for the next conditional write without re-reading.
+        assert second_write["payload"]["content_sha256"] == hashlib.sha256(b"verified\n").hexdigest()
+        assert call("write_text_file", path="source.txt", content="verified\n", expected_content_sha256=second_write["payload"]["content_sha256"])["ok"]
         assert call("create_object_from_file", name="text", path="source.txt", namespace=None)["ok"]
         assert runtime.memory.get_object_by_name(pid, "text").namespace == current
-        assert call("write_object_to_file", name="text", path="copy.txt", namespace=None)["ok"]
+        exported = call("write_object_to_file", name="text", path="copy.txt", namespace=None)
+        assert exported["ok"], exported
+        assert exported["payload"]["content_sha256"] == hashlib.sha256(b"verified\n").hexdigest()
         assert (tmp_path / "copy.txt").read_text() == "verified\n"
 
         checkpoint = call("create_checkpoint", reason="Verified contract workflow", pid=None)
