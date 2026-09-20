@@ -14,6 +14,7 @@ model-controlled installation.
 - [Entrypoint](#entrypoint)
 - [Registration surfaces](#registration-surfaces)
 - [PTY module](#pty-module)
+- [agentvfs module](#agentvfs-module)
 - [CLI](#cli)
 - [Persistence and checkpoints](#persistence-and-checkpoints)
 - Return to the [documentation home](index.md).
@@ -594,6 +595,78 @@ support is needed:
 ```bash
 uv sync --frozen --extra pty
 ```
+
+## agentvfs Module
+
+`modules/agentvfs/module.yaml` is a trusted module that exposes an
+[agentvfs](https://github.com/thustorage/ContextFS) checkpointable FUSE
+workspace to agent processes. When loaded and trusted, it registers the tools
+`agentvfs_status`, `agentvfs_checkpoint`, and `agentvfs_rollback`, plus the
+`agentvfs-agent:v0` image. The module is self-contained: it speaks the
+daemon's newline-delimited JSON control protocol over its AF_UNIX socket
+using only the standard library, so it has no dependency on agentvfs source
+or Python bindings — the `agentvfs` binary is a Host-installed prerequisite,
+in the same sense as the configured Deno or Git executables.
+
+The Host starts and owns the daemon lifecycle (`agentvfs workspace init` /
+`start`); the module only attaches. Binding is Host-only composition: set the
+substrate attribute `agentvfs` to a workspace name (or a mapping with
+`workspace` and an optional explicit `socket`) before `Runtime.open`. The
+startup hook discovers the workspace through its `session.json` and fails
+closed unless the session reports `started`; connection failures are surfaced
+when a tool contacts the daemon. A bound workspace requires Python AF_UNIX
+support. Without a binding the module loads inert on every platform and every
+tool call fails closed. The model can never supply a socket path or workspace
+name.
+
+Tools enforce capability authority on `agentvfs:<workspace>` before any
+socket traffic: `read` for status, `write` for checkpoint, and the stronger
+`admin` for the destructive rollback, mirroring checkpoint-restore authority.
+Denials and operations are audited as `module.agentvfs.*` actions. Calls use the
+protected-operation SDK to reserve and settle finite-use capabilities and record
+external effects. A connection failure before sending a command returns the
+reserved use; a failure after a send attempt keeps it consumed because the
+daemon may already have changed state. Filesystem mutations remain external
+effects: ordinary libOS checkpoint restore does not undo them automatically.
+
+Every command also checks the current data labels against the Host-configured
+data-flow Sink `agentvfs:<workspace>` before socket traffic. Ordinary data is
+accepted by the default Sink policy; sensitive or tenant-scoped data requires
+appropriate Host Sink clearance (and an exact release for conditional Sinks).
+Replies are treated as untrusted ingress and retain the request's sensitivity.
+
+Both mutating tools accept `pair_libos` to couple the two state planes. A
+paired checkpoint additionally creates a libOS checkpoint (requiring the
+process's `checkpoint:process:<pid>` write right, probed before any socket
+traffic) and records the agentvfs workspace, label, and commit in the libOS
+checkpoint's metadata. A paired rollback requires an explicit
+`libos_checkpoint_id` and validates its owner, workspace, stored commit, and
+target before any filesystem rollback. The target must be the saved label or
+commit; the daemon receives the immutable saved commit so moving a label cannot
+select a different snapshot. Its response must match that commit before the
+process-authorized libOS restore is attempted. Because the scheduler holds its
+run lock across every tool quantum,
+an in-quantum restore is refused by design; the tool then reports
+`libos_restore=pending_host_restore` with a Host hint (audited as
+`module.agentvfs.libos_restore_pending`), and the Host completes
+`CheckpointManager.restore` once the process is quiescent. With Host-granted
+checkpoint admin, any required image authority, and a quiescent runtime, both
+planes restore inside the one tool call. If image authority is missing, scoped
+ObjectTasks or Durable TaskRuns remain active, or another restore/recovery is in
+progress after filesystem rollback, the result preserves the completed filesystem
+commit and reports `pending_host_restore`. The Host resolves the reported blocker
+and finishes only the libOS restore, without repeating the filesystem rollback.
+Restore warnings and pending reconciliation remain visible in the
+result instead of being reported as full success. Pairing records an association,
+not an atomic transaction across both systems: the Host must coordinate workspace
+writers and finish any pending restore before resuming work.
+
+Tests in `tests/security/test_agentvfs_*.py` use an in-process fake control daemon
+and need neither FUSE nor an agentvfs binary. Socket integration cases are skipped
+where AF_UNIX is unavailable; unsupported-platform and binding validation tests
+still run there. Real-daemon end-to-end drivers live in the agentvfs repository
+under
+`extensions/agent-libos/`.
 
 ## CLI
 
