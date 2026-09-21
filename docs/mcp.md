@@ -57,7 +57,7 @@ distribution metadata:
 | --- | --- | --- |
 | v1 legacy wire | `mcp` | `0.1.0` |
 | v2 governed Tools compatibility | `agent-libos` | `1.4.2` |
-| v3 exact `2026-07-28` | `agent-libos` | `1.5.3` |
+| v3 exact `2026-07-28` | `agent-libos` | `1.6.0` |
 
 The v1 and v2 values are frozen compatibility identities. Only exact-v3 uses
 the current modern product identity; changing the package version must never

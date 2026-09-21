@@ -114,17 +114,17 @@ def test_release_version_syntax_accepts_final_numeric_ascii_triplet(
 def test_release_version_accepts_only_the_current_target(tmp_path: Path) -> None:
     _write_aligned_release_metadata(tmp_path, RELEASE_TARGET_VERSION)
 
-    assert validate_version_alignment(tmp_path) == "1.5.3"
+    assert validate_version_alignment(tmp_path) == "1.6.0"
 
 
-@pytest.mark.parametrize("version", ["0.0.0", "1.4.2", "2.0.0", "10.20.30"])
+@pytest.mark.parametrize("version", ["0.0.0", "1.4.2", "1.5.3", "2.0.0", "10.20.30"])
 def test_release_version_rejects_aligned_non_target_version(
     tmp_path: Path,
     version: str,
 ) -> None:
     _write_aligned_release_metadata(tmp_path, version)
 
-    with pytest.raises(ValueError, match="target version must be exactly 1.5.3"):
+    with pytest.raises(ValueError, match="target version must be exactly 1.6.0"):
         validate_version_alignment(tmp_path)
 
 
@@ -157,56 +157,56 @@ def test_release_version_rejects_non_final_or_non_ascii_spelling(
     [
         (
             "experiments/agentdojo/uv.lock",
-            'version = "1.5.3"',
-            'version = "1.5.4"',
+            'version = "1.6.0"',
+            'version = "1.6.1"',
             "experiments/agentdojo/uv.lock",
         ),
         (
             ".github/workflows/test.yml",
-            "agent_libos-1.5.3-py3-none-any.whl",
-            "agent_libos-1.5.4-py3-none-any.whl",
+            "agent_libos-1.6.0-py3-none-any.whl",
+            "agent_libos-1.6.1-py3-none-any.whl",
             "RELEASE_WHEEL",
         ),
         (
             ".github/workflows/test.yml",
-            "agent_libos-1.5.3.tar.gz",
-            "agent_libos-1.5.4.tar.gz",
+            "agent_libos-1.6.0.tar.gz",
+            "agent_libos-1.6.1.tar.gz",
             "RELEASE_SDIST",
         ),
         (
             "skills/swe-agent/SKILL.md",
-            "agent-libos==1.5.3",
-            "agent-libos==1.5.4",
+            "agent-libos==1.6.0",
+            "agent-libos==1.6.1",
             "skills/swe-agent/SKILL.md",
         ),
         (
             "agent_libos/substrate/local.py",
-            'version="1.5.3"',
-            'version="1.5.4"',
+            'version="1.6.0"',
+            'version="1.6.1"',
             "MCP clientInfo",
         ),
         (
             "desktop/runtime-manifest.json",
-            '"version": "1.5.3"',
-            '"version": "1.5.4"',
+            '"version": "1.6.0"',
+            '"version": "1.6.1"',
             "desktop/runtime-manifest.json",
         ),
         (
             "scripts/check_desktop_artifacts.py",
-            'VERSION = "1.5.3"',
-            'VERSION = "1.5.4"',
+            'VERSION = "1.6.0"',
+            'VERSION = "1.6.1"',
             "scripts/check_desktop_artifacts.py",
         ),
         (
             "CHANGELOG.md",
-            "## 1.5.3",
-            "## 1.5.4",
+            "## 1.6.0",
+            "## 1.6.1",
             "CHANGELOG.md current release",
         ),
         (
             "docs/release_status.md",
-            "Agent libOS 1.5.3 Status",
-            "Agent libOS 1.5.4 Status",
+            "Agent libOS 1.6.0 Status",
+            "Agent libOS 1.6.1 Status",
             "docs/release_status.md",
         ),
     ],
@@ -251,8 +251,8 @@ def test_release_validation_rejects_desktop_artifact_name_drift(
     workflow = tmp_path / ".github" / "workflows" / "desktop-internal.yml"
     workflow.write_text(
         workflow.read_text(encoding="utf-8").replace(
-            "agent-libos-1.5.3-macos-arm64-internal-unsigned",
-            "agent-libos-1.5.4-macos-arm64-internal-unsigned",
+            "agent-libos-1.6.0-macos-arm64-internal-unsigned",
+            "agent-libos-1.6.1-macos-arm64-internal-unsigned",
         ),
         encoding="utf-8",
     )
@@ -276,7 +276,7 @@ def test_release_runbook_keeps_remote_version_uniqueness_out_of_local_checker() 
     )
     assert "re-check the complete PyPI project history" in normalized
     assert "intended remote's tags" in normalized
-    assert "pins the exact target `1.5.3`" in normalized
+    assert "pins the exact target `1.6.0`" in normalized
 
 
 def test_release_runbook_builds_local_preflight_in_a_fresh_directory() -> None:

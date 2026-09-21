@@ -14,7 +14,7 @@ Several independent version namespaces coexist. Never infer one from another:
 
 | Namespace | Current value | What it versions |
 | --- | --- | --- |
-| Agent libOS product/package | `1.5.3` | Python package, aligned GUI package, release workflow, and current product contract |
+| Agent libOS product/package | `1.6.0` | Python package, aligned GUI package, release workflow, and current product contract |
 | RuntimeStore schema | `8` | Persisted SQL store shape accepted by ordinary Runtime startup |
 | GUI snapshot envelope | `3` | Same-build `GET /api/snapshot` response consumed by the bundled renderer |
 | GUI JSON Schema registry | `2` | The deliberately partial registry in [`gui_api_schema.json`](gui_api_schema.json); it describes selected v3 snapshot/API shapes and confirmed mutations, not a complete REST API |

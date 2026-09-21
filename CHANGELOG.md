@@ -9,6 +9,14 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+## 1.6.0
+
+`1.6.0` is the current version aligned across the Python project, package
+lockfiles, GUI package, MCP client identity, desktop metadata, and release
+workflows. This version entry does not itself claim publication; publication
+still follows the separately authorized, receipt-bound process in
+[docs/releasing.md](docs/releasing.md).
+
 - Correct documentation for private Responses replay storage and cleanup,
   staged store migrations, MCP authority, semantic classifier configuration,
   CLI errors, and recovery behavior. Fix the release readback verifier and
@@ -163,7 +171,7 @@ release. Do not treat an entry in this section as shipped behavior.
 
 ## 1.5.3
 
-`1.5.3` is the current release version aligned across the Python project,
+`1.5.3` was the preceding release version aligned across the Python project,
 package lockfiles, GUI package, MCP client identity, desktop metadata, and
 release workflows.
 
