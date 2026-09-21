@@ -388,6 +388,60 @@ instead use the exact Host CAS bridge
 reach that bridge may validate and plan, but must fail before mutation rather
 than downgrade v3 or perform a non-CAS replacement.
 
+### OAuth profile file
+
+The CLI `--profile-file` and `--oauth-profile-file` options accept the same
+strict, non-secret JSON object. Copy [oauth-profile.json](../examples/mcp/oauth-profile.json)
+and adapt it to your authorization server's pre-registered public client:
+
+```json
+{
+  "profile_id": "work-oauth",
+  "server_id": "demo-mcp",
+  "resource_uri": "https://api.example.test/mcp",
+  "expected_issuer": "https://identity.example.test",
+  "redirect_uri": "http://127.0.0.1:8766/callback",
+  "client_id": "agent-libos-desktop",
+  "registration_mode": "preregistered",
+  "token_endpoint_auth_method": "none",
+  "allowed_scopes": ["resources.read"],
+  "default_scopes": ["resources.read"]
+}
+```
+
+This file passes offline profile validation. Its reserved `.test` hosts and
+client id are placeholders, so it cannot perform a live login unchanged.
+The matching v3 manifest must use `server_id: demo-mcp`,
+`http.url: https://api.example.test/mcp`, and `auth_profile_id: work-oauth`.
+Enable `mcp.oauth_enabled: true` in the Host configuration used for registration
+and every later CLI invocation; the default is false. The CLI login keeps one
+Runtime alive while you open the authorization URL and paste the full callback
+URL. The redirect must be pre-registered with the issuer; the CLI does not start
+an HTTP callback listener.
+
+| Field | Requirement or default |
+| --- | --- |
+| `profile_id`, `server_id` | Required local ids; match the manifest's `auth_profile_id` and `server_id`. |
+| `resource_uri` | Required HTTP(S) protected-resource URI; Runtime requires it to match the registered MCP HTTP URL. |
+| `expected_issuer` | Required exact issuer URL, without a query or fragment; discovered metadata must report this issuer. |
+| `redirect_uri`, `client_id` | Required registered callback URI and client identity. Redirects use HTTPS or explicit loopback HTTP, with a path and no query/fragment. |
+| `registration_mode` | Required `preregistered` or `cimd`; CIMD requires an HTTPS document URL as `client_id`, with a non-root path and no query/fragment. |
+| `token_endpoint_auth_method` | `none` by default; a preregistered confidential client may use `client_secret_basic` or `client_secret_post`. CIMD requires `none`. |
+| `allowed_scopes`, `default_scopes` | String arrays, empty by default; default and requested scopes must remain within the allowlist. |
+| `audience` | Optional; when supplied, must equal `resource_uri`. |
+| `protected_resource_metadata_url`, `authorization_server_metadata_url` | Optional discovery overrides on the resource and issuer origin respectively. |
+| `protected_resource_metadata_sha256`, `authorization_server_metadata_sha256` | Optional 64-character lowercase SHA-256 metadata pins, reviewed by the Host. |
+| `allowed_endpoint_origins` | Optional array of additional origins allowed for discovered OAuth endpoints; the issuer origin is always allowed. Entries have no non-root path, query, or fragment. |
+| `allow_loopback_http` | False by default; explicitly permits loopback HTTP for resource/issuer metadata and endpoints during local development. The loopback callback URI is separately allowed. |
+| `protocol_revision`, `transport` | Default to and accept only `2026-07-28` and `streamable_http`. |
+
+Unknown fields are rejected. Client secrets, tokens, authorization codes, and
+PKCE/state values never belong in this file. Confidential clients use the CLI's
+inherited secret-file-descriptor option or the Host credential-broker API; see
+[the OAuth CLI workflow](cli.md#mcp-commands). The shipped deterministic OAuth
+tutorial uses a scripted transport and in-memory broker; it does not validate a
+deployment's issuer metadata or secure keyring backend.
+
 ## Modern Host Client API
 
 `McpModernClient` is the Host-facing v3 Resources/Prompts/Completion manager.
@@ -419,6 +473,56 @@ requires a fresh list. The vault is capped by `mcp.cursor_handle_limit`.
 Cache hints are advisory, their TTL is capped by
 `mcp.cache_hint_ttl_cap_ms`, and they never expand the manifest allowlist.
 There is no modern MCP response-body cache or cross-principal cache reuse.
+
+### Pagination in one Runtime
+
+Keep the same Runtime, server, surface, and actor for the complete traversal.
+Ordinary CLI invocations each open and close a Runtime, so a `next_cursor` from
+`mcp resources list`, `mcp resources templates`, or `mcp prompts list` cannot be
+passed to a later CLI process. Those commands currently expose one page; use a
+long-lived Host integration for subsequent pages.
+
+For an already configured Runtime with a registered v3 server, this Host-side
+helper uses the protected public facade:
+
+```python
+from agent_libos import Runtime
+from agent_libos.mcp.types import McpResource
+
+
+def collect_resources(
+    runtime: Runtime, server_id: str, *, max_pages: int
+) -> list[McpResource]:
+    if type(max_pages) is not int or max_pages <= 0:
+        raise ValueError("max_pages must be a positive integer")
+    resources = []
+    cursor = None
+    for _ in range(max_pages):
+        page = runtime.mcp.list_resources(server_id, cursor=cursor, actor="runtime")
+        resources.extend(page.items)
+        if page.next_cursor is None:
+            return resources
+        cursor = page.next_cursor
+    raise RuntimeError("resource catalog exceeds this traversal's page budget")
+```
+
+Stop only when `next_cursor` is `None`: allowlist filtering may produce an empty
+page that still has another cursor. Choose a finite `max_pages` for the Host's
+workflow; an exceeded budget or cursor failure must not be reported as a
+complete catalog. Do not reuse a consumed cursor or retry it after failure.
+Each page remains a separate protected operation, and catalog changes may
+invalidate the traversal; this is not an atomic remote catalog snapshot.
+Process callers instead pass the same process id as `actor` and need the
+[Resource catalog authority](#authority).
+
+Run [run_pagination_e2e.py](../examples/mcp/run_pagination_e2e.py) for a complete
+no-network example that injects a supported Resource Provider through the Host
+substrate, registers an in-memory manifest, traverses three pages (including a
+filtered empty page), and reads a Resource through `Runtime.mcp`. The same
+cursor loop applies to `list_resource_templates` and `list_prompts`, each with
+its own separate traversal.
+
+### Results and Host composition
 
 Resource read and Prompt get return exactly one of `McpComplete`,
 `McpInputRequired`, or `McpRemoteTask`. Completion is Complete-only because the
@@ -731,7 +835,9 @@ rehydrated.
 ## Authority
 
 The Tool Capability resources below apply to both the stable v1/v2 primitive
-and exact-v3 Tool calls. `McpModernClient` itself is a Host composition object: its allowlists, bounds,
+and exact-v3 Tool calls. Exact-v3 process calls additionally require `execute`
+on `mcp_server:<server_id>`; v1/v2 Tool calls do not require that extra server
+right. `McpModernClient` itself is a Host composition object: its allowlists, bounds,
 projections, and fence checks do not manufacture a Runtime Capability or effect
 receipt. The built-in model Resource list/read wrappers therefore enter a
 separate protected primitive facade before calling that client. Any other Host
@@ -807,7 +913,7 @@ changes a manifest Tool's effect classification.
 `inspect_mcp_server` returns that value as `stdio_authority_resource`; its hash
 covers the canonical command, args, environment mapping, and cwd. HTTP servers
 return `null` for this field. `call_mcp_tool` requires the right declared by the
-tool spec on `mcp:<server_id>:<tool_id>`.
+tool spec on `mcp:<server_id>:<tool_id>`, plus server `execute` for v3.
 
 Actor-mode registration also reads the user-supplied manifest through the
 filesystem primitive, so the actor needs filesystem `read` authority for that
@@ -850,8 +956,9 @@ supported Runtime writer from bypassing the in-process guard.
 Tool binding and model visibility are not authority. With `DEFAULT_CONFIG`,
 the complete process tool tables for `base-agent:v0`, `coding-agent:v0`, and
 `review-agent:v0` bind the four server/Tool entries plus the two v3 Resource
-list/read entries. Their initial Skill projection contains only the five
-bootstrap tools, so none of these MCP schemas is initially model-visible;
+list/read entries. Their initial Skill projection contains the five
+Skill bootstrap tools and the two message-read tools, for seven tools total,
+so none of these MCP schemas is initially model-visible;
 activating the exact `agent-libos-mcp` Skill projects them without changing
 Capability authority. The narrow direct `research-agent:v0`,
 `analysis-agent:v0`, and `operator-agent:v0` images expose the same six
@@ -1280,6 +1387,8 @@ uv run agent-libos --db user mcp tools demo-mcp --refresh
 uv run agent-libos --db user capabilities grant <pid> process:spawn --rights write
 uv run agent-libos --db user capabilities grant <pid> mcp_stdio:<sha256-from-inspect> --rights execute
 uv run agent-libos --db user capabilities grant <pid> mcp:demo-mcp:forecast --rights read
+# Additional server authority when the registered manifest is v3:
+uv run agent-libos --db user capabilities grant <pid> mcp_server:demo-mcp --rights execute
 uv run agent-libos --db user mcp call <pid> demo-mcp forecast --arguments-json '{"city":"Beijing"}'
 uv run agent-libos --db user mcp unregister demo-mcp
 ```

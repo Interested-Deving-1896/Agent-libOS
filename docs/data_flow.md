@@ -17,6 +17,7 @@ permission. All of those checks still apply.
 - [Labels and derivation](#labels-and-derivation)
 - [Operation integrity floors](#operation-integrity-floors)
 - [Sink trust registry](#sink-trust-registry)
+- [Run a local Sink trust example](#local-host-sink-trust-example)
 - [Stable Sink identities](#stable-sink-identities)
 - [Enforcement order](#enforcement-order)
 - [Exact conditional release](#exact-conditional-release)
@@ -181,6 +182,55 @@ Reusable as well as finite registry authority is reauthorized inside the
 registry mutation transaction immediately before the write. Revoking an
 unlimited `admin` grant after the outer check therefore prevents both register
 and unregister from changing the registry.
+
+### Local Host Sink trust example
+
+Obtain an LLM Sink's hash from the assembled Runtime with
+`runtime.llms.profile_identity_sha256("corp-secure")`, using the id of an
+already configured profile. This reads its effective Host identity without
+creating a client or sending a provider request. Use that returned digest as
+the rule's `identity_sha256`; hashing only the model name or base URL does not
+produce the Runtime's identity. Resolve it in the same Host configuration and
+environment that will dispatch the request. An unknown profile id is an error.
+
+The complete, executable
+[Sink trust example](../examples/data_flow/sink_trust_demo.py) creates a
+temporary SQLite database and workspace, configures a named identity-only LLM
+profile, and then:
+
+1. Gets the configured profile's hash and creates a synthetic confidential
+   Object with tenant/principal labels.
+2. Confirms the Object cannot clear the unmatched Sink and that a process
+   without registry `admin` cannot register a trust rule.
+3. Creates an administrator process and uses the trusted embedding Host's
+   `capability.issue_trusted()` to grant `admin` on
+   `runtime.config.data_flow.registry_resource`.
+4. Constructs a `SinkTrustRule` with the exact profile hash, sensitivity ceiling,
+   tenant, and principal; registers it through `Runtime.register_sink_trust()`;
+   and reads it back through the inspect/list facades.
+5. Confirms clearance is now `allow`, then changes the Host profile's model and
+   confirms the old rule rejects the new profile identity.
+
+After [installing the development environment](../README.md#3-to-5-minute-quick-start),
+run from the repository root:
+
+```bash
+uv run python examples/data_flow/sink_trust_demo.py
+```
+
+The JSON output reports `registration_without_admin: "denied"`, then
+`before_registration: "deny"`, `after_registration: "allow"`, and
+`after_profile_change: "deny"`. The profile is a local identity fixture; no API
+key, network request, or provider tokens are needed, and temporary state is
+removed on exit. For a deployment, select its real configured profile and
+deliberately review identity changes before replacing its rule.
+
+The example uses the read-only Host `data_flow.classify_egress_snapshot()`
+precheck. An `allow` result is only Sink clearance, not permission to dispatch;
+actual operations still require ordinary authority, any Task Authority effect
+ceiling, approval, resource checks, and Protected Operation revalidation.
+`issue_trusted()` is an embedding Host authority source, not actor-name
+authentication; neither it nor the registry facade belongs in a model tool.
 
 ## Stable Sink identities
 
@@ -411,15 +461,23 @@ replay. A provider-certified not-started outcome keeps the exact linked pair
 pending, so reopen does not create duplicate release requests.
 
 Conditional LLM provider releases additionally obey `llm.persist_full_io`
-before approval. In opt-out mode, `llm_pending_actions` stores only the exact
-prepared-request hash, payload hash, and non-sensitive resume identifiers; the
-raw messages, tool schema, and egress payload remain in executor memory. The
-same runtime can consume the approved one-shot release against that hash. If
-the runtime reopens after losing the in-memory request, it claims the durable
-generation and fails the process closed rather than reconstructing a different
-prompt or sending an unbound payload. Rejecting the exact release clears that
-prepared request and pauses the process behind a Host-only resume gate. A
-parent/model `signal_child_process(resume)` cannot turn the rejection into an
+before approval. With the default `persist_full_io=true`, the Runtime
+serializes the final messages, tool schemas, profile/Sink identity, request
+options, provider-state scope, flow context, and exact payload binding as one
+durable prepared request before returning `waiting_human`. In opt-out mode,
+`llm_pending_actions` stores only the exact prepared-request hash, payload hash,
+and non-sensitive resume identifiers; the raw messages, tool schema, and egress
+payload remain in executor memory. The same runtime can consume the approved
+one-shot release against that hash. If the in-memory request is lost, the
+Runtime fails closed before provider dispatch rather than reconstructing a
+different prompt from process memory, asking the model to recreate the call,
+or sending an unbound payload. If it reopens after that loss, it claims the
+durable generation and fails the process closed. A changed profile/Sink identity also fails closed,
+and the same release cannot produce a second provider request.
+
+Rejecting the exact release clears that prepared request and pauses the
+process behind a Host-only resume gate. A parent/model
+`signal_child_process(resume)` cannot turn the rejection into an
 automatic replacement request; an explicit Host resume starts a new model turn
 and, if still required, a new independently bound release.
 
@@ -456,18 +514,6 @@ cannot inherit the receipt. Presentation evidence remains
 available in the full ledgers while bounded GUI causal windows exclude those
 internally generated rows so polling cannot displace unrelated recent events or
 audits.
-
-For an LLM Sink, the default `llm.persist_full_io=true` policy serializes the
-final messages, tool schemas, profile/Sink identity, request options,
-provider-state scope, flow context, and exact payload binding as one durable
-prepared request before returning `waiting_human`. With
-`persist_full_io=false`, the durable row contains only the prepared-request and
-payload hashes plus non-sensitive resume metadata; the exact request remains
-in executor memory. Approval in that same runtime resumes the hash-bound
-request once. If the in-memory request is lost, the runtime fails closed before
-provider dispatch rather than rematerializing process memory or asking the
-model to recreate the call. A changed profile/Sink identity also fails closed,
-and the same release cannot produce a second provider request.
 
 The protected-operation lifecycle restores an unconsumed ordinary/release use
 when protected preparation aborts before its durable dispatch boundary. Once

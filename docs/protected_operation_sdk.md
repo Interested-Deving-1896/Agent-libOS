@@ -14,6 +14,7 @@ and committed and how provider ambiguity is represented.
 
 ## In this guide
 
+- [Run a complete protected operation example](#run-a-complete-protected-operation-example)
 - [Define and invoke a protected contract](#contract-and-invocation)
 - [Implement a synchronous operation](#synchronous-operation)
 - [Compose async providers](#async-and-composite-providers)
@@ -21,6 +22,44 @@ and committed and how provider ambiguity is represented.
 - [Use prepare, settle, and compensation hooks](#prepare-settle-and-compensation-hooks)
 - [Understand enforcement](#enforcement)
 - Return to the [documentation home](index.md).
+
+## Run a complete protected operation example
+
+The [standalone example](../examples/extensions/protected_operation.py) defines
+an in-memory read-only provider and its classifier, registers a contract,
+issues one exact Capability, dispatches a protected read, and verifies that a
+second call is denied without another provider call. From a Git checkout
+containing `uv.lock`, after `uv sync --frozen`, run:
+
+```sh
+uv run python examples/extensions/protected_operation.py
+```
+
+For an extracted sdist, follow the
+[source-distribution installation instructions](development.md#source-distribution-installation-smoke)
+and use that environment's Python in place of `uv run python`; the sdist omits
+the repository lock.
+
+It requires Python 3.11+, but no credentials, network, LLM, or Deno. Explicit
+`DEFAULT_CONFIG`, an in-memory database, and a temporary workspace isolate it
+from the CLI's project configuration and persistent state. Expected output:
+
+```json
+{"audit_and_event_linked": true, "denied_after_one_use": true, "effect_state": "committed", "provider_calls": 1, "result": "hello"}
+```
+
+The example exercises Capability consumption, trusted unclassified ingress,
+resource preflight/settlement, and linked event/audit/effect evidence. Assertions
+check that denial does not call the provider or create another effect. Its
+fixed provider result is a bounded fixture; real providers also need their own
+time, cancellation, transport, and size enforcement. An explicit Task Authority
+effect ceiling must permit `example.read_notice`. See the
+[walkthrough](../examples/extensions/README.md#protected-provider-operation) for
+the phase-by-phase explanation and the
+[Python tool example](tools_and_jit.md#run-a-complete-python-tool-example) for
+model-facing registration and invocation. The snippets below show individual
+parts of a larger integration; the standalone example supplies all imports and
+Host setup.
 
 ## Contract and invocation
 
@@ -43,6 +82,28 @@ runtime.protected_operations.register_contract(
     )
 )
 ```
+
+`ProtectedOperationContract.require_classifier` defaults to `True`. The provider
+must expose this synchronous method before the SDK can prepare an operation:
+
+```python
+def classify_external_effect(
+    self, operation: str, context: dict[str, Any], result: Any
+) -> ExternalEffectClassification:
+    ...
+```
+
+Import `Any` from `typing` and `ExternalEffectClassification`,
+`ExternalEffectRollbackClass`, and `ExternalEffectRollbackStatus` from
+`agent_libos.models`. Return a classification with `rollback_class`,
+`rollback_status`, `state_mutation`, and `information_flow`; optional `metadata`
+must be safe evidence. `operation` is the contract's operation string.
+`complete()` passes its `classification_context` (or the invocation's safe
+observation) and `classification_result` (or the provider result) to the
+classifier. The standalone example implements the complete read-only
+`no_rollback_required/not_required` case. A missing method fails before
+dispatch; a classifier exception after dispatch uses the contract's
+conservative fallback and must never be interpreted as proof of no effect.
 
 `AuthorityMode.CAPABILITY` is the default and requires one or more allowed
 `CapabilityDecision` values for the acting pid. `AuthorityMode.RUNTIME_INTERNAL`

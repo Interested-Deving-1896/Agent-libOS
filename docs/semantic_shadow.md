@@ -374,16 +374,43 @@ message, audit, event, or ordinary LLM rows payload-free.
 
 ## External classifier configuration
 
-External assessment is optional. It must use a named, non-default LLM profile
-selected by the Host. Enabling any external semantic mode rejects configuration unless
-all of these profile properties are explicit and stable:
+External assessment is optional. It must use a named LLM profile other than
+`llm.default_profile_id`, selected by the Host. An enabled external mode requires:
 
-- a non-empty model;
-- `store: false`;
-- no prompt-cache key or retention;
-- no previous-response chaining;
-- `max_retries: 0`;
-- a finite positive timeout.
+- an explicit, non-empty `model` and `api_mode: chat` or `api_mode: responses`;
+- explicit `store: false`, `max_retries: 0`,
+  `responses_previous_response_id: false`, and `fallback_json_actions: false`;
+- `provider_tools: null` and no enabled Responses replay; setting
+  `responses_replay: false` makes the classifier's choice explicit;
+- an explicit finite positive `timeout_s`;
+- no prompt-cache key, retention, or TTL on either the profile or global `llm`
+  defaults. The profile's cache mode must be unset or `provider_default`;
+  the global mode may be `auto` or `provider_default`. The classifier resolves
+  to `provider_default` and does not enable the ordinary process cache policy.
+
+Set the profile timeout below `semantic.assessment_timeout_s` to leave room for
+queue and preflight work. At dispatch it must fit the assessment's remaining
+deadline; an otherwise valid profile cannot extend that deadline.
+
+The complete [external classifier example](../examples/semantic/external_classifier.yaml)
+configures `shadow` mode and a separate profile with those settings. Validate it
+from the repository root without credentials or a provider request:
+
+```bash
+uv run python - <<'PY'
+from agent_libos.config import load_config_file
+
+config = load_config_file("examples/semantic/external_classifier.yaml")
+print(config.semantic.mode, config.semantic.external_profile_id)
+PY
+```
+
+Loading the YAML validates configuration only. To run external assessments, the
+Host must supply the profile's `SEMANTIC_OPENAI_API_KEY`, select a model available
+on its provider, and satisfy the Sink clearance and dispatch conditions below.
+`enforce_deny` and `canary_auto` additionally require their static policy epoch;
+the example enables neither. See the [configuration reference](configuration.md#semantic-phase-24-configuration)
+for the shared semantic settings.
 
 The configuration/profile conditions are checked before an enabled external
 Runtime is assembled. Assembly freezes both the selected profile snapshot

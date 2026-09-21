@@ -20,6 +20,7 @@ Durable Task Runs are not a distributed workflow service.
 - [Follow crash-safe command settlement](#crash-safe-command-settlement)
 - [Recover execution after restart](#execution-and-restart-recovery)
 - [Use the Python Host API](#python-host-api)
+- [Run the offline Host example](#offline-host-example)
 - [Use the CLI](#cli)
 - [Use the GUI and local HTTP API](#gui-and-local-http-api)
 - [Respect existing subsystem boundaries](#boundaries-with-existing-subsystems)
@@ -528,6 +529,58 @@ and return types remain authoritative in the installed package. Every mutation
 accepts `expected_revision` and `command_id`; callers should generate a command
 id once and reuse it only when retrying the exact same request. Creation uses
 its stable client request id instead of an expected revision.
+
+The next Host action depends on the latest summary. Read `allowed_actions` and
+`blockers` as well as `status`; this table is a navigation aid, not permission
+to bypass an evidence or revision check.
+
+| Observed status | Next step |
+| --- | --- |
+| `queued` | Call `run_until_blocked` with the observed revision to start execution. |
+| `running` after a quantum-bounded call returns | Call `run_until_blocked` again with a new command id and a freshly observed revision to advance more quanta. |
+| `waiting_human`, `waiting_process`, `waiting_message`, `waiting_tool` | Resolve the owning Human/process/message/tool condition, then inspect the Run and use its advertised `run` action. `wait()` itself does not resolve or dispatch the work. |
+| `paused` | Use `resume` when advertised, then separately call `run_until_blocked` to advance execution. Resume alone does not run a model quantum. |
+| `needs_attention` | Inspect `recovery_options` and apply only an evidence-backed Host recovery choice. Ordinary run/resume is unavailable. |
+| `cancelling`, `finalizing` | Observe convergence; an unsettled effect or cleanup failure can require attention. |
+| `succeeded`, `failed`, `cancelled` | Read retained results/evidence or create a linked rerun. A purged goal needs an explicit replacement. |
+
+### Offline Host example
+
+From a repository checkout, install the locked environment with
+`uv sync --frozen`, then run:
+
+```bash
+uv run python examples/task_runs/host_lifecycle.py
+```
+
+The [complete example](../examples/task_runs/host_lifecycle.py) supplies its own
+deterministic local LLM client, so it needs no API key or paid Provider call.
+It explicitly enables Task Run plaintext payloads in an isolated temporary
+SQLite database outside the workspace. As a trusted Host, it selects
+`permanent` retention so the final result remains available for inspection
+until the example closes and deletes that temporary directory. This is a
+single-Runtime lifecycle walkthrough, not a restart-recovery or permanent
+storage example.
+
+The script creates a queued Run, observes it with `wait(timeout=0)`, advances
+one quantum, pauses, reads the current revision, resumes, and separately
+advances execution to completion. Its scripted actions use the real tool and
+completion-review paths; no process status or completion evidence is injected
+into the Store. The reported statuses are `queued` → `running` → `paused` →
+`running` → `succeeded`. Passive wait and resume leave the local client's call
+count unchanged: the JSON report shows `local_completions_after_wait: 0`,
+`local_completions_after_resume: 1`, and `local_completions_total: 3`. Success
+also reports `satisfied_requirements: 1` and the result summary
+`Local Skill catalog inspected.`
+
+Each new mutation uses a new command id and the latest observed revision. For
+an uncertain response, retry the original command id **and exact original
+request**, including its revision; do not substitute a freshly read revision
+under that id. A stale new command is rejected, a typed wait needs its owning
+condition resolved, and `needs_attention` requires the server-derived recovery
+path. Replacing the local client with a real Provider also requires configured
+credentials, authority, data-flow policy, and budgets; this example does not
+establish those external prerequisites.
 
 ## CLI
 

@@ -66,10 +66,17 @@ status fields, `truncated: false`, and a 64-hex state token. MCP must return
 exactly `servers: []` and `has_more: false`; merely returning a list shape is
 not sufficient.
 
+Run from a Git checkout after `uv sync --frozen`. For a paid run, configure
+`OPENAI_API_KEY` and `OPENAI_LANGUAGE_MODEL` (or `OPENAI_MODEL`) in an ignored
+`.env`, or export them in the launching shell. The Python script does not load
+`.env` implicitly; the command below uses uv's explicit loader. If you exported
+the variables instead, omit `--env-file .env` from the command: uv requires the
+named file to exist even when the variables are already set. See
+[real-LLM setup](../../docs/development.md#real-llm-smoke) for custom endpoints.
 Run it only with explicit real-LLM credentials and confirmation:
 
 ```bash
-.venv/bin/python experiments/run_builtin_tool_skill_evaluation.py \
+uv run --env-file .env python experiments/run_builtin_tool_skill_evaluation.py \
   --confirm-real-llm \
   --require-all-correct \
   --require-publication-gate \
@@ -120,14 +127,15 @@ Preview the fixed 15-pair plan without reading credentials or making provider
 calls:
 
 ```bash
-.venv/bin/python experiments/run_builtin_tool_skill_evaluation.py --dry-run
+uv run python experiments/run_builtin_tool_skill_evaluation.py --dry-run
 ```
 
 The corresponding pytest is marked `real_llm`, so ordinary CI collects but
-skips it. To run it explicitly:
+skips it. To run it explicitly, use the command below; omit `--env-file .env`
+when using variables already exported in the shell:
 
 ```bash
-.venv/bin/python -m pytest \
+uv run --env-file .env python -m pytest \
   tests/benchmarks/test_builtin_tool_skill_evaluation.py \
   --run-real-llm
 ```

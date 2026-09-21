@@ -1,4 +1,4 @@
-# Runtime-Safety Benchmark
+# Benchmarks and Evaluation
 
 The benchmark harness is a deterministic runtime-safety workload for
 Agent libOS. It is designed to compare agent runtime boundaries against simpler
@@ -13,6 +13,7 @@ The task schema is defined in
 ## In this guide
 
 - [Understand the task suite](#task-suite)
+- [Choose an evaluation and its evidence gate](#evaluation-map)
 - [Choose a runner](#runners)
 - [Run deterministic or comparative evaluations](#running)
 - [Opt in to real-LLM mode](#real-llm-mode)
@@ -21,6 +22,37 @@ The task schema is defined in
 - [Publish benchmark evidence](#publishing-benchmark-evidence)
 - [Distinguish practical evidence levels](#practical-workflow-evidence-levels)
 - Return to the [documentation home](index.md).
+
+## Evaluation map
+
+Start with the question you need to answer. The runtime-safety sections below
+describe one suite; the linked guides define the other suites' prerequisites,
+commands, oracles, and report contracts. A successful report write is not always
+a passing gate, so preserve the strict flags shown here when claiming evidence.
+Live model runs require credentials and can spend provider tokens; their
+deterministic tests or dry runs validate the harness, not live model quality.
+
+| Purpose and guide | Execution/evidence | Entry point | Strict gate | Main artifacts |
+| --- | --- | --- | --- | --- |
+| [Runtime boundary safety](../benchmarks/runtime_safety/README.md) | Deterministic by default; optional real LLM | [`run_benchmark.py`](../experiments/run_benchmark.py) | `--require-all-passed --require-release-evidence` for the complete release workload | `results.jsonl`, completion manifest, `summary.json`, `metrics.json`/CSV, per-task stores |
+| [Practical workflow evidence](../benchmarks/practical_agent_workflows/README.md) | Token-free `native-live` and `modeled`, reported separately | [`run_practical_evaluation.py`](../experiments/run_practical_evaluation.py) | Strict by default: native/model oracles pass and modeled fallback is zero | Schema-v1 JSON report |
+| [External-effect recovery scale](../benchmarks/external_effect_recovery/README.md) | Deterministic local store; `ci` or `million` population | [`run_external_effect_recovery_scale.py`](../experiments/run_external_effect_recovery_scale.py) | Structural paging/index/convergence checks always enforced | Schema-v3 JSON with artifact metadata; timing is diagnostic |
+| [Runtime publication recovery](../benchmarks/runtime_publication_recovery/README.md) | Deterministic; named `ci` profile or explicit sizes | [`run_publication_reconciliation_scale.py`](../experiments/run_publication_reconciliation_scale.py) | Structural handler/query/convergence checks always enforced | Schema-v3 JSON with artifact metadata |
+| [Durable Task Run crash and scale recovery](../benchmarks/durable_task_runs/README.md) | Deterministic subprocess crashes and local 100k-Run history | [`run_task_run_crash_matrix.py`](../experiments/run_task_run_crash_matrix.py), [`run_task_run_recovery_scale.py`](../experiments/run_task_run_recovery_scale.py) | Crash convergence/idempotency and bounded indexed recovery are always enforced | Separate JSON reports with crash receipts and recovery diagnostics |
+| [Long-horizon repository maintenance](../benchmarks/long_horizon_agent/README.md) | Opt-in real LLM; scenario catalog and deterministic harness tests available | [`run_long_horizon_evaluation.py`](../experiments/run_long_horizon_evaluation.py) | `--confirm-real-llm --require-all-successful` | Schema-v1 scenario/run report; optional diagnostic artifacts |
+| [Built-in Tool Skill routing comparison](../benchmarks/builtin_tool_skills/README.md) | Opt-in paired real LLM; `--dry-run` is token-free | [`run_builtin_tool_skill_evaluation.py`](../experiments/run_builtin_tool_skill_evaluation.py) | `--confirm-real-llm --require-all-correct --require-publication-gate` | Schema-v3 paired report; full publication grid is 15 pairs/30 runs |
+| [Durable live repository maintenance](../benchmarks/durable_task_runs/README.md#opt-in-live-repository-maintenance-gate) | Real LLM with TaskRun restart and follow-up | [`run_durable_task_run_evaluation.py`](../experiments/run_durable_task_run_evaluation.py) | `--confirm-real-llm --require-release-gate --repetitions 3` | Redacted family JSON and optional retained runtime artifacts |
+| [Browser customer operations](../benchmarks/browser_customer_workflows/README.md) | Real LLM and real Chromium; deterministic tests use an in-memory portal | [`run_browser_customer_flow_evaluation.py`](../experiments/run_browser_customer_flow_evaluation.py) | `--confirm-real-llm --confirm-browser --require-release-gate --repetitions 3` | Redacted family JSON with browser/effect evidence |
+| [Research and analysis workflows](../benchmarks/knowledge_workflows/README.md) | Real LLM; deterministic executor tests available | [`run_knowledge_workflow_evaluation.py`](../experiments/run_knowledge_workflow_evaluation.py) | `--confirm-real-llm --require-release-gate --repetitions 3` for both scenarios | Schema-v2 family JSON |
+| [Combined live TaskRun release evidence](#durable-task-run-live-repository-maintenance-gate) | Offline validation of the three paid family reports above | [`check_live_release_gate.py`](../experiments/check_live_release_gate.py) | `--require-release-gate`: all family gates, safety 12/12, utility at least 10/12, matching clean provenance | Combined JSON report |
+| [AgentDojo paired integration](../experiments/agentdojo/README.md) | Separate Python 3.11–3.12 environment; deterministic tests/dry run or paid evaluation | `agent-libos-dojo run`, then `agent-libos-dojo verify`, inside the subproject | Run with `--confirm-real-llm --fail-on-invalid`; verify with `--require-complete --require-all-valid` | Metadata, results JSONL, metrics, traces, runtime stores, hash manifest |
+| [Prompt-cache layout qualification](providers.md#prompt-caching-v2-release-evidence) | Paid paired provider/model evidence, followed by offline validation | [`build_prompt_cache_arm_report.py`](../scripts/build_prompt_cache_arm_report.py), [`check_prompt_cache_gate.py`](../scripts/check_prompt_cache_gate.py) | Strict checker default; `--canary` is not release qualification | Provider reports, paired arm JSON, gate JSON |
+
+The live release families use a stricter publication contract than the ordinary
+long-horizon report. AgentDojo's ambient integration arm does not claim
+Capability/approval/data-flow enforcement. Follow each guide's evidence limits
+instead of comparing unlike success rates. See the
+[support matrix](support_matrix.md#evaluation-coverage) for which gates run in CI.
 
 ## Task Suite
 
@@ -266,8 +298,10 @@ is not left beside an interrupted new run.
 Agent libOS runner directories also include per-task runtime store databases
 under the output directory.
 
-An expected task or safety failure is represented in the result fields and does
-not make the benchmark command itself fail. A benchmark infrastructure failure
+By default, without `--require-all-passed`, an expected task or safety failure
+is represented in the result fields and does not make the benchmark command
+itself fail. With that flag, an unsuccessful task or safety oracle causes a
+nonzero exit after the outputs are written. A benchmark infrastructure failure
 (for example, runner setup raising unexpectedly) is marked with
 `metadata.runner_failed`, is still written to the output files, and causes the
 command to exit nonzero. The console summary caps the failure preview at 20
@@ -555,7 +589,8 @@ uv run python experiments/run_task_run_recovery_scale.py \
 [`benchmarks/durable_task_runs/`](../benchmarks/durable_task_runs/README.md)
 executes isolated workers at six Run/action/effect durability barriers and
 terminates five with `os._exit` and the provider-dispatched barrier with
-`SIGKILL`. Provider truth is written to a separate canonical JSONL ledger whose
+`SIGKILL` where the Host provides it; Windows uses the same no-cleanup
+`os._exit` termination instead. Provider truth is written to a separate canonical JSONL ledger whose
 file and parent-directory creation are fsynced independently of RuntimeStore.
 The provider-idempotent cases execute a real scripted LLM action through the
 JSON-RPC tool and protected effect path; on reopen, the provider must dedupe the

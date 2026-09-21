@@ -17,12 +17,12 @@ receipt.
 | Use the CLI | [CLI guide](cli.md) | [Machine-generated exhaustive CLI reference](cli_reference.md) |
 | Configure the Runtime | [Configuration guide](configuration.md) | [Machine-generated exhaustive field reference](configuration_reference.md) |
 | Embed the Runtime in Python | [Python API](python_api.md) | [Runtime model](runtime_model.md), [providers](providers.md) |
-| Use the desktop console | [GUI first-task path](gui.md#first-task-user-path) | [GUI workspace reference](gui.md#current-workspace), [development and API boundary](gui.md#development) |
+| Use the desktop console | [Model and credential setup](gui.md#configure-a-model-before-the-first-task), [first-task path](gui.md#first-task-user-path) | [GUI workspace reference](gui.md#current-workspace), [development and API boundary](gui.md#development) |
 | Operate a persistent store | [Storage](storage.md) | [Configuration](configuration.md), [release/support status](support_matrix.md) |
 | Understand the security model | [Threat model](threat_model.md) | [Capabilities](capabilities.md), [data flow](data_flow.md), [invariants](invariants.md) |
 | Author an image, Skill, or module | [AgentImages](agent_images.md), [Skills](skills.md), [Runtime Modules](modules.md) | [Tools and JIT](tools_and_jit.md) |
 | Add a protected provider operation | [Protected Operation SDK](protected_operation_sdk.md) | [Provider substrate](providers.md), [architecture](architecture.md) |
-| Evaluate or contribute | [Development guide](development.md) | [Benchmark contract](benchmark.md), [contribution guide](../CONTRIBUTING.md) |
+| Evaluate or contribute | [Development guide](development.md) | [Evaluation map](benchmark.md#evaluation-map), [contribution guide](../CONTRIBUTING.md) |
 | Prepare a release | [Release status](release_status.md) | [Release runbook](releasing.md), [artifact anonymity](artifact_anonymity.md) |
 
 If an unfamiliar project term blocks the path, use the [glossary](glossary.md).
@@ -46,6 +46,24 @@ changing authority, retention, or provider settings.
 For long-running supervised work, continue with [Durable Task Runs](durable_task_runs.md).
 For process state and context, use [Object Memory](object_memory.md),
 [checkpoints](checkpoints.md), and the [Runtime model](runtime_model.md).
+
+## Hands-on integration paths
+
+These tutorials give prerequisites, executable examples, and expected results.
+The local examples use temporary state or configuration validation; replacing a
+fixture with a real provider requires the Host configuration described in its
+guide.
+
+| Task | Tutorial |
+| --- | --- |
+| Register a Python tool and verify its authority boundary | [Complete Python tool example](tools_and_jit.md#run-a-complete-python-tool-example) |
+| Add a provider with classified effects and evidence | [Complete Protected Operation example](protected_operation_sdk.md#run-a-complete-protected-operation-example) |
+| Create, observe, pause, resume, and complete a TaskRun | [Offline Host lifecycle](durable_task_runs.md#offline-host-example) |
+| Register exact Sink trust and verify denial/clearance | [Local Host Sink trust](data_flow.md#local-host-sink-trust-example) |
+| Validate an external semantic classifier profile | [Complete classifier configuration](semantic_shadow.md#external-classifier-configuration) |
+| Traverse MCP pages without losing cursor state | [Pagination in one Runtime](mcp.md#pagination-in-one-runtime) |
+| Prepare a non-secret OAuth profile | [OAuth profile file](mcp.md#oauth-profile-file) |
+| Check an unpacked source distribution | [Installed-package smoke](development.md#source-distribution-installation-smoke) |
 
 ## Security reviewer path
 
@@ -89,8 +107,10 @@ between visibility, authority, effect, operation, and evidence are unclear.
 
 - [Development](development.md): setup, deterministic lanes, optional real
   integrations, documentation rules, and dependency changes.
-- [Benchmark](benchmark.md): runtime-safety and practical-workflow contracts,
-  runners, outputs, metrics, and publication rules.
+- [Evaluation map](benchmark.md#evaluation-map): choose among runtime-safety,
+  practical, recovery, long-horizon, Tool Skills, browser, knowledge, and
+  AgentDojo suites by purpose and prerequisites; then use the
+  [benchmark contract](benchmark.md) for metrics and publication rules.
 - [Release status](release_status.md): current scope and required gates; not a
   CI receipt.
 - [Release runbook](releasing.md): explicitly authorized artifact, tag, and

@@ -510,7 +510,11 @@ from pathlib import Path
 import sys
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-if not isinstance(report, dict) or report.get("target_file", {}).get("content_matches") is not True:
+if (
+    not isinstance(report, dict)
+    or report.get("target_file_exists") is not True
+    or report.get("target_file_content_matches") is not True
+):
     raise SystemExit("deterministic demo did not return its successful JSON contract")
 print("entrypoint-help-and-demo-ok")
 PY

@@ -106,12 +106,24 @@ Runtime startup has one deliberate recovery-only exception. Before normal
 admission opens, the Object repository directly scans live rows whose durable
 `runtime_memory` marker has no reconstructable process-local payload. In
 bounded store transactions it marks those rows `released`, removes their
-links, and revokes active Object capabilities. This recovery sweep does not
-invoke `ObjectMemoryManager` release finalizers or its per-Object online audit
-path. Hash-anchored payloads from an interrupted checkpoint restore are
-rehydrated before the sweep. A runtime-only Object must therefore not be used
-as the sole durable record of a host resource that requires finalization after
-reopen.
+links, and normally revokes active Object capabilities. An exact existing READ
+grant can survive solely as source authority for validated Host-private LLM
+replay or hosted-provider continuation owned by a nonterminal process. Startup
+checks the retained history, process/provider/context binding, source identity
+and version, and current authority before selecting those grants. The sweep
+keeps their existing effect, restrictions, lineage, expiry, and remaining uses,
+narrows their rights to `read`, and disables delegation; matching READ DENY/ASK
+policies remain in force. It does not recreate revoked grants or retain write
+authority. The Object itself is still released and ordinary Object lookup
+cannot recover its payload from that retained READ grant.
+
+This recovery sweep does not invoke `ObjectMemoryManager` release finalizers or
+its per-Object online audit path. Hash-anchored payloads from an interrupted
+checkpoint restore are rehydrated before the sweep. A runtime-only Object must
+therefore not be used as the sole durable record of a host resource that
+requires finalization after reopen. See
+[private replay retention](evidence_payload_retention.md#private-responses-replay)
+for the separate lifecycle of retained LLM history.
 
 Ownership changes are lifecycle changes and increment the Object version.
 Create, update, append, transfer, and trusted delete all acquire the Object

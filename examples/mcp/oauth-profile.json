@@ -1,0 +1,12 @@
+{
+  "profile_id": "work-oauth",
+  "server_id": "demo-mcp",
+  "resource_uri": "https://api.example.test/mcp",
+  "expected_issuer": "https://identity.example.test",
+  "redirect_uri": "http://127.0.0.1:8766/callback",
+  "client_id": "agent-libos-desktop",
+  "registration_mode": "preregistered",
+  "token_endpoint_auth_method": "none",
+  "allowed_scopes": ["resources.read"],
+  "default_scopes": ["resources.read"]
+}

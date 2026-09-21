@@ -203,8 +203,9 @@ unload provenance ambiguous:
 | `agent-libos-git-remotes` | Fetch, pull, or push configured remotes |
 | `agent-libos-git-pull-requests` | Manage repository-local simulated pull requests |
 
-Base, coding, review, and toolmaker each start with the same five Skill
-lifecycle/bootstrap schemas and no loaded Skill. They discover and activate
+Base, coding, review, and toolmaker each start with seven schemas: the five
+required Skill lifecycle/bootstrap tools plus `read_process_messages` and
+`receive_process_messages`. They have no loaded Skill. They discover and activate
 navigation, authority, human collaboration, Object Memory, workspace, JIT, or
 other domain guidance only when the task requires it. Context-compressor
 remains a single-tool image.
@@ -380,6 +381,43 @@ notices for an active task; disabling a watch does not retract notices already
 published, cancel the runner, or alter target-tool authority.
 
 ## Writing Python Tools
+
+### Run a complete Python tool example
+
+The [standalone Python tool example](../examples/extensions/python_tool.py)
+defines strict input/output schemas, implements `SyncAgentTool.run`, registers
+the tool, binds it to a process, and invokes it through `runtime.tools.call`.
+From a Git checkout containing `uv.lock`, after `uv sync --frozen`, run:
+
+```sh
+uv run python examples/extensions/python_tool.py
+```
+
+For an extracted sdist, follow the
+[source-distribution installation instructions](development.md#source-distribution-installation-smoke)
+and use that environment's Python in place of `uv run python`; the sdist omits
+the repository lock.
+
+It needs Python 3.11+, but no credentials, LLM, network, or Deno. It uses explicit
+`DEFAULT_CONFIG`, a temporary workspace, and an in-memory database; it does not
+load the CLI's project configuration. Expected output:
+
+```json
+{"denied_before_grant": true, "result": {"bytes_read": 6, "truncated": false}, "tool_visible": true}
+```
+
+The first call is denied despite the tool being visible. After trusted Host
+code grants one read of the exact fixture path, the same call returns the six
+UTF-8 bytes in `中文`. The tool delegates the read to the filesystem primitive;
+Host fixture setup and capability issuance stay outside its `run` method.
+`configure_process_tools` replaces both process tool tables, so applications
+must include every binding they intend to retain. See the
+[example walkthrough](../examples/extensions/README.md#python-tool) for the
+registration, authority, and timeout details, and the
+[Protected Operation SDK example](protected_operation_sdk.md#run-a-complete-protected-operation-example)
+when adding a provider-backed primitive of your own.
+
+### Authoring contract
 
 Python tools should not directly access host resources. Use this pattern:
 
@@ -577,9 +615,13 @@ The TypeScript module must export `run(args, libos)`:
 ```ts
 export async function run(args, libos) {
   const file = await libos.syscall("filesystem.read_text", { path: args.path });
-  return { bytes: String(file.content ?? "").length };
+  return { bytes_read: file.bytes_read, truncated: file.truncated };
 }
 ```
+
+`bytes_read` counts the raw bytes retained by the filesystem primitive;
+`truncated=true` means the file has an unobserved suffix. JavaScript string
+`.length` counts UTF-16 code units and cannot substitute for the byte count.
 
 `run` may be synchronous or async. The only libOS access channel is:
 

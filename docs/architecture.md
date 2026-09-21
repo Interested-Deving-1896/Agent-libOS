@@ -12,6 +12,7 @@ TCB exception described below; it is not a model-facing authority path.
 
 - [Layer model](#layer-model)
 - [Composition root and internal dependencies](#composition-root-and-internal-dependencies)
+- [Startup recovery order](#startup-recovery-order)
 - [Tool boundary](#tool-boundary)
 - [Primitive boundary](#primitive-boundary)
 - [Semantic approval and flow plane](#semantic-approval-and-flow-plane)
@@ -274,15 +275,29 @@ an owned store. Custom Runtime subclasses must be created through their
 `open`/`aopen` entrypoints or `RuntimeBuilder`; invoking a custom subclass
 constructor directly is outside this lifecycle contract.
 
+### Startup recovery order
+
 Before the lifecycle becomes `OPEN`, the assembled Runtime holds a dedicated
 recovery lease. It first validates recoverable TaskRun plaintext and integrity
-bindings without dispatch, then drains durable startup work in dependency order:
-prepared protected operations, pending external effects, semantic authority,
-stale capability-use reservations, resource-usage reservations, process-exec
-publications, process-launch publications, checkpoint-restore publications,
-root-spawn initial-goal payloads, missing volatile Object payloads, registered
-JIT rehydration, stale Explainable Operations, stale process execution leases,
-Object Tasks, incomplete process-terminal cleanup intents, and TaskRun recovery.
+bindings without dispatch. The builder then drains durable startup work in this
+order:
+
+1. Crash-interrupted MCP continuations, then MCP remote Tasks, then MCP
+   subscriptions. These steps reconcile durable restart state without provider
+   replay.
+2. Prepared protected operations, then pending external effects.
+3. Semantic authority, then stale capability-use reservations, then
+   resource-usage reservations.
+4. Process-exec publications, then process-launch publications, then
+   checkpoint-restore publications.
+5. Root-spawn initial-goal payloads, then private LLM replay source preflight,
+   then missing volatile Object payloads. The preflight preserves only the
+   exact source-read bindings described in [Object payload recovery](object_memory.md#objects).
+6. Registered JIT rehydration, then stale Explainable Operations, then stale
+   process execution leases.
+7. Object Tasks, then incomplete process-terminal cleanup intents, then TaskRun
+   startup recovery.
+
 Pending-effect reconciliation precedes stale capability-reservation abandonment
 because a provider receipt may prove an effect never started and restore its
 bound reservation. Recovery queries use configured, hard-bounded keyset pages.
@@ -299,6 +314,8 @@ the ObjectTask worker, performs checkpoint payload begin/prepare/complete
 delivery, reconciles terminal restore publications again, and commits the
 payload acknowledgement before publishing `OPEN`. Normal mutation admission
 does not open between these two phases.
+
+### Component assembly and ownership
 
 Before an async entrypoint offloads allocation or assembly, its event-loop
 caller atomically installs an identity-only `StoreAssemblyReservation`. New

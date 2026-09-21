@@ -9,6 +9,12 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+- Correct documentation for private Responses replay storage and cleanup,
+  staged store migrations, MCP authority, semantic classifier configuration,
+  CLI errors, and recovery behavior. Fix the release readback verifier and
+  exercise it against a real deterministic demo result and invalid receipts.
+  Add executable integration examples and clarify GUI setup, source-archive
+  checks, and evaluation entrypoints.
 - Stop counting contract-required identifier echoes as prompt-cache leaks: the
   `process_exit` scan excludes `result_oid` and the cumulative-review
   `goal_oid`, `reviewed_message_ids`, and `source_refs` fields (decoding

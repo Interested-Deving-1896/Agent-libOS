@@ -181,7 +181,10 @@ runtime = Runtime.open(config=config)
 ### Store persistence and relative path ownership
 
 The checked-in repository `config.yaml` selects the reserved `user` target and
-loads the trusted PTY Runtime Module. `DEFAULT_CONFIG.runtime.local_store_target`
+loads the trusted [PTY](modules.md#pty-module) and
+[agentvfs](modules.md#agentvfs-module) Runtime Modules. Agentvfs remains inert
+without an explicit Host substrate binding; ordinary CLI use and the demo need
+neither its daemon nor FUSE. `DEFAULT_CONFIG.runtime.local_store_target`
 is also `user`, so the CLI, directly launched development GUI server, and bare
 `Runtime.open()`/`Runtime.aopen()` resolve by default to
 `~/.agent-libos/runtime/agent-libos.sqlite`. Packaged Electron explicitly keeps
@@ -612,11 +615,17 @@ profile other than `llm.default_profile_id`, with an explicit model; explicit
 `api_mode: chat` or `api_mode: responses`; `store: false`; `max_retries: 0`;
 `responses_previous_response_id: false`; `fallback_json_actions: false`;
 `provider_tools: null`; and a
-finite timeout compatible with `semantic.assessment_timeout_s`. Prompt caching
-must be disabled both on that profile and in the global `llm` defaults: neither
-level may set a cache key, retention, or TTL; the profile cache mode may only be
-unset or `provider_default`, and the global cache mode must be
-`provider_default`. The runtime freezes the profile snapshot identity and
+finite timeout compatible with `semantic.assessment_timeout_s`. Neither that
+profile nor the global `llm` defaults may set a prompt-cache key, retention, or
+TTL. The profile cache mode may only be unset or `provider_default`; the global
+mode accepts `auto` or `provider_default`. The classifier resolves its effective
+mode to `provider_default` independently of the global mode, so ordinary agent
+profiles can use `auto` without enabling it for semantic assessment. Likewise,
+the classifier does not inherit global Responses replay: its profile may leave
+`responses_replay` unset or set it to `false`, and its effective value is always
+`false`. See the
+[minimal external-classifier configuration](../examples/semantic/external_classifier.yaml)
+for a complete overlay. The runtime freezes the profile snapshot identity and
 explicit model at assembly; assessment rechecks snapshot/resolution/client
 identity and model/timeout, and the Protected Operation revalidates the
 profile-bound Sink. Drift fails closed instead of inheriting permissive

@@ -6,8 +6,9 @@ Use [docs/development.md](docs/development.md) for environment setup, standard
 checks, optional provider gates, and release-artifact validation. A Git checkout
 also contains [AGENTS.md](AGENTS.md), which gives coding agents additional
 repository-local operating instructions. Source distributions intentionally do
-not include that automation-specific file; this contributing guide and the
-checked-in `docs/` pages are sufficient for human contributors using an sdist.
+not include that automation-specific file. Human contributors can use this
+guide and `docs/` to understand an sdist, but the complete repository checks
+require a Git checkout with the omitted development files.
 
 Core Python code lives in `agent_libos/`, deterministic pytest coverage in
 `tests/`, runtime-safety fixtures and evaluators in `benchmarks/`, user-facing
@@ -20,8 +21,14 @@ authority, approval, data-flow, resource, effect, event, and audit rules.
 In a Git checkout, install the reviewed lock with `uv sync --frozen`. The source
 distribution intentionally omits the repository `uv.lock`; from an unpacked
 sdist, `uv sync` can resolve a new local environment, but that is not a
-frozen-lock reproduction or release receipt. The normal complete deterministic
-Python check is `uv run python scripts/test_matrix.py --lane all`. Use the
+frozen-lock reproduction or release receipt. Use the
+[source-distribution installation smoke](docs/development.md#source-distribution-installation-smoke)
+to check an unpacked sdist without Git. The complete Python matrix cannot run
+from an sdist: collection uses Git metadata, and some Python tests inspect GUI
+and CI source files that the archive omits.
+
+From a Git checkout, the normal complete deterministic Python check is
+`uv run python scripts/test_matrix.py --lane all`. Use the
 narrower lane that matches the change while iterating, then run the complete set
 before claiming a full local validation. Run
 `uv run python scripts/check_test_invariants.py` for invariant changes and

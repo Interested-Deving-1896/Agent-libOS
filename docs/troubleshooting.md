@@ -137,9 +137,11 @@ uv run agent-libos --db user init
 ```
 
 The CLI loads the project-root `config.yaml` when `--config` is omitted. In this
-checkout that file may select a persistent store and trusted module even if the
-shell's current directory differs. Pass `--db local` or an exact `--config` when
-you need an unambiguous diagnostic environment.
+checkout that file selects a persistent store and the trusted PTY and agentvfs
+modules even if the shell's current directory differs. Pass `--db local` or an
+exact `--config` when you need an unambiguous diagnostic environment.
+The [agentvfs module](modules.md#agentvfs-module) stays inert without an explicit
+Host substrate binding; the ordinary demo does not require its daemon or FUSE.
 
 ### Runtime reports an unsupported store version
 

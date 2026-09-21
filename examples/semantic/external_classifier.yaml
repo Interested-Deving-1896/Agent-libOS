@@ -1,0 +1,29 @@
+# Strict-loader example. Loading this file makes no network requests.
+# A live external assessment requires SEMANTIC_OPENAI_API_KEY and an
+# available model on the Host-selected provider.
+llm:
+  prompt_cache_mode: provider_default
+  prompt_cache_key: null
+  prompt_cache_retention: null
+  prompt_cache_ttl: null
+  profiles:
+    semantic-classifier:
+      model: gpt-6-astra
+      api_key_env: SEMANTIC_OPENAI_API_KEY
+      api_mode: responses
+      store: false
+      max_retries: 0
+      timeout_s: 15.0
+      responses_previous_response_id: false
+      responses_replay: false
+      fallback_json_actions: false
+      provider_tools: null
+      prompt_cache_mode: provider_default
+      prompt_cache_key: null
+      prompt_cache_retention: null
+      prompt_cache_ttl: null
+semantic:
+  mode: shadow
+  adapter: external
+  external_profile_id: semantic-classifier
+  assessment_timeout_s: 30.0

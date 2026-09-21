@@ -89,15 +89,7 @@ intent, then commits on the first effectful provider phase. The public
 is its sole provider-effect caller.
 On reopen, the Runtime holds its lifecycle recovery lease and first validates
 recoverable TaskRun plaintext and integrity bindings without dispatch. It then
-uses the builder-defined dependency order: crash-interrupted MCP continuations,
-MCP remote Tasks, and MCP subscriptions; prepared protected operations; pending
-external effects; semantic authority; stale capability-use reservations;
-resource-usage reservations; process-exec, process-launch, and
-checkpoint-restore publications; root-spawn initial-goal payloads; missing
-volatile Object payloads; registered JIT rehydration; stale Explainable
-Operations; stale process execution leases; Object Tasks; incomplete
-process-terminal cleanup intents; and finally TaskRun startup recovery. The
-three MCP steps are durable restart reconciliation, never provider replay.
+follows the [startup recovery order](architecture.md#startup-recovery-order).
 Prepared protected operations restore exact still-live reservations only when
 their durable intent proves that no provider phase began. Pending external
 effects must then be reconciled before every other stale `reserved` row is
@@ -535,7 +527,9 @@ child-spawn or compressor-image authority.
 The static default tool tables of the built-in base, coding, review, and
 toolmaker images contain `list_capabilities` and `inspect_capability`; the
 context-compressor image does not. Those four images use Skill projection, so
-neither capability tool is model-visible in the initial five-tool bootstrap.
+neither capability tool is model-visible in the initial bootstrap projection.
+Those images initially expose the five Skill/lifecycle bootstrap tools plus
+`read_process_messages` and `receive_process_messages`, for seven tools.
 Activating the exact `agent-libos-authority-basics` Skill projects both tools
 (and `request_permission`) for that process. `delegate_capability` and
 `revoke_capability` are registered static tools but are not included in those
@@ -990,7 +984,7 @@ non-forced push follow the capability record's normal `allow`/`ask`/`deny`
 effect.
 
 Git tools in the coding/review static tables are not part of the initial
-five-tool model projection. The corresponding all-or-nothing Git Skills must be
+bootstrap model projection. The corresponding all-or-nothing Git Skills must be
 activated before their owned schemas become model-visible. Static binding or
 later projection grants no `git:*`, `git_remote:*`, `git_pr:*`, filesystem,
 Task Authority effect, or data-flow permission. Existing `shell:git` grants are

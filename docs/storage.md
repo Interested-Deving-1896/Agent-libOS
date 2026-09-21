@@ -438,8 +438,12 @@ operator investigation rather than reuse of the original plan.
 
 Schema v8 stores replay payloads only in its dedicated private relation. The
 migration does not export them to checkpoint bodies, agent images, public
-call records, or audit receipts. Payload retention and purge apply when replay
-records are subsequently written by the Host.
+call records, or audit receipts. The age-based `payload-retention` maintenance
+commands do not scan these private replay rows. Task Run lifecycle purge and
+explicit Host replay purge can remove them; ordinary non-TaskRun replay has no
+automatic age-based expiry. See
+[private replay retention](evidence_payload_retention.md#private-responses-replay)
+for the plaintext storage, backup, and checkpoint-reference boundaries.
 
 ## Offline v6 to v7 migration
 
@@ -567,9 +571,14 @@ The supported procedure is:
    tables/indexes, appends the exact plan-bound PostgreSQL migration receipt,
    compare-and-swaps the singleton marker from 4 to 5, runs the complete
    canonical v5 storage catalog validator, and only then commits.
-6. Open the migrated target with this release and archive the plan/result with
-   the operator recovery record. Keep the backup until application validation
-   is complete.
+6. Archive the plan/result with the operator recovery record. The target is now
+   v5, which this release's Runtime still rejects. Continue with the separate
+   [v5-to-v6](#offline-v5-to-v6-migration),
+   [v6-to-v7](#offline-v6-to-v7-migration), and
+   [v7-to-v8](#offline-v7-to-v8-migration) procedures, establishing and verifying
+   each step's required recovery copy and plan digest. Open the target with this
+   release only after it reaches v8. Keep the recovery copies until application
+   validation is complete.
 
 A missing/mismatched plan digest, stale or non-self-contained SQLite backup,
 absent PostgreSQL confirmation, lock conflict, noncanonical v4 input, failed

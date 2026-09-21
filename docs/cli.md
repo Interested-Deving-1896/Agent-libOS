@@ -212,10 +212,12 @@ uv run agent-libos --db user \
 ```
 
 The checked-in `config.yaml` already names and trusts
-`modules/pty/module.yaml`. Do not pass that manifest again while using the
-default project config: duplicate startup manifest paths fail closed. Either
-use the configured PTY entry as-is or select a config that omits it before
-supplying the explicit global options.
+`modules/pty/module.yaml` and `modules/agentvfs/module.yaml`. Do not pass either
+manifest again while using the default project config: duplicate startup
+manifest paths fail closed. Use the configured entries as-is or select a config
+that omits an entry before supplying it through the explicit global options.
+The [agentvfs module](modules.md#agentvfs-module) remains inert without an
+explicit Host substrate binding, so ordinary CLI use requires no agentvfs daemon.
 
 `modules verify` reports `manifest_sha256`, `source_sha256`, and `trust_key`;
 copy `trust_key` into `--trusted-module`. For multi-file modules,
@@ -281,8 +283,8 @@ labelled “useful options” are intentionally not exhaustive.
 `agent_outputs/demo_patch_preview.txt` below the Runtime workspace and uses
 overwrite mode. Preserve or move an existing file at that path before running
 the demo if it contains user data. In this source checkout, project-root
-`config.yaml` loads its configured PTY Runtime Module; omitting `--db` also
-opens the persistent `user` target selected by that config. Use
+`config.yaml` loads its configured PTY and agentvfs Runtime Modules; omitting
+`--db` also opens the persistent `user` target selected by that config. Use
 `agent-libos --db local demo` when the Runtime records should be in-memory. The
 preview file is still written in either mode.
 
@@ -310,11 +312,18 @@ argparse usage/help text. The status contract for everything else is stable:
   `error.type: NotFound` and also exits with status 1.
 - Argument-parser usage failures (a missing required argument or an invalid
   subcommand choice) follow the argparse convention: the usage message goes to
-  stderr and the command exits with status 2.
-- Usage failures detected by the CLI after parsing, such as a malformed
-  `--args-json`/`--arguments-json` object or mutually exclusive options used
-  together, print their plain message without the JSON envelope and exit with
-  status 1.
+  stderr and the command exits with status 2. Missing or invalid config files,
+  invalid store-target syntax, and some post-parse option checks also use this
+  parser-error path.
+- Legacy JSON argument checks, including `workflow run --args-json`,
+  `jsonrpc call --params-json`, and `mcp call --arguments-json`, print a plain
+  message to stderr and exit with status 1 when the input is malformed or has
+  an unsupported shape. Other explicit usage checks may use the same path.
+- Modern MCP JSON argument checks use the domain-error JSON envelope on stdout,
+  with `error.type: ValidationError` and status 1. For example, malformed
+  `mcp prompts get --arguments-json` and `mcp resources read --variables-json`
+  are rejected before provider dispatch. The option name alone does not
+  determine the output format; the command's parser path does.
 - `workflow run` prints the tool result JSON even when it is `ok: false`, then
   exits with status 1.
 - `mcp` operations print the structured result exactly once; a returned
@@ -738,7 +747,7 @@ Useful leaf options are:
 | --- | --- |
 | `start` | Exactly one of `--goal`/`--goal-json`, required `--title`, optional Image/launch/authority/deadline/retention fields, stable `--client-request-id`, and explicit `--run [--max-quanta N] [--run-command-id ID]`; launch JSON accepts only `capabilities`, `resource_budget`, `working_directory`, and `llm_profile_id` and must not contain credentials |
 | `list` | Repeated or comma-separated `--status` over the closed status set (`queued`, `running`, `waiting_human`, `waiting_process`, `waiting_message`, `waiting_tool`, `paused`, `cancelling`, `finalizing`, `needs_attention`, `succeeded`, `failed`, `cancelled`), opaque `--cursor`, and bounded `--limit`; an unknown status value is rejected with the valid list |
-| `wait` | Optional finite `--timeout`; it has no run command id because it never mutates or dispatches |
+| `wait` | Optional finite `--timeout`; it has no run command id and dispatches no scheduler quanta, provider calls, or tools; observation may persist deadline cancellation, settlement, and terminal-retention housekeeping |
 | `recovery-options` | Read-only, server-derived recovery choices for the Run; use the returned opaque `option_id` with `recover` |
 | `pause` / `resume` | Required `--expected-revision`; optional stable `--command-id` is generated for a one-shot invocation when omitted |
 | `cancel` | Revision/command identity, optional `--reason`, and required `--confirm` |
@@ -1404,6 +1413,7 @@ uv run agent-libos --db user mcp prompts list demo-mcp
 uv run agent-libos --db user mcp prompts get demo-mcp release-notes --arguments-json '{"version":"1.5.1"}'
 uv run agent-libos --db user mcp prompts complete demo-mcp prompt release-notes version 2
 
+# Enable mcp.oauth_enabled: true in the selected Host config first.
 # OAuth login is one foreground flow. It prints the authorization URL, waits
 # for the full callback URL, and completes before this Runtime exits.
 uv run agent-libos --db user mcp auth login work-oauth --profile-file oauth-profile.json --scope resources.read
@@ -1485,7 +1495,7 @@ separate admin-operation audit.
 | `discover` | exact server `read+execute`; stdio additionally requires the local-spawn rights; Manifest v2 `auto`/`2026-07-28` only |
 | `tools` | exact server `read`; `--refresh` also requires server `execute` and the stdio local-spawn rights when applicable |
 | `unregister` | exact server `admin` |
-| `call <pid> ...` | the target `<pid>` supplies the declared tool right and any stdio local-spawn rights; an explicitly supplied `--actor-pid` must equal `<pid>` and does not add authority |
+| `call <pid> ...` | the target `<pid>` supplies the declared tool right and any stdio local-spawn rights; Manifest v3 additionally requires `execute` on `mcp_server:<server_id>`; an explicitly supplied `--actor-pid` must equal `<pid>` and does not add authority |
 
 All modern groups (`resources`, `prompts`, `auth`, `continuations`,
 `remote-tasks`, and `subscriptions`) and all DX commands (`validate`, `doctor`,
@@ -1499,6 +1509,14 @@ Omission selects the documented default object, while an explicit JSON `null`
 is rejected. Resource variables and Prompt arguments require string values.
 Pagination cursors are opaque and `has_more` is derived from `next_cursor`; do
 not manufacture, decode, or reuse a cursor with another server or operation.
+Resource, Resource Template, and Prompt cursors belong to the Runtime that
+issued them and are kept only in its memory. Each ordinary CLI invocation opens
+and closes a new Runtime, so passing its `next_cursor` to a later CLI invocation
+fails even with the same persistent `--db`. To traverse all pages, keep one
+embedded Runtime open and pass each cursor back to the same list method; use
+the [same-Runtime pagination tutorial](mcp.md#pagination-in-one-runtime) and
+[runnable local example](../examples/mcp/run_pagination_e2e.py). The current
+one-shot CLI does not provide a complete multi-page traversal command.
 
 Resource read and Prompt get may return `complete`, `input_required`, or
 `remote_task`; Prompt completion is complete-only. Continuation inspect is
@@ -1512,9 +1530,16 @@ output into a process, system prompt, or developer prompt.
 
 OAuth supports only Host-configured pre-registration and CIMD; DCR is not
 supported. A bounded, strict, extra-forbid profile JSON supplies the non-secret
-issuer/resource/client/redirect authority. `auth login` performs begin, manual
-browser authorization, callback input, and completion inside one foreground
-Runtime; there is deliberately no standalone `auth complete` command. A
+issuer/resource/client/redirect authority. Start from the
+[profile-file guide](mcp.md#oauth-profile-file) and
+[non-secret JSON template](../examples/mcp/oauth-profile.json), replacing its
+example identities with the Host's reviewed registration. OAuth defaults to
+disabled: set `mcp.oauth_enabled: true` in the selected Host config for login and
+every later OAuth-backed invocation. If using an explicit overlay, repeat its
+global `--config <path>` before `mcp`, alongside the required profile file.
+`auth login` performs
+begin, manual browser authorization, callback input, and completion inside one
+foreground Runtime; there is deliberately no standalone `auth complete` command. A
 non-interactive caller must opt in with `--callback-stdin`, and callback values
 never appear in success or error JSON. The callback authorization code exists
 only in the foreground process's transient input/request memory for the single
@@ -1584,6 +1609,15 @@ wildcard that digest. Streamable HTTP servers do not need those two local-spawn
 grants. The CLI cannot supply arbitrary transports, commands, URLs, headers, or
 raw MCP tool names.
 
+A Manifest v3 Tool call also requires server execution authority, for example:
+
+```bash
+uv run agent-libos --db user capabilities grant <pid> mcp_server:demo-mcp --rights execute
+```
+
+This is additional to the exact Tool right and any stdio local-spawn grants;
+Manifest v1/v2 Tool calls do not require this additional server grant.
+
 `mcp call` always prints the structured call result. A returned MCP failure
 (`ok: false`) exits with status 1 after printing that JSON exactly once; the CLI
 does not retry the provider call.
@@ -1598,13 +1632,14 @@ CLI invocations.
 
 Runtime Modules are trusted Python startup extensions. They are loaded with
 global arguments before the selected command runs. In this checkout the default
-project config already loads and trusts the PTY module, so inspect that
-configured instance without repeating its manifest:
+project config already loads and trusts the PTY and agentvfs modules, so inspect
+the configured instances without repeating their manifests:
 
 ```bash
 uv run agent-libos --db user modules verify modules/pty/module.yaml
 uv run agent-libos --db user modules list
 uv run agent-libos --db user modules inspect agent-libos-pty:v0
+uv run agent-libos --db user modules inspect agent-libos-agentvfs:v0
 ```
 
 | Module subcommand | Arguments and option defaults |

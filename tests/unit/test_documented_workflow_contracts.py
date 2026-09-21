@@ -165,12 +165,15 @@ def test_browser_live_docs_gate_node_playwright_and_chromium_first() -> None:
         "benchmarks/browser_customer_workflows/README.md",
     ):
         document = _read(path)
-        npm_ci = document.index("npm --prefix gui ci")
-        chromium = document.index(
+        # Navigation can name the runner before setup; execution instructions
+        # must still put the locked browser prerequisites before the live call.
+        commands = "\n".join(_bash_blocks(document))
+        npm_ci = commands.index("npm --prefix gui ci")
+        chromium = commands.index(
             "npm --prefix gui exec -- playwright install --with-deps chromium"
         )
-        playwright = document.index("npm --prefix gui exec -- playwright --version")
-        live = document.index(live_command)
+        playwright = commands.index("npm --prefix gui exec -- playwright --version")
+        live = commands.index(live_command)
         assert npm_ci < chromium < playwright < live, path
         assert "gui/package-lock.json" in document
 

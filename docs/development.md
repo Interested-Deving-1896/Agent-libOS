@@ -6,6 +6,7 @@ real LLM paths, and documentation rules for Agent libOS contributors.
 ## In this guide
 
 - [Set up the locked development environments](#setup)
+- [Check an unpacked source distribution](#source-distribution-installation-smoke)
 - [Choose focused or complete checks](#standard-checks)
 - [Build and inspect release artifacts](#release-artifacts)
 - [Run opt-in real-LLM evidence](#real-llm-smoke)
@@ -58,7 +59,64 @@ tests marked `real_deno` skip with a clear pytest reason; use
 run real Deno/TypeScript JIT tools from another binary, pass a runtime config
 built with `dataclasses.replace(DEFAULT_CONFIG, tools=replace(...))`.
 
+### Source-distribution installation smoke
+
+An unpacked Python sdist can be installed without Git, but it omits the root
+`uv.lock`, `.github/`, and `gui/`. The complete Python matrix below requires a
+Git checkout: documentation-test collection reads Git metadata, and other
+Python tests inspect those omitted GUI and CI files. Do not skip those tests
+and call the result complete repository validation.
+
+From the unpacked sdist root, create a separate installation and run a
+token-free smoke outside the source directory. These are POSIX shell commands;
+on Windows use `.venv-sdist/Scripts/python.exe` in place of
+`.venv-sdist/bin/python`, and save the Python block as a temporary script to
+execute with that interpreter.
+
+```bash
+uv venv .venv-sdist
+uv pip install --python .venv-sdist/bin/python .
+.venv-sdist/bin/python - <<'PY'
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+python = str(Path(sys.executable).absolute())
+bin_dir = Path(python).parent
+suffix = ".exe" if os.name == "nt" else ""
+env = dict(os.environ)
+env.pop("PYTHONPATH", None)
+with tempfile.TemporaryDirectory(prefix="agent-libos-sdist-smoke-") as work:
+    subprocess.run(
+        [python, "-I", "-c", "import agent_libos, importlib.metadata; "
+         "assert agent_libos.__version__ == importlib.metadata.version('agent-libos')"],
+        cwd=work, env=env, check=True,
+    )
+    for name in ("agent-libos", "agent-libos-gui-server", "agent-libos-migrate-tool-groups"):
+        subprocess.run([str(bin_dir / (name + suffix)), "--help"],
+                       cwd=work, env=env, check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        [str(bin_dir / ("agent-libos" + suffix)), "--db", "local", "demo"],
+        cwd=work, env=env, check=True, capture_output=True, text=True,
+    )
+    report = json.loads(result.stdout)
+    assert report["target_file_exists"] and report["target_file_content_matches"]
+    assert report["final_report_oid"]
+print("installed-package entrypoints and deterministic demo passed")
+PY
+```
+
+Dependencies are resolved for this installation because the sdist has no root
+lock. This verifies installed-package entrypoints and a deterministic demo; it
+is not frozen-lock reproduction, the complete test matrix, or a release receipt.
+The temporary working directory and demo output are removed on completion.
+
 ## Standard Checks
+
+Run repository checks from a Git checkout, after the setup above.
 
 ### Focused feedback (not complete)
 
@@ -82,8 +140,9 @@ change.
 
 ### Complete deterministic root-project baseline
 
-Before claiming the complete deterministic Python and GUI baseline, install
-the checked-in locks and run:
+The root-project baseline includes all deterministic Python lanes and the GUI
+unit tests, typecheck, and build. From a Git checkout, install the checked-in
+locks and run:
 
 ```bash
 uv sync --frozen
@@ -101,6 +160,14 @@ The Python `all` selection covers `unit`, `runtime`, `security`,
 `self-evolution`, `providers`, and `benchmark`; it does not include the GUI,
 AgentDojo subproject, PostgreSQL, MCP, real-LLM, or other separately gated
 environment cells described below.
+
+The `gui` lane runs Vitest, TypeScript checks, and the production build. It does
+not run the deterministic browser end-to-end suite that per-change CI also
+requires. For that additional GUI gate, follow the
+[Playwright/Chromium setup and E2E commands](gui.md#development); its browser
+installation is a separate environment prerequisite. Neither command above
+alone reproduces all service, native-desktop, artifact, and live-provider gates
+in the [support matrix](support_matrix.md).
 
 ### Isolated AgentDojo harness
 

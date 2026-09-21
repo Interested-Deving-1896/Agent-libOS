@@ -568,24 +568,13 @@ def test_architecture_docs_track_recovery_and_host_control_boundaries() -> None:
     ):
         assert required in documentation
 
+    # The complete builder/document order is checked below, including the MCP
+    # restart steps. Keep this assertion focused on the reservation dependency.
     _assert_in_order(
-        recovery,
+        recovery.casefold(),
         "prepared protected operations",
         "pending external effects",
-        "semantic authority",
         "stale capability-use reservations",
-        "resource-usage reservations",
-        "process-exec publications",
-        "process-launch publications",
-        "checkpoint-restore publications",
-        "root-spawn initial-goal payloads",
-        "missing volatile Object payloads",
-        "registered JIT rehydration",
-        "stale Explainable Operations",
-        "stale process execution leases",
-        "Object Tasks",
-        "incomplete process-terminal cleanup intents",
-        "TaskRun recovery",
     )
     assert "current 46-value event catalog" not in documentation
 
@@ -644,15 +633,21 @@ def test_core_runtime_docs_match_builder_startup_recovery_order() -> None:
 
     _assert_in_order(builder_recovery, *builder_markers)
     for path, start_marker in (
+        ("docs/architecture.md", "Before the lifecycle becomes"),
         ("docs/runtime_model.md", "The builder first validates"),
         ("docs/storage.md", "While holding the lifecycle recovery lease"),
-        ("docs/capabilities.md", "On reopen, the Runtime holds"),
     ):
         documentation = _words(_read(path)).split(start_marker, 1)[1]
-        _assert_in_order(documentation, *documentation_markers)
+        _assert_in_order(
+            documentation.casefold(),
+            *(marker.casefold() for marker in documentation_markers),
+        )
         assert "provider receipt" in documentation
         assert "provider replay" in documentation
         assert "restore its bound reservation" in documentation
+
+    capabilities = _read("docs/capabilities.md")
+    assert "[startup recovery order](architecture.md#startup-recovery-order)" in capabilities
 
 
 def test_semantic_docs_separate_evidence_control_settlement_and_remote_layers() -> None:

@@ -967,10 +967,16 @@ metadata and do not embed managed worktrees or remote state.
 
 Responses replay references are an optional local-only snapshot field. Restore
 and fork validate retained payload integrity, process/TaskRun and provider/model
-scope, and current source authority before effects. The full encrypted history
-remains in Host-private store rows, is excluded from image commits and packages,
-and cannot be resurrected after purge. Old snapshots with no replay reference
-remain readable. Active TaskRun checkpoint restrictions are unchanged.
+scope, and current source authority before effects. The complete replay history
+remains in Host-private store rows and is excluded from image commits and
+packages. Ordinary messages, tool arguments, and tool outputs in that history
+are plaintext JSON; only provider-supplied encrypted reasoning remains opaque
+ciphertext. Host-private access does not provide encryption at rest for the
+history or its database backups. See the
+[private replay retention boundary](evidence_payload_retention.md#private-responses-replay)
+before purging: removed payloads cannot be resurrected through an old checkpoint
+reference. Old snapshots with no replay reference remain readable. Active
+TaskRun checkpoint restrictions are unchanged.
 
 Checkpoint list callers may request only positive integer limits no larger
 than `CheckpointDefaults.list_limit`; `0`, negative values, booleans, and larger

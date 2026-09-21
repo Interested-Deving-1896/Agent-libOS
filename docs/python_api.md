@@ -492,6 +492,12 @@ not model tools. A Host that exposes those operations must supply the governed
 binding/provider managers and preserve their Capability, data-flow, effect,
 resource, event, audit, and lifecycle fences.
 
+Resource, Resource Template, and Prompt pagination cursors are local to one
+Runtime lifetime. Keep the Runtime open while following `next_cursor`; see
+[Pagination in one Runtime](mcp.md#pagination-in-one-runtime) for the complete
+loop and a runnable local example. A persistent store does not preserve these
+cursor handles for a new Runtime.
+
 Exact-v3 custom Provider protocols are exported from `agent_libos.mcp`. Each
 implementation declares `mcp_manifest_schema_version = 3` and
 `mcp_protocol_revision = "2026-07-28"`; Runtime composition rejects legacy

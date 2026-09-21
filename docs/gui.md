@@ -29,6 +29,7 @@ Deno visible without changing Electron's own environment.
 
 ## In this guide
 
+- [Configure a model before the first task](#configure-a-model-before-the-first-task)
 - [Complete a first task](#first-task-user-path)
 - [Review the architecture](#architecture)
 - [Develop and test the GUI](#development)
@@ -41,6 +42,11 @@ Deno visible without changing Electron's own environment.
 - Return to the [documentation home](index.md).
 
 ## First task: user path
+
+Before launching a model task, complete the
+[model and credential setup](#configure-a-model-before-the-first-task) below.
+A connected Runtime confirms the local service is ready; it does not confirm
+that the selected model's API-key environment variable is present.
 
 1. **Launch the app.** Open an installed internal desktop package, or follow
    [Development](#development) to start Electron from a checkout. Wait for the
@@ -68,6 +74,62 @@ Deno visible without changing Electron's own environment.
    **Audit** or **Explain** view when more evidence is needed. Do not treat a
    missing message or an unknown external effect as success; start another task
    only after the terminal evidence is understood.
+
+## Configure a model before the first task
+
+Model tasks make real provider calls and may consume paid tokens. The selected
+LLM profile must name a model available to your provider and an `api_key_env`
+environment variable containing its credential. The default profile uses
+`OPENAI_API_KEY` and accepts `OPENAI_LANGUAGE_MODEL` for the model. In **New
+task → Edit settings**, review the model profile; its selector shows a missing
+environment-variable warning when the key is unavailable. Creating a profile
+stores only the variable's name, not its secret value.
+
+For checkout development, install the dependencies under
+[Development](#development), copy the template, and edit its key and model
+values before starting Electron:
+
+```bash
+test -e .env || cp .env.example .env
+# Edit .env: set OPENAI_API_KEY and OPENAI_LANGUAGE_MODEL for your provider.
+npm --prefix gui run electron:dev
+```
+
+The development launcher reads that root `.env`; inherited environment values
+take precedence. A direct Python server instead needs explicit loading, for
+example `uv run --env-file .env agent-libos-gui-server --db user --port 0`.
+
+An installed desktop package does not load a checkout `.env` and does not
+require Python, uv, or Node. Supply credentials in the environment of the
+process that launches the app. For example, in a POSIX shell on macOS, replace
+the placeholder values and adjust the application path if installed elsewhere:
+
+```bash
+export OPENAI_API_KEY='your-api-key'
+export OPENAI_LANGUAGE_MODEL='your-model'
+"/Applications/Agent libOS.app/Contents/MacOS/Agent libOS"
+```
+
+On Linux, use the same exports and launch the downloaded AppImage or the
+extracted `agent-libos` executable by its actual path. In Windows PowerShell,
+launch the installed or extracted executable from the shell that holds the
+variables:
+
+```powershell
+$env:OPENAI_API_KEY = 'your-api-key'
+$env:OPENAI_LANGUAGE_MODEL = 'your-model'
+& 'C:\path\to\Agent libOS.exe'
+```
+
+A GUI shortcut launch may have a different environment from your terminal.
+After changing external environment variables or the development `.env`, fully
+quit and relaunch the app and its backend from the configured environment.
+For a custom profile, set the environment variable named by that profile and
+choose it before Start; non-default profiles need their model and endpoint
+fields set explicitly. Custom endpoints also require the Host opt-in described
+in [LLM profile configuration](configuration.md#effective-llm-profile-precedence).
+If a first task fails with `<variable> is not configured`, fix the launch
+environment, relaunch, check the profile warning, and create a new task.
 
 ## Architecture
 
@@ -210,7 +272,7 @@ uv sync
 npm --prefix gui install
 ```
 
-Run the Python server directly:
+For server-only API or browser development, run the Python server directly:
 
 ```bash
 uv run agent-libos-gui-server --db user --port 0
@@ -256,7 +318,9 @@ token:
 {"url":"http://127.0.0.1:51234","token":"...","db":"/home/user/.agent-libos/runtime/agent-libos.sqlite"}
 ```
 
-Run the Electron app:
+To use the Electron desktop, run the command below instead. Electron starts its
+own Python server; stop a separately launched server using the same `user`
+database first, because the active-runtime lease permits only one writer.
 
 ```bash
 npm --prefix gui run electron:dev
@@ -275,8 +339,14 @@ Build and type-check the GUI:
 npm --prefix gui run test
 npm --prefix gui run typecheck
 npm --prefix gui run build
+# Or run the equivalent three checks with one command:
 uv run python scripts/test_matrix.py --lane gui
 ```
+
+The matrix `gui` lane is a shortcut for the preceding three npm commands; run
+either form, not both. It covers unit tests, typechecking, and compilation.
+Browser E2E is a separate deterministic gate, also required by per-change CI,
+and needs the additional setup below.
 
 The browser end-to-end suite also needs the lock-installed Playwright package
 and its version-matched Chromium binary. The `npm --prefix gui ci` step below

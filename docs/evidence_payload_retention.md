@@ -33,6 +33,41 @@ remains independently applicable; a Host/admin may later invoke the same
 audited purge explicitly for a terminal permanent Run.
 See [Durable Task Runs](durable_task_runs.md).
 
+## Private Responses replay
+
+Schema-v8 `llm_replay_turns` and `llm_replay_heads` are a separate persistence
+surface from observable `llm_calls`. A private replay payload contains ordinary
+messages, tool arguments, and tool outputs as plaintext JSON, alongside any
+opaque provider-encrypted reasoning. Restricting access to Host APIs does not
+encrypt that JSON or its database backups.
+
+Age-based `PayloadRetentionMaintenance` and the `payload-retention llm_call`
+and `payload-retention external_effect` CLI commands do not scan or reduce
+private replay rows. Reducing an observable LLM call therefore does not remove
+the corresponding private history. `responses_replay_max_bytes` and
+`responses_replay_max_turns` bound each retained replay payload, not the age or
+total size of immutable historical rows. Context compaction or clearing the
+current replay head also leaves the old payloads retained for existing local
+references.
+
+Task Run terminal cleanup under `purge_on_terminal`, and the explicit
+`Runtime.task_runs.purge_payloads` operation for a terminal `permanent` Run,
+remove the Run's private replay bodies in their cleanup transaction. Ordinary
+non-TaskRun processes have no automatic replay expiry: a trusted Host must
+deliberately invoke `Runtime.store.purge_llm_replay(pid=...)` to remove that
+process's private bodies and heads. This Store operation is not a model tool or
+an age-retention CLI command. It leaves identity, hash, and purge tombstones.
+
+Before explicit purge, stop dispatch for the affected process, let any
+in-flight work finish, and decide whether its continuation and checkpoint
+references must remain usable. Purge
+is irreversible through the Runtime: a later resume, restore, or fork that
+requires those bodies fails closed rather than reconstructing them from public
+call summaries. Already-created database backups are independent copies and
+are not erased by a live-store purge. See
+[Responses replay configuration](configuration.md#responses-reasoning-and-local-replay)
+and [the database backup runbook](storage.md#backup-and-restore-runbook).
+
 ## Monotonic tiers
 
 Payloads move in one direction:

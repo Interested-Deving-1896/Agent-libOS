@@ -101,7 +101,37 @@ absolute deadlines, bounds, lifecycle fences, and effect policy. Constructing
 an official SDK client directly inside a Resource/Prompt provider would bypass
 that boundary and is not a supported tutorial shortcut.
 
+## Traverse a catalog in one Runtime
+
+```bash
+uv run python examples/mcp/run_pagination_e2e.py
+```
+
+This no-network example supplies a complete, deterministic Resource Provider
+through the public Host substrate SPI. All catalog pages and the final Resource
+read enter `Runtime.mcp`; the example does not replace private Runtime managers.
+It reads three pages within one Runtime. The first page is empty after allowlist
+filtering but has a continuation cursor, so the loop continues and returns the
+two declared logical ids, `status` and `version`. The script asserts these
+results and prints `pages_read: 3` plus the untrusted `status` read result.
+
+Reuse only the latest opaque cursor with the same Runtime, actor, server, and
+surface, and stop when `next_cursor` is `None`. The example fails if its explicit
+page budget is exhausted instead of returning a partial catalog as complete.
+Separate one-shot CLI invocations cannot share these in-memory cursors. See
+[Pagination in one Runtime](../../docs/mcp.md#pagination-in-one-runtime) for the
+reusable loop and process authority requirements. This fixture demonstrates
+public Host composition and pagination; the real-transport tutorial above
+exercises SDK transport governance separately.
+
 ## Exercise Host-preconfigured OAuth and restart recovery
+
+For a real CLI deployment, start with the non-secret
+[oauth-profile.json](oauth-profile.json) and the
+[profile field guide](../../docs/mcp.md#oauth-profile-file). Its reserved hosts
+and public client id must be adapted; it is an offline-valid template, not a
+working login service. The fixture below uses its own scripted profile and
+broker and does not contact those hosts.
 
 ```bash
 uv run python examples/mcp/run_oauth_e2e.py
