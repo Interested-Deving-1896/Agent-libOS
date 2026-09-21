@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import socket
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -21,24 +20,16 @@ from agent_libos.mcp.oauth import (
 from agent_libos.mcp.types import McpResource
 from agent_libos.primitives.mcp import McpPrimitive
 from examples.mcp import run_pagination_e2e
+from tests.support.network import offline_network
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.fixture(autouse=True)
-def deny_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    def denied(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("The documented offline MCP example attempted network I/O")
-
-    monkeypatch.setattr(socket.socket, "connect", denied)
-    monkeypatch.setattr(socket.socket, "connect_ex", denied)
-    monkeypatch.setattr(socket, "getaddrinfo", denied)
-
-
 def test_documented_mcp_pagination_continues_after_filtered_empty_page(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    offline_network: None,
 ) -> None:
     observed_pages: list[tuple[int, bool]] = []
     original = McpPrimitive.list_resources
@@ -70,6 +61,7 @@ def test_documented_mcp_pagination_continues_after_filtered_empty_page(
 def test_documented_mcp_pagination_budget_rejects_partial_catalog(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    offline_network: None,
 ) -> None:
     original = run_pagination_e2e.collect_resources
 
@@ -90,7 +82,9 @@ def test_documented_mcp_pagination_budget_rejects_partial_catalog(
     assert capsys.readouterr().out == ""
 
 
-def test_documented_mcp_oauth_profile_uses_strict_non_secret_shape() -> None:
+def test_documented_mcp_oauth_profile_uses_strict_non_secret_shape(
+    offline_network: None,
+) -> None:
     supplied = json.loads((ROOT / "examples/mcp/oauth-profile.json").read_text())
     documentation = (ROOT / "docs/mcp.md").read_text()
     section = documentation.split("### OAuth profile file\n", 1)[1].split("\n## ", 1)[0]

@@ -9,6 +9,11 @@ Git history remains the record for earlier development snapshots.
 Changes intended for the next published version must be summarized here before
 release. Do not treat an entry in this section as shipped behavior.
 
+- Keep offline example tests compatible with Windows asyncio's internal socket
+  pairs while rejecting ordinary network access. Split Ubuntu runtime CI into
+  four complete, disjoint shards per Python version to stay within the existing
+  480-second process deadline.
+
 ## 1.6.0
 
 `1.6.0` is the current version aligned across the Python project, package

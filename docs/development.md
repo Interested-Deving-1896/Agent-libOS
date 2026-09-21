@@ -293,7 +293,7 @@ Use pytest-xdist workers for faster local Python feedback:
 ```bash
 uv run python scripts/test_matrix.py --lane all --workers 4
 uv run python scripts/test_matrix.py --lane runtime --workers auto --dist worksteal
-uv run python scripts/test_matrix.py --lane runtime --shard-count 2 --shard-index 0
+uv run python scripts/test_matrix.py --lane runtime --shard-count 4 --shard-index 0
 ```
 
 `--workers` applies only to Python lanes. The `runtime`, `security`,
@@ -322,8 +322,9 @@ are zero-based, and every shard must contain at least one selected test file.
 Timeout exits with status 124 after terminating the process group/tree.
 Standard lanes deselect `postgres` tests because the PostgreSQL CI
 service runs them separately with `pytest -m postgres --run-postgres`. Linux CI
-uses a 480-second process deadline for the runtime and benchmark lanes and 360
-seconds for the other standard lanes, within a 15-minute step. The Windows
+splits runtime into four file-weighted shards and benchmark into two per Python
+version. It uses a 480-second process deadline for those lanes and 360 seconds
+for the other standard lanes, within a 15-minute step. The Windows
 matrix uses explicit file shards and a 1,400-second process deadline within a
 25-minute step; those
 larger limits cover platform and runner variance rather than a different test

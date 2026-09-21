@@ -2038,22 +2038,42 @@ def test_release_workflow_preserves_and_clean_installs_validated_artifacts() -> 
         {
             "python-version": "3.11",
             "lane": "runtime",
-            "shard_args": "--shard-count 2 --shard-index 0",
+            "shard_args": "--shard-count 4 --shard-index 0",
         },
         {
             "python-version": "3.11",
             "lane": "runtime",
-            "shard_args": "--shard-count 2 --shard-index 1",
+            "shard_args": "--shard-count 4 --shard-index 1",
+        },
+        {
+            "python-version": "3.11",
+            "lane": "runtime",
+            "shard_args": "--shard-count 4 --shard-index 2",
+        },
+        {
+            "python-version": "3.11",
+            "lane": "runtime",
+            "shard_args": "--shard-count 4 --shard-index 3",
         },
         {
             "python-version": "3.14",
             "lane": "runtime",
-            "shard_args": "--shard-count 2 --shard-index 0",
+            "shard_args": "--shard-count 4 --shard-index 0",
         },
         {
             "python-version": "3.14",
             "lane": "runtime",
-            "shard_args": "--shard-count 2 --shard-index 1",
+            "shard_args": "--shard-count 4 --shard-index 1",
+        },
+        {
+            "python-version": "3.14",
+            "lane": "runtime",
+            "shard_args": "--shard-count 4 --shard-index 2",
+        },
+        {
+            "python-version": "3.14",
+            "lane": "runtime",
+            "shard_args": "--shard-count 4 --shard-index 3",
         },
         {
             "python-version": "3.11",

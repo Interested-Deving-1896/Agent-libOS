@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import socket
 import subprocess
 import sys
 from dataclasses import replace
@@ -15,18 +14,15 @@ from agent_libos.config import DEFAULT_CONFIG
 from agent_libos.models import TaskRunStatus
 from agent_libos.runtime.task_runs import TaskRunManager
 from examples.task_runs.host_lifecycle import run_demo
+from tests.support.network import offline_network
 
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_documented_task_run_example_uses_real_completion_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, offline_network: None,
 ) -> None:
-    def deny_network(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("The documented offline example attempted network access")
-
-    monkeypatch.setattr(socket.socket, "connect", deny_network)
     commands: list[tuple[str, str]] = []
 
     def instrument(name: str) -> None:
